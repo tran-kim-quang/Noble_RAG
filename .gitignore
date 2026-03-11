@@ -1,3 +1,4 @@
+# env
 env/
 .env
 .venv
@@ -13,12 +14,18 @@ env/
 .env.test.local
 .env.production.local
 
-*.log
+# Log
+.log
 
+# Pycahce
 pycache/
 
 __pycache__/
 
 .pytest_cache/
 
+# Poetry
 poetry.lock
+
+# Test
+test/

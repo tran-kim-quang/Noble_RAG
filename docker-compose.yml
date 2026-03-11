@@ -1,0 +1,29 @@
+services:
+  whisper-service:
+    build:
+      context: ./whisper-service
+      args:
+        BASE_IMAGE: nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04
+        WHISPER_DEVICE: cuda
+        WHISPER_COMPUTE: float16
+        WHISPER_MODEL: large-v3
+    container_name: whisper-service
+    ports:
+      - "8001:8001"
+    environment:
+      - WHISPER_MODEL=large-v3
+      - WHISPER_DEVICE=cuda
+      - WHISPER_COMPUTE=float16
+    volumes:
+      - whisper_cache:/app/.cache/hf
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  whisper_cache:

@@ -15,9 +15,9 @@ ARG BASE_IMAGE=python:3.11-slim-bookworm
 FROM ${BASE_IMAGE}
 
 # ── Build-time args (mirrored as env so uvicorn can read them) ─────────────
-ARG  WHISPER_MODEL=base
-ARG  WHISPER_DEVICE=cpu
-ARG  WHISPER_COMPUTE=int8
+ARG  WHISPER_MODEL=large-v3
+ARG  WHISPER_DEVICE=cuda
+ARG  WHISPER_COMPUTE=float16
 ARG  WHISPER_BEAM=5
 
 ENV  WHISPER_MODEL=${WHISPER_MODEL}  \
@@ -35,9 +35,13 @@ ENV  WHISPER_MODEL=${WHISPER_MODEL}  \
 # libgomp → OpenMP runtime needed by CTranslate2
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
         ffmpeg \
         libgomp1 \
         curl \
+    && ln -s /usr/bin/python3 /usr/bin/python || true \
+    && ln -s /usr/bin/pip3 /usr/bin/pip || true \
     && rm -rf /var/lib/apt/lists/*
 
 # ── App directory ──────────────────────────────────────────────────────────
