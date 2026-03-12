@@ -1,19 +1,21 @@
 services:
   whisper-service:
     build:
-      context: ./whisper-service
+      context: ./service/whisper-service
       args:
         BASE_IMAGE: nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04
         WHISPER_DEVICE: cuda
         WHISPER_COMPUTE: float16
         WHISPER_MODEL: large-v3
     container_name: whisper-service
+    shm_size: '2gb'
     ports:
       - "8001:8001"
     environment:
       - WHISPER_MODEL=large-v3
       - WHISPER_DEVICE=cuda
       - WHISPER_COMPUTE=float16
+      - NVIDIA_VISIBLE_DEVICES=all
     volumes:
       - whisper_cache:/app/.cache/hf
     deploy:

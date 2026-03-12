@@ -33,23 +33,26 @@ ENV  WHISPER_MODEL=${WHISPER_MODEL}  \
 # ── System deps ────────────────────────────────────────────────────────────
 # ffmpeg  → required by faster-whisper for audio decoding
 # libgomp → OpenMP runtime needed by CTranslate2
-RUN apt-get update -y && \
+RUN apt-get -o Acquire::Check-Valid-Until=false -o Acquire::Check-Date=false update -y && \
     apt-get install -y --no-install-recommends \
         python3 \
         python3-pip \
+        python3-dev \
         ffmpeg \
         libgomp1 \
         curl \
-    && ln -s /usr/bin/python3 /usr/bin/python || true \
-    && ln -s /usr/bin/pip3 /usr/bin/pip || true \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# Đảm bảo pip được cập nhật và nhận diện đúng
+RUN python3 -m pip install --upgrade pip
 
 # ── App directory ──────────────────────────────────────────────────────────
 WORKDIR /app
 
-# ── Python deps (layer-cached unless requirements.txt changes) ─────────────
+# ── Python deps ────────────────────────────────────────────────────────────
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python3 -m pip install --no-cache-dir -r requirements.txt
 
 # ── Copy application code ──────────────────────────────────────────────────
 COPY app.py /app/app.py
