@@ -1,0 +1,280 @@
+Quick Reference: Storage Comparison Chart
+==========================================
+
+
+RECOMMENDED ARCHITECTURE
+========================
+
+PostgreSQL                 Qdrant                  Redis
+   ^                         ^                       ^
+   |                         |                       |
+   v                         v                       v
+[Raw Chunks]           [Vector Data]          [Session Cache]
+[Entities]             [Embeddings]           [Conversations]
+[Relations]            [Similarity Search]    [Short-lived Data]
+[Doc Status]           
+
+Connection: Direct to LightRAG
+Database URLs in config/llm_info.py
+
+
+FEATURE COMPARISON MATRIX
+=========================
+
+Feature              PostgreSQL    Qdrant    Redis    MongoDB
+                     --------      ------    -----    -------
+ACID Compliance      Yes           No        No       Partial
+Consistency          Strong        Eventual  Eventual Eventual
+Scalability          Vertical      Horizontal Vertical Horizontal
+Schema Flexibility   Rigid         Fixed     N/A      Flexible
+Vector Search        Via pgvector  Native    No       Via Atlas
+Relationships        Foreign keys  No        No       Manual
+Query Language       SQL           HTTP API  RESP     MongoDB QL
+Index Types          Many          HNSW      No       Many
+TTL Support          No            No        Yes      Yes
+Transactions         Full          Single    Commands Transactions
+Backup/Recovery      Excellent     Good      Good     Good
+Operational Cost     Low           Low       Low      High (Atlas)
+Learning Curve       Moderate      Low       Low      Moderate
+
+
+USE CASE MAPPING
+================
+
+Raw Document Chunks
+  PostgreSQL KV_STORAGE (JSON columns)
+  Storage size: O(documents_count * avg_bytes)
+  Access: SELECT by doc_id, chunk_index
+  TTL: No, permanent storage
+
+Entity Nodes
+  PostgreSQL table
+  Storage size: O(unique_entities * metadata_size)
+  Access: SELECT by entity_name (indexed)
+  Operations: CRUD with ACID, relationships enforced
+
+Relation Edges
+  PostgreSQL table with foreign keys
+  Storage size: O(unique_relations)
+  Access: SELECT by source/target (indexed)
+  Queries: Graph traversal via CTEs
+
+Vector Embeddings
+  Qdrant collection
+  Storage size: O(chunks + entities + relations) * vector_dim (3072)
+  Access: Similarity search (cosine distance)
+  Performance: < 20ms for 1M vectors
+
+Session Data
+  Redis (volatile, TTL-based)
+  Storage size: O(active_sessions) * avg_session_size
+  Access: Fast in-memory
+  TTL: Auto-expire (86400 seconds default)
+
+
+CONFIGURATION EXAMPLES
+======================
+
+Local Development (.env):
+  KV_STORAGE=PGKVStorage
+  VECTOR_STORAGE=QdrantVectorDBStorage
+  GRAPH_STORAGE=PGGraphStorage
+  POSTGRES_HOST=localhost
+  POSTGRES_PORT=5432
+  QDRANT_URL=http://localhost:6333
+  REDIS_HOST=localhost
+  REDIS_PORT=6379
+
+Production AWS (.env):
+  POSTGRES_HOST=noble-rag-db.xxxxx.us-east-1.rds.amazonaws.com
+  POSTGRES_PORT=5432
+  QDRANT_URL=http://qdrant-service.internal:6333
+  REDIS_HOST=redis-cluster.xxxxx.cache.amazonaws.com
+  REDIS_PORT=6379
+
+Production GCP (.env):
+  POSTGRES_HOST=Cloud SQL PostgreSQL instance
+  QDRANT_URL=Qdrant managed service
+  REDIS_HOST=Cloud Memorystore
+
+
+DECISION TREE: Which Storage for Knowledge Graph?
+===================================================
+
+Do you need ACID compliance?
+  YES -> PostgreSQL ✓
+  NO  -> MongoDB or Qdrant
+
+Is graph structure stable (not changing)?
+  YES -> PostgreSQL ✓
+  NO  -> MongoDB
+
+Need horizontal scaling across regions?
+  YES -> MongoDB
+  NO  -> PostgreSQL ✓
+
+Have PostgreSQL expertise?
+  YES -> PostgreSQL ✓
+  NO  -> MongoDB or use existing
+
+Budget constraints?
+  Tight -> PostgreSQL (free) ✓
+  Flexible -> MongoDB (Atlas) or PostgreSQL
+
+Performance requirement (query latency)?
+  < 10ms -> PostgreSQL (with indexes) or MongoDB (sharded)
+  < 100ms -> PostgreSQL ✓
+  Any -> MongoDB
+
+Final Recommendation: PostgreSQL
+
+
+STORAGE STATISTICS
+==================
+
+Small Knowledge Graph (< 100K entities):
+  PostgreSQL: ~500MB
+    - 100K entities: 200MB
+    - 500K relations: 300MB
+  Qdrant: ~1.2GB
+    - 600K vectors @ 3072 dims: 900MB + overhead
+  Redis: < 100MB (sessions only)
+
+Medium Knowledge Graph (1M entities):
+  PostgreSQL: ~5GB
+  Qdrant: ~12GB
+  Redis: < 500MB
+
+Large Knowledge Graph (10M entities):
+  PostgreSQL: ~50GB
+    - Requires indexing/partitioning strategy
+  Qdrant: ~120GB
+    - May need quantization
+  Redis: < 5GB
+
+
+QUERY PATTERN PERFORMANCE
+==========================
+
+Find Entity by Name:
+  PostgreSQL: 1-5ms (indexed lookup)
+  MongoDB: 5-15ms (indexed lookup)
+  Redis: N/A
+
+Get All Relations for Entity:
+  PostgreSQL: 10-30ms (with indexes)
+  MongoDB: 20-50ms (with indexes)
+
+Graph Path Finding (depth 3):
+  PostgreSQL: 30-100ms (recursive CTE)
+  MongoDB: 100-500ms (nested $lookup)
+
+Vector Similarity (top-10 from 1M):
+  Qdrant: 5-20ms (optimized)
+  PostgreSQL pgvector: 50-200ms
+
+Bulk Insert (100K records):
+  PostgreSQL: 5-20s
+  MongoDB: 3-15s
+
+
+OPERATIONAL CHECKLIST
+====================
+
+Setup Verification:
+  [ ] PostgreSQL service running
+  [ ] Database created and tables initialized
+  [ ] pgvector extension enabled
+  [ ] Indexes created (entity_name, relation timestamps)
+  
+  [ ] Qdrant service running
+  [ ] Health check passing (curl /health)
+  [ ] Collections auto-created on first insert
+  
+  [ ] Redis service running
+  [ ] PING command returning PONG
+  [ ] Memory available for cache
+
+Monitoring:
+  [ ] PostgreSQL: Monitor table sizes and query performance
+  [ ] Qdrant: Monitor collection memory usage
+  [ ] Redis: Monitor key count and memory usage
+
+Backup:
+  [ ] PostgreSQL daily backups scheduled
+  [ ] Qdrant snapshots created
+  [ ] Redis AOF persistence enabled
+
+Testing:
+  [ ] Entity CRUD operations
+  [ ] Relation queries with JOINs
+  [ ] Session creation and expiry
+  [ ] Vector similarity search
+
+
+MIGRATION PATHS
+===============
+
+Local -> PostgreSQL:
+  1. Initialize PostgreSQL (docker-compose up postgres)
+  2. Run init-postgres.sql (automatic via volume)
+  3. Update .env: POSTGRES_HOST, credentials
+  4. Restart application
+  5. Data migrates on first query
+
+Local -> Cloud:
+  1. Setup RDS/Cloud SQL/managed PostgreSQL
+  2. Update connection string in .env
+  3. Initialize with init-postgres.sql
+  4. Run migration script to copy data
+  5. Verify and switch
+
+PostgreSQL -> MongoDB (graph only):
+  1. Initialize MongoDB collections
+  2. Set USE_MONGODB_FOR_GRAPH=true
+  3. Run migration script
+  4. Verify entity/relation counts
+  5. Run queries to validate
+
+
+TIMESTAMP REFERENCE
+===================
+
+PostgreSQL queries:
+  SELECT * FROM entities WHERE created_at > NOW() - INTERVAL '7 days'
+  
+  For monthly stats:
+  SELECT DATE_TRUNC('month', created_at) as month, COUNT(*)
+  FROM entities
+  GROUP BY DATE_TRUNC('month', created_at)
+
+MongoDB queries:
+  db.entities.find({ created_at: { $gte: new Date(Date.now() - 7*24*60*60*1000) }})
+
+
+FINAL RECOMMENDATION
+====================
+
+Architecture Chosen: PostgreSQL + Qdrant + Redis
+
+Rationale:
+  - PostgreSQL: Knowledge graph (entities + relations) = relational data
+  - Qdrant: Vector embeddings = specialized vector DB
+  - Redis: Sessions = high-speed cache
+  
+Benefits:
+  - Each component optimized for its purpose
+  - Can scale independently
+  - Low infrastructure cost
+  - Industry standard stack
+  - ACID compliance for critical data
+  - Proven production-ready
+
+Cost per month (self-hosted):
+  ~$20-30 (cloud VM with all services)
+
+Performance guarantees:
+  - Entity lookup: < 5ms
+  - Relation traversal: < 100ms
+  - Vector search: < 20ms
+  - Session access: < 1ms

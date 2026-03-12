@@ -1,0 +1,292 @@
+TECHNICAL ANALYSIS: PostgreSQL vs MongoDB for Knowledge Graph Storage
+=====================================================================
+
+Use Case: Storing entities, relations, and knowledge graph data for Noble_RAG
+
+
+COMPARISON TABLE
+================
+
+Feature                  PostgreSQL                  MongoDB
+-------------------     ----------                  -------
+Schema                   Fixed schema (structured)   Flexible schema (JSON)
+ACID Transactions        Full ACID                   Limited (4.0+)
+Foreign Keys             Yes (enforced)              No (manual refs)
+Indexing                 B-tree, GiST, etc          Regular, text, geo
+Full-text Search         Native                      Limited
+Graph Queries            Via JOINs                   Via $lookup
+Horizontal Scaling       Sharding/replication        Native sharding
+JSON Support             JSONB type                  Native
+Vector Support           Via pgvector                Via MongoDB Atlas
+Cost                     Low (open source)           Medium-High (Atlas)
+Query Performance        Fast for structured         Fast for JSON
+Concurrent Writes        Optimized                   Good
+Memory Usage             Low                         Medium-High
+
+
+DATA MODELING
+=============
+
+PostgreSQL Approach
+------------------
+
+Entity Table:
+CREATE TABLE entities (
+    id UUID PRIMARY KEY,
+    entity_name VARCHAR UNIQUE NOT NULL,
+    entity_type VARCHAR NOT NULL,
+    description TEXT,
+    embedding VECTOR(3072),
+    source_doc_id VARCHAR,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP,
+    metadata JSONB,
+    
+    INDEX idx_entity_name (entity_name),
+    INDEX idx_entity_type (entity_type),
+    INDEX idx_embedding USING ivfflat (embedding vector_cosine_ops)
+);
+
+Relation Table:
+CREATE TABLE relations (
+    id UUID PRIMARY KEY,
+    source_entity_id UUID NOT NULL REFERENCES entities(id),
+    target_entity_id UUID NOT NULL REFERENCES entities(id),
+    relation_name VARCHAR NOT NULL,
+    description TEXT,
+    weight FLOAT,
+    embedding VECTOR(3072),
+    metadata JSONB,
+    created_at TIMESTAMP,
+    
+    FOREIGN KEY (source_entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+    FOREIGN KEY (target_entity_id) REFERENCES entities(id) ON DELETE CASCADE,
+    INDEX idx_src_entity (source_entity_id),
+    INDEX idx_tgt_entity (target_entity_id),
+    INDEX idx_relation_name (relation_name)
+);
+
+Advantages:
+- ACID compliance: Transactions guaranteed
+- Referential integrity: Foreign keys ensure data consistency
+- Efficient JOINs: Fast queries across entities and relations
+- Indexes: Multiple index types for optimization
+- No duplicates: UNIQUE constraints
+- Storage efficiency: Row-based, compressed
+
+Disadvantages:
+- Schema must be pre-defined
+- Schema changes require migrations
+- Not ideal for rapidly evolving structure
+
+
+MongoDB Approach
+----------------
+
+Entities Collection:
+db.entities.insertOne({
+    _id: ObjectId(),
+    entity_name: "Google",
+    entity_type: "company",
+    description: "Google is a tech company",
+    embedding: [...3072 floats...],
+    source_doc_id: "doc_001",
+    metadata: {
+        confidence: 0.95,
+        source: "document_chunk_1",
+        created_at: ISODate()
+    },
+    tags: ["technology", "corporation"],
+    alternative_names: ["Alphabet", "GOOGL"]
+});
+
+Relations Collection:
+db.relations.insertOne({
+    _id: ObjectId(),
+    source_entity_id: ObjectId("..."),  # Reference to Google
+    target_entity_id: ObjectId("..."),  # Reference to Gmail
+    relation_name: "operates",
+    description: "Google operates email service",
+    weight: 2.5,
+    embedding: [...3072 floats...],
+    metadata: {
+        evidence: ["chunk_1", "chunk_2"],
+        confidence: 0.92
+    },
+    properties: {
+        since: 2004,
+        type: "service_ownership"
+    }
+});
+
+Advantages:
+- Flexible schema: Easy to add new fields
+- JSON-native: Intuitive for nested data
+- No migrations: Schema evolution without downtime
+- Easy horizontal scaling: Sharding built-in
+- Good for unstructured data
+
+Disadvantages:
+- No referential integrity: Manual relationship management
+- No ACID transactions across collections
+- More data redundancy possible
+- Eventual consistency: Not ACID strong
+- Vector search requires Atlas (paid)
+
+
+QUERY PATTERNS
+==============
+
+Finding a specific entity:
+
+PostgreSQL:
+  SELECT * FROM entities WHERE entity_name = 'Google';
+
+MongoDB:
+  db.entities.findOne({ entity_name: "Google" });
+
+
+Get all relations for an entity:
+
+PostgreSQL:
+  SELECT r.* FROM relations r
+  JOIN entities e ON r.source_entity_id = e.id
+  WHERE e.entity_name = 'Google';
+
+MongoDB:
+  db.relations.find({ source_entity_id: ObjectId("...") });
+
+
+Find paths between entities (Graph traversal):
+
+PostgreSQL (Complex):
+  -- Recursive query with CTEs
+  WITH RECURSIVE path AS (
+    SELECT source_entity_id, target_entity_id, relation_name, 1 as depth
+    FROM relations
+    WHERE source_entity_id = (SELECT id FROM entities WHERE entity_name = 'Google')
+    UNION ALL
+    SELECT r.source_entity_id, r.target_entity_id, r.relation_name, p.depth + 1
+    FROM relations r
+    JOIN path p ON r.source_entity_id = p.target_entity_id
+    WHERE p.depth < 5
+  )
+  SELECT * FROM path;
+
+MongoDB (Complex):
+  -- Need multiple $lookup stages for graph traversal
+  db.relations.aggregate([
+    { $match: { source_entity_id: ObjectId("...") } },
+    { $lookup: { /* nested lookups for traversal */ } }
+  ]);
+
+
+SCALABILITY CHARACTERISTICS
+============================
+
+PostgreSQL:
+- Vertical scaling: Better performance with more CPU/RAM
+- Horizontal scaling: Via replication + connection pooling
+- Write scalability: Single writer becoming bottleneck at extreme scale
+- Good for: Datasets < 10TB, moderate write volume
+
+MongoDB:
+- Horizontal scaling: Native sharding by entity_name
+- Write scalability: Better for distributed writes
+- Read scalability: Excellent across shards
+- Good for: Datasets > 10TB, high write volume
+- Cost: Atlas pricing per GB stored
+
+
+PRODUCTION RECOMMENDATIONS
+==========================
+
+RECOMMENDATION: Use PostgreSQL for Knowledge Graph
+---------------------------------------------------
+
+Reasons:
+1. Entities and relations are inherently relational
+2. ACID transactions ensure consistency
+3. Foreign keys prevent orphaned references
+4. Already using PostgreSQL for raw data
+5. No additional infrastructure cost
+6. Better query performance for structured data
+7. Can add Apache AGE extension for native graph queries
+8. Simpler operational model (one less database to manage)
+
+When to Choose MongoDB Instead:
+1. If graph schema changes frequently
+2. Need horizontal scaling across multiple regions
+3. Already have MongoDB expertise
+4. Budget permits Atlas subscription
+5. Need flexible entity properties (highly variable attributes)
+
+Hybrid Approach (Not Recommended):
+- PostgreSQL: Entities, relations, metadata
+- MongoDB: Flexible graph properties/metadata
+- Adds operational complexity for marginal benefit
+
+
+IMPLEMENTATION STRATEGY
+=======================
+
+Phase 1: PostgreSQL (Current - Recommended)
+------------------------------------------
+- Use PostgreSQL for all graph data
+- Schema is well-defined and stable
+- Add pgvector extension for embeddings
+- Use PGGraphStorage from LightRAG
+
+Phase 2: Optional MongoDB (If needed)
+------------------------------------
+- Add MongoDB for specific use cases
+- Keep PostgreSQL as source of truth
+- Sync data between systems
+- Enable USE_MONGODB_FOR_GRAPH=true in config
+
+
+PERFORMANCE BENCHMARKS (Estimated)
+===================================
+
+Entity Lookup by Name:
+- PostgreSQL: 1-5ms (with index)
+- MongoDB: 5-15ms
+
+Relation Traversal (depth 3):
+- PostgreSQL: 10-30ms
+- MongoDB: 50-200ms (varies with sharding)
+
+Bulk Insert (10,000 entities):
+- PostgreSQL: 2-5s
+- MongoDB: 1-3s
+
+Vector Similarity Search:
+- PostgreSQL (pgvector): 30-100ms
+- MongoDB Atlas (Vector Search): 20-80ms
+- Qdrant (recommended): 5-20ms
+
+Memory Usage (indices for 1M entities):
+- PostgreSQL: 2-5GB
+- MongoDB: 3-7GB
+
+
+CONCLUSION
+==========
+
+PostgreSQL + Qdrant + Redis Architecture:
+
+PostgreSQL:  Raw chunks, entities, relations, doc status
+Qdrant:      Vector embeddings (optimized for similarity)
+Redis:       Session cache (fast, ephemeral)
+
+This architecture provides:
+- Data consistency (ACID)
+- Query efficiency (SQL + vector ops)
+- Session performance (in-memory)
+- Cost optimization (no enterprise licensing)
+- Operational simplicity (fewer moving parts)
+
+PostgreSQL's relational model aligns naturally with
+knowledge graph structure (entities = nodes, relations = edges).
+Use MongoDB only if you have specific requirements for
+schema flexibility or extreme horizontal scaling.
