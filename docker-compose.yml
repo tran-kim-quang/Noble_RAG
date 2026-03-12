@@ -36,11 +36,6 @@ services:
       - qdrant_data:/qdrant/storage
     environment:
       LOG_LEVEL: INFO
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
     networks:
       - noble_rag_net
     restart: unless-stopped
@@ -66,6 +61,52 @@ services:
     networks:
       - noble_rag_net
     restart: unless-stopped
+
+  # ==================== Ollama (Local Embedding Runtime) ====================
+  ollama:
+    image: ollama/ollama:latest
+    container_name: noble_rag_ollama
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - noble_rag_net
+    restart: unless-stopped
+
+  # Pull embedding model once if missing (idempotent)
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: noble_rag_ollama_init
+    entrypoint: ["/bin/sh", "-c"]
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-embeddinggemma:300m}
+    command: >
+      '
+      set -e;
+      model="$${EMBEDDING_MODEL}";
+      echo "[ollama-init] Ensuring model: $${model}";
+      if ollama list | awk "NR>1 {print \$1}" | grep -Fx "$${model}" >/dev/null 2>&1; then
+        echo "[ollama-init] Model already exists: $${model}";
+      else
+        echo "[ollama-init] Pulling model: $${model}";
+        ollama pull "$${model}";
+      fi;
+      echo "[ollama-init] Done";
+      '
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks:
+      - noble_rag_net
+    restart: "no"
 
   # ==================== pgAdmin (Optional - for PostgreSQL UI) ====================
   pgadmin:
@@ -94,8 +135,11 @@ services:
       - LLM_PROVIDER=${LLM_PROVIDER:-openai}
       - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
       - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_API_URL=${LLM_API_URL:-}
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-openai}
       - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-large}
       - EMBEDDING_DIM=${EMBEDDING_DIM:-3072}
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
       - POSTGRES_URL=postgresql://${POSTGRES_USER:-rag_user}:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/${POSTGRES_DB:-noble_rag}
       - QDRANT_URL=http://qdrant:6333
       - REDIS_URL=redis://redis:6379/0
@@ -108,9 +152,13 @@ services:
       postgres:
         condition: service_healthy
       qdrant:
-        condition: service_healthy
+        condition: service_started
       redis:
         condition: service_healthy
+      ollama:
+        condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
       interval: 10s
@@ -158,6 +206,8 @@ volumes:
   qdrant_data:
     driver: local
   redis_data:
+    driver: local
+  ollama_data:
     driver: local
   whisper_cache:
     driver: local

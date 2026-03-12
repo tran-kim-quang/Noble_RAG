@@ -16,6 +16,7 @@ import logging
 import tempfile
 from typing import Optional, List
 from enum import Enum
+from functools import partial
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse
@@ -23,14 +24,18 @@ from pydantic import BaseModel
 import uvicorn
 
 # LightRAG imports
-from lightrag import LightRAG
-from lightrag.llm import OpenAI, Claude, Ollama
-from lightrag.embedding import OpenAIEmbedding
+from lightrag import LightRAG, QueryParam
+from lightrag.llm.openai import (
+    openai_complete_if_cache,
+    openai_embed,
+    wrap_embedding_func_with_attrs,
+)
 
 # ── Config via env vars ────────────────────────────────────────────────
 LLM_PROVIDER     = os.getenv("LLM_PROVIDER",       "openai")     # openai, azure, ollama, gemini, claude
 LLM_MODEL        = os.getenv("LLM_MODEL",          "gpt-4o-mini")
 LLM_API_KEY      = os.getenv("LLM_API_KEY",        "")
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", LLM_PROVIDER)
 EMBEDDING_MODEL  = os.getenv("EMBEDDING_MODEL",    "text-embedding-3-large")
 EMBEDDING_DIM    = int(os.getenv("EMBEDDING_DIM",  "3072"))
 
@@ -100,49 +105,87 @@ class QueryResponse(BaseModel):
 def init_llm():
     """Initialize LLM based on provider"""
     log.info(f"Initializing LLM provider='{LLM_PROVIDER}' model='{LLM_MODEL}'...")
-    
+
     provider_lower = LLM_PROVIDER.lower()
-    
+
     if provider_lower == "openai":
-        return OpenAI(
-            api_key=LLM_API_KEY,
-            model_name=LLM_MODEL,
-            model_config={
-                "temperature": 0.7,
-                "max_tokens": 2048,
-            }
-        )
-    elif provider_lower == "claude":
-        return Claude(
-            api_key=LLM_API_KEY,
-            model_name=LLM_MODEL,
-        )
+        async def llm_func(
+            prompt,
+            system_prompt=None,
+            history_messages=[],
+            **kwargs,
+        ):
+            return await openai_complete_if_cache(
+                LLM_MODEL,
+                prompt,
+                system_prompt=system_prompt,
+                history_messages=history_messages,
+                api_key=LLM_API_KEY,
+                base_url=os.getenv("LLM_API_URL") or None,
+                **kwargs,
+            )
+
+        return llm_func
     elif provider_lower == "ollama":
-        return Ollama(
-            base_url=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
-            model_name=LLM_MODEL,
+        from lightrag.llm.ollama import ollama_model_complete
+
+        return partial(
+            ollama_model_complete,
+            model=LLM_MODEL,
+            host=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
         )
     else:
-        raise ValueError(f"Unsupported LLM provider: {LLM_PROVIDER}")
+        raise ValueError(
+            f"Unsupported LLM provider for this service build: {LLM_PROVIDER}. "
+            "Use 'openai' or 'ollama'."
+        )
 
 
 def init_embedding():
     """Initialize embedding model"""
-    log.info(f"Initializing embedding model='{EMBEDDING_MODEL}'...")
-    
-    provider_lower = LLM_PROVIDER.lower()
-    
-    if provider_lower in ["openai"]:
-        return OpenAIEmbedding(
-            api_key=LLM_API_KEY,
-            model=EMBEDDING_MODEL,
+    log.info(
+        f"Initializing embedding provider='{EMBEDDING_PROVIDER}' model='{EMBEDDING_MODEL}'..."
+    )
+
+    provider_lower = EMBEDDING_PROVIDER.lower()
+
+    if provider_lower == "ollama":
+        from lightrag.llm.ollama import ollama_embed
+
+        @wrap_embedding_func_with_attrs(
+            embedding_dim=EMBEDDING_DIM,
+            max_token_size=int(os.getenv("MAX_TOKEN_SIZE", "8192")),
+            model_name=EMBEDDING_MODEL,
         )
-    else:
-        # Default to OpenAI embedding
-        return OpenAIEmbedding(
-            api_key=LLM_API_KEY,
-            model=EMBEDDING_MODEL,
+        async def embedding_func(texts: list[str]):
+            return await ollama_embed.func(
+                texts,
+                embed_model=EMBEDDING_MODEL,
+                host=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
+                api_key=os.getenv("OLLAMA_API_KEY") or None,
+            )
+
+        return embedding_func
+
+    if provider_lower == "openai":
+        @wrap_embedding_func_with_attrs(
+            embedding_dim=EMBEDDING_DIM,
+            max_token_size=int(os.getenv("MAX_TOKEN_SIZE", "8192")),
+            model_name=EMBEDDING_MODEL,
         )
+        async def embedding_func(texts: list[str]):
+            return await openai_embed.func(
+                texts,
+                model=EMBEDDING_MODEL,
+                api_key=LLM_API_KEY,
+                base_url=os.getenv("LLM_API_URL") or None,
+            )
+
+        return embedding_func
+    raise ValueError(
+        f"Unsupported embedding provider: {EMBEDDING_PROVIDER}. "
+        "Use 'openai' or 'ollama'."
+    )
 
 
 # ── Initialize LightRAG ────────────────────────────────────────────────
@@ -150,16 +193,17 @@ log.info("Loading LightRAG components...")
 _load_start = time.perf_counter()
 
 try:
-    llm = init_llm()
-    embedding = init_embedding()
+    llm_model_func = init_llm()
+    embedding_func = init_embedding()
     
     # Initialize LightRAG instance
     rag = LightRAG(
         working_dir="./rag_db",
-        llm=llm,
-        embedding=embedding,
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
+        llm_model_func=llm_model_func,
+        llm_model_name=LLM_MODEL,
+        embedding_func=embedding_func,
+        chunk_token_size=CHUNK_SIZE,
+        chunk_overlap_token_size=CHUNK_OVERLAP,
     )
     
     _load_time = time.perf_counter() - _load_start
@@ -176,6 +220,13 @@ app = FastAPI(
     description="Retrieval-Augmented Generation service powered by LightRAG",
     version="1.0.0",
 )
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize LightRAG storages required by latest LightRAG pipeline."""
+    await rag.initialize_storages()
+    log.info("LightRAG storages initialized")
 
 
 # ── Health Check ───────────────────────────────────────────────────────
@@ -288,7 +339,6 @@ async def upload_document(
         # Storage type parameter is retained for future extensibility.
         document_id = await rag.ainsert(
             text_content,
-            metadata=doc_metadata,
         )
         
         # Estimate chunks (rough calculation)
@@ -348,15 +398,15 @@ async def query_rag(request: QueryRequest):
         # Query the RAG system
         response = await rag.aquery(
             request.query,
-            param={
-                "top_k": request.top_k,
-                "mode": "local" if request.return_structured_output else "global",
-            }
+            param=QueryParam(
+                top_k=request.top_k,
+                mode="local" if request.return_structured_output else "global",
+            ),
         )
-        
-        # Extract answer and context
-        answer = response.get("answer", "")
-        context_items = response.get("context", [])
+
+        # Current LightRAG aquery returns a string answer (or stream iterator when enabled).
+        answer = response if isinstance(response, str) else str(response)
+        context_items: list[str] = []
         
         elapsed_time = time.perf_counter() - start_time
         
@@ -368,10 +418,7 @@ async def query_rag(request: QueryRequest):
         return QueryResponse(
             response=answer,
             context=context_items[:request.top_k],
-            tokens_used={
-                "input": response.get("input_tokens", 0),
-                "output": response.get("output_tokens", 0),
-            },
+            tokens_used=None,
             model=LLM_MODEL,
         )
     
