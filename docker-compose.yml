@@ -5,7 +5,8 @@ name: noble_rag
 services:
   # ==================== PostgreSQL ====================
   postgres:
-    image: postgres:16.2-alpine
+    build:
+      context: ./infra/postgres
     container_name: noble_rag_postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-rag_user}
@@ -45,7 +46,7 @@ services:
     image: redis:7.2-alpine
     container_name: noble_rag_redis
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "${REDIS_PORT:-6380}:6379"
     command: >
       redis-server
       --appendonly yes

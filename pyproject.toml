@@ -10,6 +10,9 @@ package-mode = false
 python = ">=3.12,<3.13"
 lightrag-hku = {extras = ["api"], version = "^1.4.10"}
 pydantic-settings = "^2.0.0"
+requests = "^2.32.5"
+numpy = "^2.3.3"
+sounddevice = "^0.5.2"
 
 
 [build-system]
