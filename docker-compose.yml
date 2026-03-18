@@ -128,7 +128,8 @@ services:
   # ==================== RAG Service (LightRAG) ====================
   rag-service:
     build:
-      context: ./service/RAG
+      context: .
+      dockerfile: ./service/RAG/Dockerfile
     container_name: noble_rag_service
     ports:
       - "${RAG_SERVICE_PORT:-8000}:8000"
@@ -147,8 +148,8 @@ services:
       - CHUNK_SIZE=${CHUNK_SIZE:-1024}
       - CHUNK_OVERLAP=${CHUNK_OVERLAP:-20}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - RAG_SERVICE_HOST=0.0.0.0
       - RAG_SERVICE_PORT=8000
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -166,6 +167,28 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+    networks:
+      - noble_rag_net
+    restart: unless-stopped
+
+  # ==================== RAG Web UI ====================
+  rag-ui:
+    build:
+      context: .
+      dockerfile: ./ui/Dockerfile.ui
+    container_name: noble_rag_ui
+    ports:
+      - "${WEB_UI_PORT:-8501}:8501"
+    volumes:
+      - .:/app
+    environment:
+      - RAG_SERVICE_URL=http://rag-service:8000
+      - WEB_UI_HOST=0.0.0.0
+      - WEB_UI_PORT=8501
+      - PYTHONPATH=/app
+    depends_on:
+      rag-service:
+        condition: service_healthy
     networks:
       - noble_rag_net
     restart: unless-stopped

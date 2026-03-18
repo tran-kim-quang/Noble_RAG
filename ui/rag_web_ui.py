@@ -123,10 +123,26 @@ INDEX_HTML = """
           return JSON.stringify(payload, null, 2);
         }
         const lines = payload.documents.map((doc, idx) => {
-          const fileName = (doc.metadata && doc.metadata.filename) ? doc.metadata.filename : "(unknown)";
-          return `${idx + 1}. ${fileName} | status=${doc.status} | chunks=${doc.chunks_count ?? 0} | updated=${doc.updated_at ?? "-"}`;
+          const fileName = (doc.metadata && doc.metadata.filename) ? doc.metadata.filename : (doc.file_path ? doc.file_path.split('/').pop() : "(unknown)");
+          const docId = doc.id;
+          return `${idx + 1}. [${fileName}] | status=${doc.status} | chunks=${doc.chunks_count ?? 0} | updated=${doc.updated_at ?? "-"} <button onclick="deleteDoc('${docId}', '${fileName}')" style="padding: 2px 6px; background: #991b1b; color: white; margin-left: 10px;">Xoá</button>`;
         });
-        return `workspace=${payload.workspace} | total=${payload.count}\\n` + lines.join("\\n");
+        return `workspace=${payload.workspace} | total=${payload.count}\n` + lines.join("\n");
+      }
+
+      async function deleteDoc(docId, fileName) {
+        if (!confirm(`Bạn có chắc muốn xoá tài liệu: ${fileName}?`)) return;
+        try {
+          const { response, data } = await apiFetch(`/api/documents/${docId}`, { method: "DELETE" }, 15000);
+          if (!response.ok) {
+            alert(`Lỗi khi xoá: ${data.detail || "Unknown error"}`);
+            return;
+          }
+          alert("Đã xoá thành công!");
+          await refreshDocuments();
+        } catch (e) {
+          alert(`Lỗi kết nối: ${e}`);
+        }
       }
 
       async function refreshDocuments() {
@@ -179,21 +195,22 @@ INDEX_HTML = """
           }
 
           const taskId = data.task_id;
-          msgEl.textContent = `Đang xử lý nền. Task: ${taskId}`;
+          const fileName = fileInput.files[0].name;
+          msgEl.textContent = `Đang xử lý: ${fileName}`;
           msgEl.className = "muted";
 
           const timer = setInterval(async () => {
             try {
               const { response: statusRes, data: statusData } = await apiFetch(`/api/tasks/${taskId}`, {}, 15000);
               if (!statusRes.ok || !statusData) {
-                msgEl.textContent = `Không lấy được trạng thái task: ${JSON.stringify(statusData)}`;
+                msgEl.textContent = `Không lấy được trạng thái: ${fileName}`;
                 msgEl.className = "err";
                 uploadBtn.disabled = false;
                 clearInterval(timer);
                 return;
               }
 
-              msgEl.textContent = `Task ${taskId}: ${statusData.status}`;
+              msgEl.textContent = `File ${fileName}: ${statusData.status}`;
               if (statusData.status === "completed") {
                 msgEl.className = "ok";
                 resultEl.textContent = JSON.stringify(statusData.result, null, 2);
@@ -407,6 +424,20 @@ async def list_documents(limit: int = 50) -> JSONResponse:
         return JSONResponse(response.json())
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail=f"Failed to fetch documents from RAG service: {exc}") from exc
+
+
+@app.delete("/api/documents/{doc_id}")
+async def delete_document(doc_id: str) -> JSONResponse:
+    try:
+        # Note: LightRAG service needs to support DELETE /documents/{doc_id}
+        # Assuming the backend has it or we are adding it to the client
+        response = requests.delete(f"{RAG_SERVICE_URL}/documents/{doc_id}", timeout=15)
+        response.raise_for_status()
+        return JSONResponse(response.json())
+    except requests.RequestException as exc:
+        log.error(f"Delete failed: {exc}")
+        # If the backend doesn't support DELETE yet, we might need to implement it there first.
+        raise HTTPException(status_code=502, detail=f"Failed to delete document: {exc}") from exc
 
 
 @app.post("/api/upload")

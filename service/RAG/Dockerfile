@@ -7,11 +7,14 @@ RUN apt-get update && apt-get install -y \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+COPY service/RAG/requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py .
+# Copy the scripts directory to allow tools to be imported
+COPY scripts/ /app/scripts/
+# Copy service code
+COPY service/RAG/app.py /app/
 
 ENV LLM_PROVIDER=openai
 ENV LLM_MODEL=gpt-4o-mini

@@ -17,6 +17,7 @@ import logging
 import tempfile
 from urllib.parse import urlparse
 from typing import Optional, List
+from datetime import datetime
 from enum import Enum
 from functools import partial
 
@@ -33,6 +34,14 @@ from lightrag.llm.openai import (
     openai_embed,
     wrap_embedding_func_with_attrs,
 )
+
+# Tools imports
+try:
+    from scripts.tools.search import tavily_search
+except ImportError:
+    log.warning("scripts.tools.search.tavily_search not found. Search functionality will be limited.")
+    async def tavily_search(query, **kwargs):
+        return "Search tool not available."
 
 # ── Config via env vars ────────────────────────────────────────────────
 LLM_PROVIDER     = os.getenv("LLM_PROVIDER",       "openai")     # openai, azure, ollama, gemini, claude
@@ -57,6 +66,7 @@ CHUNK_SIZE       = int(os.getenv("CHUNK_SIZE",     "1024"))
 CHUNK_OVERLAP    = int(os.getenv("CHUNK_OVERLAP",  "20"))
 LOG_LEVEL        = os.getenv("LOG_LEVEL",          "INFO")
 QUERY_TIMEOUT_SEC = float(os.getenv("QUERY_TIMEOUT_SEC", "45"))
+TAVILY_API_KEY    = os.getenv("TAVILY_API_KEY", "")
 
 # ── Logging ───────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -117,6 +127,7 @@ class QueryRequest(BaseModel):
     query: str
     top_k: int = 10
     return_structured_output: bool = False
+    session_id: Optional[str] = "default_session"
 
 
 class UploadDocumentResponse(BaseModel):
@@ -145,6 +156,100 @@ class DocumentRecord(BaseModel):
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
     metadata: Optional[dict] = None
+
+
+# ── External Tools ─────────────────────────────────────────────────────
+# (Imported from scripts.tools.search)
+
+
+# ── Conversation History (Redis) ──────────────────────────────────────
+async def get_chat_history(session_id: str) -> list[dict]:
+    """Retrieve chat history from Redis"""
+    import redis.asyncio as redis
+    client = None
+    try:
+        client = redis.Redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=5, socket_connect_timeout=5)
+        history_json = await client.get(f"chat_history:{session_id}")
+        if history_json:
+            data = json.loads(history_json)
+            log.info(f"Redis: Found {len(data)} messages for session {session_id}")
+            return data
+    except Exception as e:
+        log.error(f"Redis get error (session={session_id}): {e}")
+    finally:
+        if client:
+            await client.aclose()
+    return []
+
+
+async def save_chat_history(session_id: str, history: list[dict], max_len: int = 10):
+    """Save chat history to Redis with a limit"""
+    import redis.asyncio as redis
+    client = None
+    try:
+        # Keep only the last N messages (N * 2 for user+assistant)
+        history_trimmed = history[-(max_len * 2):]
+        data = json.dumps(history_trimmed)
+        
+        client = redis.Redis.from_url(REDIS_URL, socket_timeout=5, socket_connect_timeout=5)
+        await client.setex(f"chat_history:{session_id}", 86400, data)
+        log.info(f"Redis: Saved {len(history_trimmed)} messages for {session_id}")
+    except Exception as e:
+        log.error(f"Redis save error (session={session_id}): {e}")
+    finally:
+        if client:
+            await client.aclose()
+
+
+async def route_query(query: str, llm_func, history: list[dict] = []) -> tuple[str, Optional[str]]:
+    """
+    Classify user query into categories: RAG, SEARCH, OTHER.
+    SEARCH is for real-time info like weather, news, etc.
+    Returns: (category, refined_query)
+    """
+    history_str = ""
+    if history:
+        history_str = "LỊCH SỬ TRÒ CHUYỆN GẦN ĐÂY:\n" + "\n".join([f"{m['role']}: {m['content']}" for m in history[-3:]])
+
+    date_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    prompt = f"""{history_str}
+Thời gian hiện tại: {date_time}
+
+BẠN LÀ MỘT BỘ ĐỊNH TUYẾN CÂU HỎI (QUERY ROUTER) THÔNG MINH.
+Hãy phân tích câu hỏi của người dùng và trả về kết quả dưới định dạng JSON:
+{{
+  "category": "SEARCH" | "RAG" | "OTHER",
+  "search_query": "câu truy vấn tối ưu cho công cụ tìm kiếm nếu khách muốn cập nhật thông tin mới, hoặc null"
+}}
+
+- 'SEARCH': Nếu người dùng hỏi các thông tin cần dữ liệu thực tế mới (thời tiết, giá cả, tin tức).
+- 'RAG': Nếu người dùng hỏi kiến thức chuyên môn hoặc thông tin trong tài liệu đã upload.
+- 'OTHER': Chào hỏi, tán gẫu hoặc phản hồi dựa trên lịch sử trò chuyện.
+
+Câu hỏi mới nhất: "{query}"
+
+YÊU CẦU:
+1. Độ chính xác cao trong việc phân loại.
+2. CHỈ TRẢ VỀ DUY NHẤT JSON. KHÔNG GIẢI THÍCH.
+"""
+    try:
+        response = await llm_func(prompt)
+        clean_resp = response.strip()
+        if clean_resp.startswith("```json"):
+            clean_resp = clean_resp.split("```json")[1].split("```")[0].strip()
+        elif clean_resp.startswith("```"):
+            clean_resp = clean_resp.split("```")[1].split("```")[0].strip()
+            
+        data = json.loads(clean_resp)
+        category = data.get("category", "RAG").upper()
+        search_query = data.get("search_query") or query
+        
+        log.info(f"Router classification: {category}")
+        return category, search_query
+    except Exception as e:
+        log.error(f"Routing logic failed: {e}")
+        return "RAG", query
 
 
 # ── Initialize LLM ─────────────────────────────────────────────────────
@@ -460,6 +565,68 @@ async def query_rag(request: QueryRequest):
             )
 
         async with QUERY_LOCK:
+            # 0. Get History
+            session_id = request.session_id or "default_session"
+            history = await get_chat_history(session_id)
+
+            # 1. Routing logic
+            category, refined_query = await route_query(request.query, llm_model_func, history)
+            
+            answer = ""
+            if category == "SEARCH":
+                search_results = await tavily_search(refined_query)
+                summary_prompt = f"""Hãy trả lời câu hỏi dựa trên kết quả tìm kiếm sau.
+Thời gian hiện tại: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+YÊU CẦU CỐT LÕI:
+1. TRẢ LỜI THẲNG VÀO VẤN ĐỀ, CỰC KỲ NGẮN GỌN (Dưới 3 câu nếu có thể).
+2. ĐẶC BIỆT LƯU Ý: KHÔNG sử dụng các ký tự đặc biệt khoa học, ký hiệu toán học phức tạp hay định dạng LaTeX (ví dụ: không dùng \Delta, \mu, \pi, v.v.). Hãy viết rõ tên bằng chữ thay vì dùng ký hiệu (ví dụ: dùng "Delta" thay cho Δ, "Micro" thay cho μ).
+3. Độ chính xác tuyệt đối dựa trên dữ liệu cung cấp.
+4. Không chào hỏi, không dẫn nhập.
+
+Câu hỏi: {request.query}
+Kết quả tìm kiếm:
+{search_results}
+
+Câu trả lời ngắn gọn (chỉ dùng chữ thường, không ký hiệu):"""
+                raw_answer = await llm_model_func(summary_prompt, history_messages=history)
+                answer = str(raw_answer)
+                
+                # Update History
+                history.append({"role": "user", "content": request.query})
+                history.append({"role": "assistant", "content": answer})
+                await save_chat_history(session_id, history)
+
+                return QueryResponse(
+                    response=answer,
+                    context=["Tavily Web Search"],
+                    model="tavily-search",
+                )
+            
+            if category == "OTHER":
+                other_prompt = f"""Phản hồi câu hỏi sau một cách tự nhiên nhưng cực kỳ ngắn gọn và chính xác.
+Thời gian hiện tại: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+YÊU CẦU QUAN TRỌNG: 
+- KHÔNG sử dụng ký tự đặc biệt khoa học, ký hiệu toán học hay LaTeX. 
+- Diễn đạt bằng ngôn từ phổ thông, rõ ràng.
+- Không trình bày dài dòng, không lặp lại câu hỏi.
+
+Câu hỏi: {request.query}
+Trả lời (chỉ dùng chữ, không ký hiệu):"""
+                raw_answer = await llm_model_func(other_prompt, history_messages=history)
+                answer = str(raw_answer)
+                
+                history.append({"role": "user", "content": request.query})
+                history.append({"role": "assistant", "content": answer})
+                await save_chat_history(session_id, history)
+
+                return QueryResponse(
+                    response=answer,
+                    context=["Direct LLM (General Chat)"],
+                    model=LLM_MODEL,
+                )
+
+            # 2. RAG logic
             try:
                 response = await asyncio.wait_for(
                     rag.aquery(
@@ -467,6 +634,8 @@ async def query_rag(request: QueryRequest):
                         param=QueryParam(
                             top_k=request.top_k,
                             mode="local" if request.return_structured_output else "global",
+                            conversation_history=history,
+                            system_prompt="BẠN PHẢI luôn phản hồi bằng văn bản thuần túy. TUYỆT ĐỐI KHÔNG sử dụng ký hiệu toán học, ký tự đặc biệt khoa học như Delta, Mu, Pi hay định dạng LaTeX. Nếu cần nhắc tới các đơn vị hoặc hằng số này, hãy viết rõ tên của chúng bằng chữ quốc ngữ hoặc tiếng Anh đơn giản."
                         ),
                     ),
                     timeout=QUERY_TIMEOUT_SEC,
@@ -490,6 +659,11 @@ async def query_rag(request: QueryRequest):
         # Current LightRAG aquery returns a string answer (or stream iterator when enabled).
         answer = response if isinstance(response, str) else str(response)
         context_items: list[str] = []
+        
+        # Update History for RAG
+        history.append({"role": "user", "content": request.query})
+        history.append({"role": "assistant", "content": answer})
+        await save_chat_history(session_id, history)
         
         elapsed_time = time.perf_counter() - start_time
         
@@ -659,6 +833,23 @@ async def get_track_status(track_id: str):
             "status_counts": status_counts,
         }
     )
+
+
+@app.delete("/documents/{doc_id}")
+async def delete_document(doc_id: str):
+    """Delete document from LightRAG storage by its ID."""
+    try:
+        log.info(f"Attempting to delete document_id={doc_id}...")
+        # LightRAG ados_delete is the method for deleting documents
+        await rag.adelete_by_doc_id(doc_id)
+        log.info(f"Document {doc_id} deletion triggered.")
+        return JSONResponse(
+            status_code=200,
+            content={"status": "success", "message": f"Deletion triggered for document {doc_id}"}
+        )
+    except Exception as e:
+        log.error(f"Failed to delete document {doc_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete document: {e}")
 
 
 # ── Run Server ─────────────────────────────────────────────────────────
