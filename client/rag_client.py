@@ -51,7 +51,8 @@ class RAGClient:
         file_path: str,
         storage_type: StorageType = StorageType.GRAPH,
         metadata: Optional[Dict[str, Any]] = None,
-        timeout: int = 300
+        timeout: int = 300,
+        upload_filename: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Upload document vào RAG system
@@ -88,8 +89,9 @@ class RAGClient:
         
         try:
             # Chuẩn bị form data
+            effective_filename = (upload_filename or path.name).strip() or path.name
             files = {
-                "file": (path.name, open(path, "rb"), "text/plain")
+                "file": (effective_filename, open(path, "rb"), "text/plain")
             }
             
             data = {
@@ -101,7 +103,7 @@ class RAGClient:
                 data["metadata"] = json.dumps(metadata)
             
             self.logger.info(
-                f"Uploading document '{path.name}' "
+                f"Uploading document '{effective_filename}' "
                 f"storage_type={storage_type.value} size={path.stat().st_size} bytes"
             )
             

@@ -123,7 +123,7 @@ INDEX_HTML = """
           return JSON.stringify(payload, null, 2);
         }
         const lines = payload.documents.map((doc, idx) => {
-          const fileName = (doc.metadata && doc.metadata.filename) ? doc.metadata.filename : (doc.file_path ? doc.file_path.split('/').pop() : "(unknown)");
+          const fileName = doc.display_filename || ((doc.metadata && doc.metadata.filename) ? doc.metadata.filename : (doc.file_path ? doc.file_path.split('/').pop() : "(unknown)"));
           const docId = doc.id;
           return `${idx + 1}. [${fileName}] | status=${doc.status} | chunks=${doc.chunks_count ?? 0} | updated=${doc.updated_at ?? "-"} <button onclick="deleteDoc('${docId}', '${fileName}')" style="padding: 2px 6px; background: #991b1b; color: white; margin-left: 10px;">Xoá</button>`;
         });
@@ -176,6 +176,21 @@ INDEX_HTML = """
 
         try {
           uploadBtn.disabled = true;
+
+          const check = await apiFetch(`/api/check-duplicate-filename?filename=${encodeURIComponent(fileInput.files[0].name)}`, {}, 15000);
+          if (!check.response.ok) {
+            msgEl.textContent = (check.data && check.data.detail) ? check.data.detail : "Không kiểm tra được trùng tên file.";
+            msgEl.className = "err";
+            uploadBtn.disabled = false;
+            return;
+          }
+          if (check.data && check.data.is_duplicate) {
+            msgEl.textContent = `File trùng tên: ${fileInput.files[0].name}. Vui lòng đổi tên file trước khi upload.`;
+            msgEl.className = "err";
+            uploadBtn.disabled = false;
+            return;
+          }
+
           const formData = new FormData();
           formData.append("file", fileInput.files[0]);
           formData.append("storage_type", storageType);
@@ -314,11 +329,60 @@ def _active_tasks() -> dict[str, dict[str, Any]]:
         return {
             task_id: task
             for task_id, task in TASKS.items()
-      if task.get("status") in {"queued", "running", "indexing"}
+            if task.get("status") in {"queued", "running", "indexing"}
         }
 
 
-def _run_upload_task(task_id: str, file_path: str, storage_type: StorageType, metadata: dict[str, Any]) -> None:
+def _extract_display_filename(doc: dict[str, Any]) -> str:
+    metadata = doc.get("metadata") or {}
+    if isinstance(metadata, dict) and metadata.get("filename"):
+        return str(metadata.get("filename"))
+
+    file_path = doc.get("file_path")
+    if file_path and str(file_path) != "unknown_source":
+        return str(file_path).split("/")[-1]
+
+    return "(unknown)"
+
+
+def _fetch_documents_payload(limit: int = 500) -> dict[str, Any]:
+    response = requests.get(f"{RAG_SERVICE_URL}/documents", params={"limit": limit}, timeout=15)
+    response.raise_for_status()
+    payload = response.json()
+    documents = payload.get("documents", [])
+    if isinstance(documents, list):
+        for doc in documents:
+            if isinstance(doc, dict):
+                doc["display_filename"] = _extract_display_filename(doc)
+    return payload
+
+
+def _is_duplicate_filename(filename: str) -> bool:
+    target = filename.strip().lower()
+    if not target:
+        return False
+
+    payload = _fetch_documents_payload(limit=500)
+    documents = payload.get("documents", [])
+    if not isinstance(documents, list):
+        return False
+
+    for doc in documents:
+        if not isinstance(doc, dict):
+            continue
+        display_name = str(doc.get("display_filename") or "").strip().lower()
+        if display_name == target:
+            return True
+    return False
+
+
+def _run_upload_task(
+  task_id: str,
+  file_path: str,
+  storage_type: StorageType,
+  metadata: dict[str, Any],
+  original_filename: str,
+) -> None:
     try:
         _set_task(task_id, {"status": "running", "started_at": time.time()})
         result = rag_client.upload_document(
@@ -326,6 +390,7 @@ def _run_upload_task(task_id: str, file_path: str, storage_type: StorageType, me
             storage_type=storage_type,
             metadata=metadata,
             timeout=600,
+          upload_filename=original_filename,
         )
 
         if result is None:
@@ -375,6 +440,24 @@ def _run_upload_task(task_id: str, file_path: str, storage_type: StorageType, me
             )
             return
 
+        status_counts = track_payload.get("status_counts") or {}
+        failed_count = int(status_counts.get("failed", 0) or 0)
+        if failed_count > 0:
+            _set_task(
+                task_id,
+                {
+                    "status": "failed",
+                    "error": {
+                        "message": "Indexing failed for one or more documents in this track.",
+                        "track_status": track_payload,
+                    },
+                    "track_status": track_payload,
+                    "result": result,
+                    "finished_at": time.time(),
+                },
+            )
+            return
+
         _set_task(
             task_id,
             {
@@ -418,12 +501,22 @@ async def health() -> JSONResponse:
 
 @app.get("/api/documents")
 async def list_documents(limit: int = 50) -> JSONResponse:
+  try:
+    payload = _fetch_documents_payload(limit=limit)
+    return JSONResponse(payload)
+  except requests.RequestException as exc:
+    raise HTTPException(status_code=502, detail=f"Failed to fetch documents from RAG service: {exc}") from exc
+
+
+@app.get("/api/check-duplicate-filename")
+async def check_duplicate_filename(filename: str) -> JSONResponse:
+    normalized = filename.strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="filename is required")
     try:
-        response = requests.get(f"{RAG_SERVICE_URL}/documents", params={"limit": limit}, timeout=15)
-        response.raise_for_status()
-        return JSONResponse(response.json())
+        return JSONResponse({"filename": normalized, "is_duplicate": _is_duplicate_filename(normalized)})
     except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch documents from RAG service: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"Failed to check duplicate filename: {exc}") from exc
 
 
 @app.delete("/api/documents/{doc_id}")
@@ -446,6 +539,19 @@ async def upload_document(
     storage_type: str = Form("graph"),
     metadata: str = Form(""),
 ) -> JSONResponse:
+    incoming_name = (file.filename or "").strip()
+    if not incoming_name:
+        raise HTTPException(status_code=400, detail="filename is required")
+
+    try:
+        if _is_duplicate_filename(incoming_name):
+            raise HTTPException(
+                status_code=409,
+                detail=f"File trùng tên: {incoming_name}. Vui lòng đổi tên file trước khi upload.",
+            )
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to validate duplicate filename: {exc}") from exc
+
     try:
         storage = StorageType(storage_type)
     except ValueError as exc:
@@ -457,6 +563,7 @@ async def upload_document(
             parsed_metadata = json.loads(metadata)
         except json.JSONDecodeError as exc:
             raise HTTPException(status_code=400, detail="metadata must be valid JSON") from exc
+    parsed_metadata["filename"] = incoming_name
 
     suffix = Path(file.filename or "upload.txt").suffix or ".txt"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
@@ -477,7 +584,7 @@ async def upload_document(
 
     thread = threading.Thread(
         target=_run_upload_task,
-        args=(task_id, temp_path, storage, parsed_metadata),
+      args=(task_id, temp_path, storage, parsed_metadata, incoming_name),
         daemon=True,
     )
     thread.start()

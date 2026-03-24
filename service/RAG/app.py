@@ -12,17 +12,19 @@ import io
 import os
 import time
 import json
+import re
 import asyncio
 import logging
 import tempfile
 from urllib.parse import urlparse
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from enum import Enum
 from functools import partial
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 import asyncpg
@@ -67,6 +69,11 @@ CHUNK_OVERLAP    = int(os.getenv("CHUNK_OVERLAP",  "20"))
 LOG_LEVEL        = os.getenv("LOG_LEVEL",          "INFO")
 QUERY_TIMEOUT_SEC = float(os.getenv("QUERY_TIMEOUT_SEC", "45"))
 TAVILY_API_KEY    = os.getenv("TAVILY_API_KEY", "")
+ROUTER_LOW_CONFIDENCE_THRESHOLD = float(os.getenv("ROUTER_LOW_CONFIDENCE_THRESHOLD", "0.60"))
+SEARCH_FALLBACK_ON_EMPTY_RAG = os.getenv("SEARCH_FALLBACK_ON_EMPTY_RAG", "true").lower() in {"1", "true", "yes", "on"}
+SUBQUERY_MAX_CONCURRENCY = max(1, int(os.getenv("SUBQUERY_MAX_CONCURRENCY", "4")))
+ROUTER_SKIP_KB_PROBE_CONFIDENCE = float(os.getenv("ROUTER_SKIP_KB_PROBE_CONFIDENCE", "0.90"))
+VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
 # ── Logging ───────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -125,7 +132,7 @@ class UploadDocumentRequest(BaseModel):
 class QueryRequest(BaseModel):
     """Request model for query"""
     query: str
-    top_k: int = 10
+    top_k: int = 8
     return_structured_output: bool = False
     session_id: Optional[str] = "default_session"
 
@@ -163,7 +170,7 @@ class DocumentRecord(BaseModel):
 
 
 # ── Conversation History (Redis) ──────────────────────────────────────
-async def get_chat_history(session_id: str) -> list[dict]:
+async def get_chat_history(session_id: str) -> List[Dict[str, Any]]:
     """Retrieve chat history from Redis"""
     import redis.asyncio as redis
     client = None
@@ -182,13 +189,13 @@ async def get_chat_history(session_id: str) -> list[dict]:
     return []
 
 
-async def save_chat_history(session_id: str, history: list[dict], max_len: int = 10):
+async def save_chat_history(session_id: str, history: List[Dict[str, Any]], max_len: int = 10):
     """Save chat history to Redis with a limit"""
     import redis.asyncio as redis
     client = None
     try:
         # Keep only the last N messages (N * 2 for user+assistant)
-        history_trimmed = history[-(max_len * 2):]
+        history_trimmed = history[-(max_len * 2):]  # type: ignore
         data = json.dumps(history_trimmed)
         
         client = redis.Redis.from_url(REDIS_URL, socket_timeout=5, socket_connect_timeout=5)
@@ -201,55 +208,451 @@ async def save_chat_history(session_id: str, history: list[dict], max_len: int =
             await client.aclose()
 
 
-async def route_query(query: str, llm_func, history: list[dict] = []) -> tuple[str, Optional[str]]:
+# ── Real Estate Assistant Persona ─────────────────────────────────────
+SYSTEM_PERSONA = """Bạn là trợ lý tư vấn chuyên sâu về các dự án bất động sản của Noble.
+
+PHẠM VI TRẢ LỜI CỐ ĐỊNH:
+1. Thông tin dự án, sản phẩm, chính sách bán hàng, pháp lý bất động sản của Noble.
+2. Thông tin về ngày giờ hiện tại và thời tiết tại một địa điểm (thông qua tra cứu).
+
+LUẬT TỪ CHỐI (QUAN TRỌNG):
+- TUYỆT ĐỐI KHÔNG trả lời các chủ đề: Thể thao, Giải trí, Chính trị, Tôn giáo, Kiến thức chung không liên quan (như công nghệ, nấu ăn, y tế, v.v.), hoặc đời tư.
+- Nếu khách hỏi ngoài phạm vi trên, hãy lịch sự từ chối: "Dạ, em là trợ lý chuyên biệt về dự án Noble Palace, em chỉ có thể hỗ trợ Anh/Chị thông tin về dự án, bất động sản, thời tiết và ngày giờ ạ. Anh/Chị có thắc mắc nào về [tên một tiện ích/dự án trong Noble] không ạ?"
+
+QUY TẮC GIAO TIẾP:
+- Xưng "em", gọi khách là "Anh/Chị".
+- Trả lời ngắn gọn, đi thẳng vào vấn đề.
+- KHÔNG gửi lời chào "Dạ em chào Anh/Chị" một cách máy móc trong mỗi câu trả lời nếu cuộc hội thoại đang diễn ra.
+- KHÔNG bịa đặt thông tin. Nếu không biết, mời để lại số điện thoại."""
+
+
+def _extract_first_json_object(text: str) -> Optional[str]:
+    """Extract the first balanced JSON object from LLM output text."""
+    if not text:
+        return None
+
+    def _extract_balanced_from(source: str) -> Optional[str]:
+        start = source.find("{")
+        if start < 0:
+            return None
+
+        depth = 0
+        for idx in range(start, len(source)):
+            char = source[idx]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[start : idx + 1]
+        return None
+
+    clean_text = text.strip()
+
+    if "```" in clean_text:
+        blocks = clean_text.split("```")
+        for block in blocks:
+            candidate = block.strip()
+            if not candidate:
+                continue
+            if candidate.lower().startswith("json"):
+                candidate = candidate[4:].strip()
+            extracted = _extract_balanced_from(candidate)
+            if extracted:
+                return extracted
+
+    return _extract_balanced_from(clean_text)
+
+
+def _now_vietnam_str() -> str:
+    """Current time in Vietnam timezone (Asia/Ho_Chi_Minh)."""
+    return datetime.now(VN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _now_vietnam_human() -> str:
+    """Human-friendly current Vietnam time in Vietnamese."""
+    now_vn = datetime.now(VN_TZ)
+    return (
+        f"{now_vn.hour} giờ {now_vn.minute:02d} phút "
+        f"ngày {now_vn.day:02d} tháng {now_vn.month:02d} năm {now_vn.year}"
+    )
+
+
+async def _analyze_time_intent(query: str, llm_func) -> tuple[bool, bool]:
+    """Use LLM to detect if query asks current time and whether a specific location is provided."""
+    prompt = f"""Bạn là bộ phân tích intent.
+Trả về DUY NHẤT JSON:
+{{
+  "asks_current_time": true|false,
+  "has_specific_location": true|false
+}}
+
+Định nghĩa:
+- asks_current_time=true nếu câu hỏi yêu cầu thời điểm hiện tại (mấy giờ, hiện tại bao nhiêu giờ, current time, now time...).
+- has_specific_location=true nếu người dùng đã nêu rõ địa điểm/khu vực cần lấy giờ.
+
+Câu hỏi: "{query}"""  # noqa: E501
+
+    try:
+        response = await llm_func(
+            prompt,
+            enable_cot=False,
+            response_format={"type": "json_object"},
+        )
+        payload = _extract_first_json_object(str(response))
+        if not payload:
+            raise ValueError("No JSON object found in time intent response")
+
+        data = json.loads(payload)
+        asks_current_time = bool(data.get("asks_current_time", False))
+        has_specific_location = bool(data.get("has_specific_location", False))
+        log.info(
+            "Time intent: asks_current_time=%s has_specific_location=%s",
+            asks_current_time,
+            has_specific_location,
+        )
+        return asks_current_time, has_specific_location
+    except Exception as e:
+        log.error(f"Time intent parse failed (pass 1): {e}")
+        try:
+            retry_prompt = prompt + "\n\nBẮT BUỘC: Trả về DUY NHẤT JSON object hợp lệ, không markdown, không text thừa."
+            retry_response = await llm_func(
+                retry_prompt,
+                enable_cot=False,
+                response_format={"type": "json_object"},
+            )
+            retry_payload = _extract_first_json_object(str(retry_response))
+            if not retry_payload:
+                raise ValueError("No JSON object found in time intent retry response")
+
+            retry_data = json.loads(retry_payload)
+            asks_current_time = bool(retry_data.get("asks_current_time", False))
+            has_specific_location = bool(retry_data.get("has_specific_location", False))
+            log.info(
+                "Time intent (retry): asks_current_time=%s has_specific_location=%s",
+                asks_current_time,
+                has_specific_location,
+            )
+            return asks_current_time, has_specific_location
+        except Exception as retry_error:
+            log.error(f"Time intent parse failed (pass 2): {retry_error}")
+            return False, False
+
+
+async def _kb_evidence_probe(query: str, history: List[Dict[str, Any]]) -> bool:
+    """Quick KB evidence probe using a constrained RAG call to reduce mis-routing."""
+    try:
+        probe_query = (
+            "Bạn là bộ kiểm tra bằng chứng nội bộ. "
+            "Dựa trên ngữ cảnh truy xuất từ kho tài liệu, chỉ trả về đúng 1 token: KB_HIT hoặc KB_MISS.\n"
+            f"Câu hỏi: {query}"
+        )
+        probe_response = await asyncio.wait_for(
+            rag.aquery(
+                probe_query,
+                param=QueryParam(
+                    top_k=2,
+                    mode="naive",
+                    conversation_history=history[-2:],
+                ),
+            ),
+            timeout=min(QUERY_TIMEOUT_SEC, 20),
+        )
+        probe_text = (probe_response if isinstance(probe_response, str) else str(probe_response)).strip().upper()
+        kb_hit = "KB_HIT" in probe_text and "KB_MISS" not in probe_text
+        log.info("KB evidence probe: %s", "KB_HIT" if kb_hit else "KB_MISS")
+        return kb_hit
+    except Exception as e:
+        log.warning(f"KB evidence probe failed, defaulting to no evidence: {e}")
+        return False
+
+
+async def _decompose_subqueries(query: str, llm_func) -> List[str]:
+    """Decompose a mixed-intent query into standalone subqueries using LLM."""
+    prompt = f"""Bạn là bộ tách ý câu hỏi.
+Trả về DUY NHẤT JSON:
+{{
+  "subqueries": ["...", "..."]
+}}
+
+Quy tắc:
+- Nếu câu hỏi chỉ có 1 ý, trả mảng gồm đúng 1 phần tử là câu gốc.
+- Nếu câu có nhiều ý (ví dụ vừa hỏi thời gian vừa hỏi dự án), tách thành các câu độc lập, ngắn gọn, đủ nghĩa.
+- Không thêm thông tin mới.
+- KHÔNG được bỏ sót ý nào trong câu gốc, kể cả mệnh đề cuối sau từ nối.
+- Giữ thứ tự ý như câu gốc.
+
+Câu hỏi gốc: "{query}"""  # noqa: E501
+
+    try:
+        response = await llm_func(
+            prompt,
+            enable_cot=False,
+            response_format={"type": "json_object"},
+        )
+        payload = _extract_first_json_object(str(response))
+        if not payload:
+            raise ValueError("No JSON object found in decomposition response")
+
+        data = json.loads(payload)
+        raw_items = data.get("subqueries", [])
+        if not isinstance(raw_items, list):
+            return [query]
+
+        cleaned: List[str] = []
+        seen: set[str] = set()
+        for item in raw_items:
+            text = str(item).strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(text)
+
+        if not cleaned:
+            return [query]
+
+        log.info("Subquery decomposition count=%s items=%s", len(cleaned), cleaned)
+        return cleaned
+    except Exception as e:
+        log.error(f"Subquery decomposition failed: {e}")
+        return [query]
+
+
+async def _timed_await(label: str, awaitable):
+    """Await a coroutine and emit elapsed time to logs."""
+    started = time.perf_counter()
+    try:
+        return await awaitable
+    finally:
+        elapsed = time.perf_counter() - started
+        log.info("Timing[%s]: %.2fs", label, elapsed)
+
+
+def _normalize_search_query_for_vietnam(original_query: str, refined_query: Optional[str]) -> str:
+    """Prioritize Vietnam context for SEARCH queries without keyword hardcoding."""
+    candidate = (refined_query or original_query or "").strip()
+    if not candidate:
+        return "Việt Nam"
+
+    lowered = candidate.lower()
+    if "việt nam" in lowered or "vietnam" in lowered:
+        return candidate
+
+    return f"{candidate} tại Việt Nam"
+
+
+async def _summarize_search_answer(
+    user_query: str,
+    search_query: str,
+    history: List[Dict[str, Any]],
+    max_sentences: int = 3,
+) -> str:
+    """Run Tavily search then summarize answer in assistant persona."""
+    normalized_query = _normalize_search_query_for_vietnam(user_query, search_query)
+    search_results = await tavily_search(normalized_query)
+    summary_prompt = f"""{SYSTEM_PERSONA}
+
+Anh/Chị vừa hỏi về thông tin bên ngoài dự án. Em sẽ tra cứu và cung cấp thông tin chính xác.
+Thời gian hiện tại (Việt Nam - UTC+7): {_now_vietnam_str()}
+
+QUY TẮC TRẢ LỜI:
+- Trả lời ngắn gọn, dưới {max_sentences} câu.
+- Chỉ trích dẫn thông tin từ kết quả tìm kiếm.
+- Không dùng ký hiệu toán học hay LaTeX.
+- Ưu tiên thông tin theo ngữ cảnh Việt Nam; nếu có nhiều khu vực, ưu tiên dữ liệu tại Việt Nam.
+- Với câu hỏi về thời gian hiện tại, trả theo múi giờ Việt Nam (UTC+7) nếu người dùng không chỉ định nơi khác.
+- Nếu kết quả chứa múi giờ nước ngoài, quy đổi hoặc diễn giải lại theo giờ Việt Nam trước khi trả lời.
+- Nếu câu hỏi không nêu rõ dự án, đừng tự gắn vào một dự án cụ thể; chỉ nói theo dữ liệu đã retrieve được.
+
+Câu hỏi của Anh/Chị: {user_query}
+Thông tin tra cứu được:
+{search_results}
+
+Câu trả lời:"""
+    raw_answer = await llm_model_func(summary_prompt, history_messages=history)
+    return str(raw_answer)
+
+
+async def route_query(query: str, llm_func, history: Optional[List[Dict[str, Any]]] = None) -> tuple[str, Optional[str]]:
+    t_route_total = time.perf_counter()
+
+    def _finish(category: str, routed_query: Optional[str]) -> tuple[str, Optional[str]]:
+        log.info(
+            "Timing[router.total]: %.2fs category=%s",
+            time.perf_counter() - t_route_total,
+            category,
+        )
+        return category, routed_query
+
+    if history is None:
+        history = []
     """
     Classify user query into categories: RAG, SEARCH, OTHER.
     SEARCH is for real-time info like weather, news, etc.
     Returns: (category, refined_query)
     """
     history_str = ""
+    recent_history = history[-2:]
     if history:
-        history_str = "LỊCH SỬ TRÒ CHUYỆN GẦN ĐÂY:\n" + "\n".join([f"{m['role']}: {m['content']}" for m in history[-3:]])
+        history_str = "LỊCH SỬ TRÒ CHUYỆN GẦN ĐÂY:\n" + "\n".join([f"{m['role']}: {m['content']}" for m in recent_history])  # type: ignore
 
-    date_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    date_time = _now_vietnam_str()
 
     prompt = f"""{history_str}
 Thời gian hiện tại: {date_time}
 
-BẠN LÀ MỘT BỘ ĐỊNH TUYẾN CÂU HỎI (QUERY ROUTER) THÔNG MINH.
-Hãy phân tích câu hỏi của người dùng và trả về kết quả dưới định dạng JSON:
+BẠN LÀ BỘ ĐỊNH TUYẾN CÂU HỎI cho hệ thống RAG doanh nghiệp.
+Phân tích câu hỏi và trả về JSON:
 {{
   "category": "SEARCH" | "RAG" | "OTHER",
-  "search_query": "câu truy vấn tối ưu cho công cụ tìm kiếm nếu khách muốn cập nhật thông tin mới, hoặc null"
+  "search_query": "câu truy vấn tối ưu hoặc null",
+  "confidence": 0.0-1.0,
+  "has_project_intent": true|false,
+  "needs_external_realtime": true|false,
+  "reason": "lý do ngắn"
 }}
 
-- 'SEARCH': Nếu người dùng hỏi các thông tin cần dữ liệu thực tế mới (thời tiết, giá cả, tin tức).
-- 'RAG': Nếu người dùng hỏi kiến thức chuyên môn hoặc thông tin trong tài liệu đã upload.
-- 'OTHER': Chào hỏi, tán gẫu hoặc phản hồi dựa trên lịch sử trò chuyện.
+- 'RAG': Câu hỏi về tri thức NỘI BỘ của hệ thống (dự án Noble Palace, sản phẩm, chính sách, pháp lý dự án...).
+- 'SEARCH': CHỈ chọn cho câu hỏi về THỜI TIẾT hiện tại hoặc các thông tin THỊ TRƯỜNG BẤT ĐỘNG SẢN bên ngoài (lãi suất ngân hàng mới nhất, quy hoạch khu vực dự án).
+- 'OTHER': Các câu hỏi chào hỏi xã giao HOẶC các câu hỏi NGOÀI PHẠM VI (thể thao, bóng đá, nấu ăn, kiến thức chung...). Các câu này sẽ bị AI từ chối ở bước sau.
 
-Câu hỏi mới nhất: "{query}"
+LUẬT ƯU TIÊN:
+- Nếu câu hỏi có thể trả lời từ dữ liệu nội bộ thì ưu tiên 'RAG'.
+- Chỉ chọn 'SEARCH' khi bản chất câu hỏi là dữ liệu ngoài hệ thống, cần nguồn cập nhật bên ngoài.
 
-YÊU CẦU:
-1. Độ chính xác cao trong việc phân loại.
-2. CHỈ TRẢ VỀ DUY NHẤT JSON. KHÔNG GIẢI THÍCH.
+QUY TẮC SEARCH:
+- Ưu tiên ngữ cảnh tại Việt Nam.
+- Nếu câu hỏi thời gian thực chưa nêu địa điểm, hãy viết search_query có hậu tố "tại Việt Nam".
+- Nếu người dùng đã nêu địa điểm cụ thể ngoài Việt Nam, giữ đúng địa điểm đó.
+
+Câu hỏi: "{query}"
+
+YÊU CẦU: CHỈ TRẢ VỀ JSON. KHÔNG GIẢI THÍCH.
 """
     try:
-        response = await llm_func(prompt)
-        clean_resp = response.strip()
-        if clean_resp.startswith("```json"):
-            clean_resp = clean_resp.split("```json")[1].split("```")[0].strip()
-        elif clean_resp.startswith("```"):
-            clean_resp = clean_resp.split("```")[1].split("```")[0].strip()
-            
-        data = json.loads(clean_resp)
-        category = data.get("category", "RAG").upper()
-        search_query = data.get("search_query") or query
-        
-        log.info(f"Router classification: {category}")
-        return category, search_query
+        response = await _timed_await(
+            "router.classify_llm",
+            llm_func(
+                prompt,
+                enable_cot=False,
+                response_format={"type": "json_object"},
+            ),
+        )
+
+        json_payload = _extract_first_json_object(str(response))
+        if not json_payload:
+            raise ValueError("No JSON object found in router response")
+
+        data = json.loads(json_payload)
+        category = str(data.get("category", "RAG")).upper()
+        if category not in {"SEARCH", "RAG", "OTHER"}:
+            category = "RAG"
+
+        search_query = str(data.get("search_query") or query).strip() or query
+        confidence_raw = data.get("confidence", 0.5)
+        try:
+            confidence = float(confidence_raw)
+        except Exception:
+            confidence = 0.5
+        confidence = max(0.0, min(1.0, confidence))
+        has_project_intent = bool(data.get("has_project_intent", category == "RAG"))
+        needs_external_realtime = bool(data.get("needs_external_realtime", category == "SEARCH"))
+
+        log.info(
+            "Router intent flags: project_intent=%s external_realtime=%s confidence=%.2f",
+            has_project_intent,
+            needs_external_realtime,
+            confidence,
+        )
+
+        if confidence >= ROUTER_SKIP_KB_PROBE_CONFIDENCE:
+            kb_hit = False
+            log.info(
+                "KB evidence probe skipped: confidence=%.2f threshold=%.2f",
+                confidence,
+                ROUTER_SKIP_KB_PROBE_CONFIDENCE,
+            )
+        else:
+            kb_hit = await _timed_await("router.kb_probe", _kb_evidence_probe(query, history))
+
+        if category == "SEARCH":
+            if has_project_intent or kb_hit:
+                log.info(
+                    "Router override SEARCH->RAG (confidence=%.2f, project_intent=%s, kb_hit=%s)",
+                    confidence,
+                    has_project_intent,
+                    kb_hit,
+                )
+                return _finish("RAG", query)
+            normalized_search_query = _normalize_search_query_for_vietnam(query, search_query)
+            log.info("Router final: SEARCH (confidence=%.2f)", confidence)
+            return _finish("SEARCH", normalized_search_query)
+
+        if category == "RAG":
+            low_confidence = confidence < ROUTER_LOW_CONFIDENCE_THRESHOLD
+            if (not kb_hit) and (
+                needs_external_realtime
+                or (low_confidence and not has_project_intent)
+            ):
+                normalized_search_query = _normalize_search_query_for_vietnam(query, search_query)
+                log.info(
+                    "Router override RAG->SEARCH (confidence=%.2f, threshold=%.2f, kb_hit=%s, external=%s, project_intent=%s)",
+                    confidence,
+                    ROUTER_LOW_CONFIDENCE_THRESHOLD,
+                    kb_hit,
+                    needs_external_realtime,
+                    has_project_intent,
+                )
+                return _finish("SEARCH", normalized_search_query)
+            log.info("Router final: RAG (confidence=%.2f)", confidence)
+            return _finish("RAG", query)
+
+        if has_project_intent or kb_hit:
+            log.info("Router override OTHER->RAG (project_intent=%s, kb_hit=%s)", has_project_intent, kb_hit)
+            return _finish("RAG", query)
+        # Removed OTHER->SEARCH override to prevent off-topic questions from triggerring search.
+        log.info("Router final: OTHER (confidence=%.2f)", confidence)
+        return _finish("OTHER", query)
     except Exception as e:
-        log.error(f"Routing logic failed: {e}")
-        return "RAG", query
+        log.error(f"Routing logic failed (pass 1): {e}")
+        try:
+            retry_prompt = prompt + "\n\nBẮT BUỘC: Trả về DUY NHẤT một JSON object hợp lệ, không có markdown, không có text thừa."
+            retry_response = await _timed_await(
+                "router.classify_llm_retry",
+                llm_func(
+                    retry_prompt,
+                    enable_cot=False,
+                    response_format={"type": "json_object"},
+                ),
+            )
+            retry_json_payload = _extract_first_json_object(str(retry_response))
+            if not retry_json_payload:
+                raise ValueError("No JSON object found in router retry response")
+
+            retry_data = json.loads(retry_json_payload)
+            retry_category = str(retry_data.get("category", "RAG")).upper()
+            if retry_category not in {"SEARCH", "RAG", "OTHER"}:
+                retry_category = "RAG"
+
+            retry_has_project_intent = bool(retry_data.get("has_project_intent", retry_category == "RAG"))
+            retry_needs_external_realtime = bool(retry_data.get("needs_external_realtime", retry_category == "SEARCH"))
+            log.info(
+                "Router intent flags (retry): project_intent=%s external_realtime=%s",
+                retry_has_project_intent,
+                retry_needs_external_realtime,
+            )
+
+            retry_search_query = str(retry_data.get("search_query") or query).strip() or query
+            if retry_category == "SEARCH":
+                retry_search_query = _normalize_search_query_for_vietnam(query, retry_search_query)
+            log.info(f"Router classification (retry): {retry_category}")
+            return _finish(retry_category, retry_search_query)
+        except Exception as retry_error:
+            log.error(f"Routing logic failed (pass 2): {retry_error}")
+            return _finish("RAG", query)
 
 
 # ── Initialize LLM ─────────────────────────────────────────────────────
@@ -266,15 +669,42 @@ def init_llm():
             history_messages=[],
             **kwargs,
         ):
-            return await openai_complete_if_cache(
+            # Patch for DeepSeek: It does not support Pydantic Structured Outputs.
+            # Convert any pydantic response_format to {"type": "json_object"} and append instruction.
+            # Also intercept 'keyword_extraction' because LightRAG's openai_complete_if_cache
+            # automatically adds Pydantic models if this flag is True!
+            force_json = False
+            if kwargs.get("keyword_extraction"):
+                kwargs["keyword_extraction"] = False
+                force_json = True
+            
+            if "response_format" in kwargs:
+                if type(kwargs["response_format"]) is not dict or kwargs["response_format"].get("type") != "json_object":
+                    force_json = True
+            
+            if force_json:
+                kwargs["response_format"] = {"type": "json_object"}
+                # Force JSON adherence via prompt string
+                prompt += "\n\nIMPORTANT: Return strictly a valid JSON object matching the requested schema. No additional text."
+
+            # enable_cot=True để hỗ trợ cả deepseek-chat và deepseek-reasoner
+            # deepseek-reasoner trả về reasoning_content thay vì content
+            cot = kwargs.pop("enable_cot", True)
+            
+            result = await openai_complete_if_cache(
                 LLM_MODEL,
                 prompt,
                 system_prompt=system_prompt,
                 history_messages=history_messages,
                 api_key=LLM_API_KEY,
                 base_url=os.getenv("LLM_API_URL") or None,
+                enable_cot=cot,
                 **kwargs,
             )
+            if result is None:
+                log.error(f"LLM returned None for model={LLM_MODEL}, prompt_len={len(prompt)}")
+                return ""
+            return result
 
         return llm_func
     elif provider_lower == "ollama":
@@ -309,12 +739,37 @@ def init_embedding():
             model_name=EMBEDDING_MODEL,
         )
         async def embedding_func(texts: list[str]):
-            return await ollama_embed.func(
-                texts,
-                embed_model=EMBEDDING_MODEL,
-                host=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
-                api_key=os.getenv("OLLAMA_API_KEY") or None,
-            )
+            if not texts:
+                return await ollama_embed.func(
+                    texts,
+                    embed_model=EMBEDDING_MODEL,
+                    host=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
+                    api_key=os.getenv("OLLAMA_API_KEY") or None,
+                )
+
+            batch_size = max(1, int(os.getenv("EMBEDDING_BATCH_SIZE", "4")))
+            if len(texts) <= batch_size:
+                return await ollama_embed.func(
+                    texts,
+                    embed_model=EMBEDDING_MODEL,
+                    host=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
+                    api_key=os.getenv("OLLAMA_API_KEY") or None,
+                )
+
+            import numpy as np
+
+            vectors = []
+            for start in range(0, len(texts), batch_size):
+                batch = texts[start : start + batch_size]
+                batch_vectors = await ollama_embed.func(
+                    batch,
+                    embed_model=EMBEDDING_MODEL,
+                    host=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
+                    api_key=os.getenv("OLLAMA_API_KEY") or None,
+                )
+                vectors.append(batch_vectors)
+
+            return np.concatenate(vectors, axis=0)
 
         return embedding_func
 
@@ -359,6 +814,8 @@ try:
         llm_model_func=llm_model_func,
         llm_model_name=LLM_MODEL,
         embedding_func=embedding_func,
+        embedding_func_max_async=int(os.getenv("EMBEDDING_FUNC_MAX_ASYNC", "2")),
+        default_embedding_timeout=int(os.getenv("EMBEDDING_TIMEOUT", "120")),
         chunk_token_size=CHUNK_SIZE,
         chunk_overlap_token_size=CHUNK_OVERLAP,
     )
@@ -477,11 +934,12 @@ async def upload_document(
                 detail="File is empty"
             )
         
-        # Parse metadata if provided
-        doc_metadata = {}
+        doc_metadata: Dict[str, Any] = {}
         if metadata:
             try:
-                doc_metadata = json.loads(metadata)
+                parsed = json.loads(metadata)
+                if isinstance(parsed, dict):
+                    doc_metadata.update(parsed)
             except json.JSONDecodeError:
                 raise HTTPException(
                     status_code=400,
@@ -502,6 +960,7 @@ async def upload_document(
         # Storage type parameter is retained for future extensibility.
         document_id = await rag.ainsert(
             text_content,
+            file_paths=file.filename,
         )
         
         # Estimate chunks (rough calculation)
@@ -533,160 +992,6 @@ async def upload_document(
 
 
 # ── Query Endpoint ─────────────────────────────────────────────────────
-@app.post("/query", response_model=QueryResponse)
-async def query_rag(request: QueryRequest):
-    """
-    Query the RAG system with document context
-    
-    Args:
-        request.query: Search query
-        request.top_k: Number of top results to use as context
-        request.return_structured_output: Return structured data
-    
-    Returns:
-        QueryResponse with LLM answer and context
-    """
-    
-    start_time = time.perf_counter()
-    
-    try:
-        if not request.query.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="Query cannot be empty"
-            )
-        
-        log.info(f"Processing query: {request.query[:100]}...")
-
-        if QUERY_LOCK.locked():
-            raise HTTPException(
-                status_code=429,
-                detail="RAG is currently processing another query. Please retry shortly.",
-            )
-
-        async with QUERY_LOCK:
-            # 0. Get History
-            session_id = request.session_id or "default_session"
-            history = await get_chat_history(session_id)
-
-            # 1. Routing logic
-            category, refined_query = await route_query(request.query, llm_model_func, history)
-            
-            answer = ""
-            if category == "SEARCH":
-                search_results = await tavily_search(refined_query)
-                summary_prompt = f"""Hãy trả lời câu hỏi dựa trên kết quả tìm kiếm sau.
-Thời gian hiện tại: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-
-YÊU CẦU CỐT LÕI:
-1. TRẢ LỜI THẲNG VÀO VẤN ĐỀ, CỰC KỲ NGẮN GỌN (Dưới 3 câu nếu có thể).
-2. ĐẶC BIỆT LƯU Ý: KHÔNG sử dụng các ký tự đặc biệt khoa học, ký hiệu toán học phức tạp hay định dạng LaTeX (ví dụ: không dùng \Delta, \mu, \pi, v.v.). Hãy viết rõ tên bằng chữ thay vì dùng ký hiệu (ví dụ: dùng "Delta" thay cho Δ, "Micro" thay cho μ).
-3. Độ chính xác tuyệt đối dựa trên dữ liệu cung cấp.
-4. Không chào hỏi, không dẫn nhập.
-
-Câu hỏi: {request.query}
-Kết quả tìm kiếm:
-{search_results}
-
-Câu trả lời ngắn gọn (chỉ dùng chữ thường, không ký hiệu):"""
-                raw_answer = await llm_model_func(summary_prompt, history_messages=history)
-                answer = str(raw_answer)
-                
-                # Update History
-                history.append({"role": "user", "content": request.query})
-                history.append({"role": "assistant", "content": answer})
-                await save_chat_history(session_id, history)
-
-                return QueryResponse(
-                    response=answer,
-                    context=["Tavily Web Search"],
-                    model="tavily-search",
-                )
-            
-            if category == "OTHER":
-                other_prompt = f"""Phản hồi câu hỏi sau một cách tự nhiên nhưng cực kỳ ngắn gọn và chính xác.
-Thời gian hiện tại: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-YÊU CẦU QUAN TRỌNG: 
-- KHÔNG sử dụng ký tự đặc biệt khoa học, ký hiệu toán học hay LaTeX. 
-- Diễn đạt bằng ngôn từ phổ thông, rõ ràng.
-- Không trình bày dài dòng, không lặp lại câu hỏi.
-
-Câu hỏi: {request.query}
-Trả lời (chỉ dùng chữ, không ký hiệu):"""
-                raw_answer = await llm_model_func(other_prompt, history_messages=history)
-                answer = str(raw_answer)
-                
-                history.append({"role": "user", "content": request.query})
-                history.append({"role": "assistant", "content": answer})
-                await save_chat_history(session_id, history)
-
-                return QueryResponse(
-                    response=answer,
-                    context=["Direct LLM (General Chat)"],
-                    model=LLM_MODEL,
-                )
-
-            # 2. RAG logic
-            try:
-                response = await asyncio.wait_for(
-                    rag.aquery(
-                        request.query,
-                        param=QueryParam(
-                            top_k=request.top_k,
-                            mode="local" if request.return_structured_output else "global",
-                            conversation_history=history,
-                            system_prompt="BẠN PHẢI luôn phản hồi bằng văn bản thuần túy. TUYỆT ĐỐI KHÔNG sử dụng ký hiệu toán học, ký tự đặc biệt khoa học như Delta, Mu, Pi hay định dạng LaTeX. Nếu cần nhắc tới các đơn vị hoặc hằng số này, hãy viết rõ tên của chúng bằng chữ quốc ngữ hoặc tiếng Anh đơn giản."
-                        ),
-                    ),
-                    timeout=QUERY_TIMEOUT_SEC,
-                )
-            except asyncio.TimeoutError:
-                elapsed_time = time.perf_counter() - start_time
-                log.error(
-                    "Query timed out after %.2fs (timeout=%.2fs). "
-                    "Possible LightRAG runtime stall.",
-                    elapsed_time,
-                    QUERY_TIMEOUT_SEC,
-                )
-                raise HTTPException(
-                    status_code=504,
-                    detail=(
-                        f"Query timed out after {QUERY_TIMEOUT_SEC:.1f}s. "
-                        "RAG runtime may be stalled; retry once or restart rag-service."
-                    ),
-                )
-
-        # Current LightRAG aquery returns a string answer (or stream iterator when enabled).
-        answer = response if isinstance(response, str) else str(response)
-        context_items: list[str] = []
-        
-        # Update History for RAG
-        history.append({"role": "user", "content": request.query})
-        history.append({"role": "assistant", "content": answer})
-        await save_chat_history(session_id, history)
-        
-        elapsed_time = time.perf_counter() - start_time
-        
-        log.info(
-            f"Query processed in {elapsed_time:.2f}s "
-            f"model={LLM_MODEL} context_items={len(context_items)}"
-        )
-        
-        return QueryResponse(
-            response=answer,
-            context=context_items[:request.top_k],
-            tokens_used=None,
-            model=LLM_MODEL,
-        )
-    
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error(f"Error processing query: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error processing query: {str(e)}"
-        )
 
 
 # ── Status Endpoint ────────────────────────────────────────────────────
@@ -850,6 +1155,298 @@ async def delete_document(doc_id: str):
     except Exception as e:
         log.error(f"Failed to delete document {doc_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to delete document: {e}")
+
+
+# ── Streaming Query Endpoint ──────────────────────────────────────────
+@app.post("/query/stream")
+async def query_rag_stream(request: QueryRequest):
+    """
+    Stream query response as NDJSON lines.
+    Each line is a JSON object: {"chunk": "...", "done": false}
+    Final line: {"chunk": "", "done": true, "model": "..."}
+    
+    Sentences are emitted as soon as they are complete (split on .!?),
+    so the client receives the first sentence within ~Router+first-token time.
+    """
+    if not request.query.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+
+    log.info(f"Stream query: {request.query[:100]}...")
+
+    async def generate():
+        import re
+        t_stream_total = time.perf_counter()
+        session_id = request.session_id or "default_session"
+        history = await _timed_await(f"stream.history_load[{session_id}]", get_chat_history(session_id))
+
+
+
+        # Heuristic optimization: skip decomposition for very short queries to save ~1.5s
+        if len(request.query.strip().split()) < 5:
+            subqueries = [request.query]
+            log.info("Skipping decomposition for short query: '%s'", request.query)
+        else:
+            subqueries = await _timed_await(
+                "stream.decompose_subqueries",
+                _decompose_subqueries(request.query, llm_model_func),
+            )
+
+        if len(subqueries) > 1:
+            completed_answers: Dict[int, str] = {}
+
+            semaphore = asyncio.Semaphore(SUBQUERY_MAX_CONCURRENCY)
+            log.info("Stream multi-intent parallel execution: subqueries=%s concurrency=%s", len(subqueries), SUBQUERY_MAX_CONCURRENCY)
+
+            async def _run_stream_subquery(idx: int, sub_query: str) -> tuple[int, str]:
+                async with semaphore:
+                    t_sub_total = time.perf_counter()
+                    sub_category, sub_refined_query = await _timed_await(
+                        f"stream.subquery[{idx}].route",
+                        route_query(sub_query, llm_model_func, history),
+                    )
+
+                    if sub_category == "SEARCH":
+                        if sub_refined_query:
+                            search_query = sub_refined_query.strip()
+                        else:
+                            search_query = sub_query.strip()
+                        sub_answer = await _timed_await(
+                            f"stream.subquery[{idx}].search_summarize",
+                            _summarize_search_answer(
+                                user_query=sub_query,
+                                search_query=search_query,
+                                history=history,
+                                max_sentences=2,
+                            ),
+                        )
+                        log.info("Timing[stream.subquery[%s].total]: %.2fs", idx, time.perf_counter() - t_sub_total)
+                        return idx, sub_answer
+
+                    if sub_category == "OTHER":
+                        other_prompt = f"""{SYSTEM_PERSONA}
+Tiểu câu hỏi/lời nhắn: {sub_query}
+Hãy phản hồi ngắn gọn, lịch sự, đúng vai trò."""
+                        raw = await _timed_await(
+                            f"stream.subquery[{idx}].other_llm",
+                            llm_model_func(other_prompt, history_messages=history),
+                        )
+                        log.info("Timing[stream.subquery[%s].total]: %.2fs", idx, time.perf_counter() - t_sub_total)
+                        return idx, str(raw)
+
+                    rag_sub_query = (
+                        f"[NGỮ CẢNH: {SYSTEM_PERSONA}]\n\n"
+                        f"Tiểu câu hỏi của khách hàng: {sub_query}\n\n"
+                        f"Hãy trả lời dựa trên thông tin retrieve từ toàn bộ kho tài liệu đã index. "
+                        f"Không mặc định dự án cụ thể nếu câu hỏi mơ hồ. Viết bằng tiếng Việt, "
+                        f"ngắn gọn, không dùng ký hiệu đặc biệt."
+                    )
+                    response = await _timed_await(
+                        f"stream.subquery[{idx}].rag_aquery",
+                        asyncio.wait_for(
+                            rag.aquery(
+                                rag_sub_query,
+                                param=QueryParam(
+                                    top_k=request.top_k,
+                                    mode="naive",
+                                    conversation_history=history,
+                                ),
+                            ),
+                            timeout=QUERY_TIMEOUT_SEC,
+                        ),
+                    )
+                    sub_answer = response if isinstance(response, str) else str(response)
+                    log.info("Timing[stream.subquery[%s].total]: %.2fs", idx, time.perf_counter() - t_sub_total)
+                    return idx, sub_answer
+
+            tasks = [
+                asyncio.create_task(_run_stream_subquery(idx, sub_query))
+                for idx, sub_query in enumerate(subqueries, start=1)
+            ]
+            for task in asyncio.as_completed(tasks):
+                try:
+                    idx, sub_answer = await task
+                except Exception as e:
+                    log.error("Stream subquery task failed: %s", e)
+                    continue
+
+                numbered = f"{idx}) {sub_answer}"
+                completed_answers[idx] = numbered
+                yield json.dumps({"chunk": numbered, "done": False}, ensure_ascii=False) + "\n"
+
+            # Fill missing answers (if any task failed unexpectedly) to keep final history consistent.
+            for idx in range(1, len(subqueries) + 1):
+                if idx not in completed_answers:
+                    fallback = "Xin lỗi, em gặp lỗi khi xử lý ý này. Anh/Chị vui lòng thử lại giúp em nhé."
+                    completed_answers[idx] = f"{idx}) {fallback}"
+
+            full_answer = "\n\n".join(completed_answers[idx] for idx in sorted(completed_answers.keys()))
+            history.append({"role": "user", "content": request.query})
+            history.append({"role": "assistant", "content": full_answer})
+            await _timed_await(f"stream.history_save[{session_id}]", save_chat_history(session_id, history))
+
+            yield json.dumps({"chunk": "", "done": True, "model": "multi-intent-composed"}, ensure_ascii=False) + "\n"
+            log.info("Timing[stream.total]: %.2fs", time.perf_counter() - t_stream_total)
+            return
+
+        # -- Router step --
+        category, refined_query = await _timed_await(
+            "stream.route_query",
+            route_query(request.query, llm_model_func, history),
+        )
+        log.info("Stream router category: %s", category)
+
+        full_answer = ""
+
+        if category == "SEARCH":
+            # UX: Let the user know search is happening
+            yield json.dumps({"chunk": "  \n*(Em đang tìm kiếm thông tin mới nhất trên mạng...)*", "done": False}, ensure_ascii=False) + "\n"
+            
+            if refined_query:
+                search_query = refined_query.strip()
+            else:
+                search_query = request.query.strip()
+            search_query = _normalize_search_query_for_vietnam(request.query, search_query)
+            log.info(f"Stream SEARCH query normalized: {search_query}")
+            search_results = await _timed_await("stream.search.tavily", tavily_search(search_query))
+            summary_prompt = f"""{SYSTEM_PERSONA}
+
+Hãy trả lời câu hỏi dựa trên kết quả tìm kiếm sau.
+Thời gian hiện tại (Việt Nam - UTC+7): {_now_vietnam_str()}
+YÊU CẦU:
+- TUÂN THỦ PHẠM VI TRẢ LỜI TRONG SYSTEM_PERSONA. Nếu thông tin tìm kiếm không thuộc các chủ đề cho phép (bất động sản, thời tiết, ngày giờ), hãy từ chối lịch sự.
+- Nếu thuộc chủ đề cho phép, trả lời ngắn gọn (dưới 3 câu), không dùng ký hiệu toán học.
+- Ưu tiên thông tin theo ngữ cảnh Việt Nam.
+Câu hỏi: {request.query}
+Kết quả tìm kiếm:
+{search_results}
+Trả lời:"""
+            raw = await _timed_await(
+                "stream.search.summarize_llm",
+                llm_model_func(summary_prompt, history_messages=history),
+            )
+            full_answer = str(raw)
+            line = json.dumps({"chunk": full_answer, "done": False}, ensure_ascii=False)
+            yield line + "\n"
+
+        elif category == "OTHER":
+            other_prompt = f"""{SYSTEM_PERSONA}
+
+Thời gian hiện tại (Việt Nam): {_now_vietnam_str()}
+Lịch sử cuộc trò chuyện gần đây:
+{chr(10).join([f"{m['role']}: {m['content']}" for m in history[-4:]]) if history else "(chưa có)"}  # type: ignore
+
+Câu hỏi/lời nhắn mới nhất của Anh/Chị: {request.query}
+
+Hãy phản hồi theo đúng SYSTEM_PERSONA. Nếu khách chào hỏi, hãy chào lại một cách tự nhiên (đừng quá máy móc). Nếu là câu hỏi ngoài lề, hãy từ chối lịch sự.
+Trả lời (ngắn gọn, không quá 3 câu):"""
+            raw = await _timed_await(
+                "stream.other.llm",
+                llm_model_func(other_prompt, history_messages=history),
+            )
+            full_answer = str(raw)
+            line = json.dumps({"chunk": full_answer, "done": False}, ensure_ascii=False)
+            yield line + "\n"
+
+        else:
+            # RAG path — stream token by token, emit complete sentences immediately
+            try:
+                # UX: Let user know RAG search is happening
+                yield json.dumps({"chunk": "  \n*(Em đang truy xuất thông tin từ kho tài liệu dự án...)*", "done": False}, ensure_ascii=False) + "\n"
+                
+                buffer = ""
+                t_rag_total = time.perf_counter()
+                first_token_sec: Optional[float] = None
+
+                # LightRAG aquery_stream
+                rag_query = (
+                    f"{SYSTEM_PERSONA}\n\n"
+                    f"Câu hỏi của khách hàng: {request.query}\n\n"
+                    f"Hãy trả lời dựa trên thông tin retrieve từ toàn bộ kho tài liệu đã index. "
+                    f"LUÔN TUÂN THỦ PHẠM VI TRẢ LỜI. "
+                    f"Viết bằng tiếng Việt, ngắn gọn."
+                )
+                
+                # Use aquery with stream=True to get an AsyncIterator
+                response = await _timed_await(
+                    "stream.rag.aquery_wait",
+                    asyncio.wait_for(
+                        rag.aquery(
+                            rag_query,
+                            param=QueryParam(
+                                top_k=request.top_k,
+                                mode="naive",
+                                conversation_history=history,
+                                stream=True,
+                            ),
+                        ),
+                        timeout=QUERY_TIMEOUT_SEC,
+                    ),
+                )
+
+                if response is None:
+                    full_answer = "Xin lỗi, em chưa tìm thấy thông tin phù hợp trong kho tài liệu hiện tại."
+                    yield json.dumps({"chunk": full_answer, "done": False}, ensure_ascii=False) + "\n"
+                elif isinstance(response, str):
+                    # In case streaming is not supported, it returns the full string
+                    if first_token_sec is None:
+                        first_token_sec = time.perf_counter() - t_rag_total
+                    full_answer = response
+                    if full_answer.strip().lower() == "none":
+                        full_answer = "Xin lỗi, em chưa tìm thấy thông tin phù hợp trong kho tài liệu hiện tại."
+                    sentences = re.split(r'(?<=[.!?。！？\n])\s*', full_answer)
+                    for sent in sentences:
+                        sent = sent.strip()
+                        if sent:
+                            yield json.dumps({"chunk": sent, "done": False}, ensure_ascii=False) + "\n"
+                            await asyncio.sleep(0)
+                else:
+                    # Async generation
+                    async for token in response:
+                        if not token:
+                            continue
+                        if first_token_sec is None:
+                            first_token_sec = time.perf_counter() - t_rag_total
+                        buffer += token
+                        # Flush complete sentences immediately
+                        parts = re.split(r'(?<=[.!?。！？\n])\s*', buffer)
+                        if len(parts) > 1:
+                            for sent in parts[:-1]:
+                                sent = sent.strip()
+                                if sent:
+                                    full_answer = str(full_answer) + str(sent) + " "
+                                    yield json.dumps({"chunk": sent, "done": False}, ensure_ascii=False) + "\n"
+                            buffer = parts[-1]
+
+                if first_token_sec is not None:
+                    log.info("Timing[stream.rag.first_token]: %.2fs", first_token_sec)
+                log.info("Timing[stream.rag.total]: %.2fs", time.perf_counter() - t_rag_total)
+
+                # Flush remaining buffer
+                if buffer.strip():
+                    full_answer = str(full_answer) + buffer.strip()
+                    yield json.dumps({"chunk": buffer.strip(), "done": False}, ensure_ascii=False) + "\n"
+
+            except asyncio.TimeoutError:
+                yield json.dumps({"chunk": "Xin lỗi, hệ thống đang bận. Bạn thử lại nhé.", "done": False}, ensure_ascii=False) + "\n"
+                full_answer = ""
+            except Exception as e:
+                log.error(f"Stream RAG error: {e}")
+                full_answer = "Xin lỗi, em gặp lỗi khi truy xuất dữ liệu. Anh/Chị thử lại giúp em nhé."
+                yield json.dumps({"chunk": full_answer, "done": False}, ensure_ascii=False) + "\n"
+
+        # Save history
+        history.append({"role": "user", "content": request.query})
+        history.append({"role": "assistant", "content": full_answer.strip()})
+        await _timed_await(f"stream.history_save[{session_id}]", save_chat_history(session_id, history))
+
+        # Done sentinel
+        yield json.dumps({"chunk": "", "done": True, "model": LLM_MODEL}, ensure_ascii=False) + "\n"
+        log.info("Timing[stream.total]: %.2fs", time.perf_counter() - t_stream_total)
+
+    return StreamingResponse(
+        generate(),
+        media_type="application/x-ndjson",
+    )
 
 
 # ── Run Server ─────────────────────────────────────────────────────────
