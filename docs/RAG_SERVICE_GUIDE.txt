@@ -1,0 +1,366 @@
+RAG Service Integration Guide
+=============================
+
+OVERVIEW
+--------
+The RAG Service is built on LightRAG and provides HTTP endpoints for:
+  - Document upload (with graph/vector storage options)
+  - LLM-powered query and retrieval
+  - Service health checks and status
+
+SERVICE ARCHITECTURE
+--------------------
+
+Ports:
+  - RAG Service: 8000 (FastAPI)
+  - Whisper Service: 8001 (Speech-to-text)
+  - PostgreSQL: 5432 (Knowledge graph storage)
+  - Qdrant: 6333 (Vector embeddings)
+  - Redis: 6379 (Session cache)
+
+QUICK START
+-----------
+
+1. Ensure .env file has LLM credentials:
+   
+   LLM_PROVIDER=openai
+   LLM_API_KEY=sk-...
+   LLM_MODEL=gpt-4o-mini
+   EMBEDDING_MODEL=text-embedding-3-large
+
+2. Start all services:
+   
+   docker-compose up -d
+
+3. Check service health:
+   
+   curl http://localhost:8000/health
+
+4. Run test script:
+   
+   python test/test_rag_service.py
+
+
+HTTP ENDPOINTS
+--------------
+
+POST /upload-document
+  Upload a text document into knowledge graph
+  
+  Parameters:
+    - file (multipart): Document file
+    - storage_type (form): "graph" | "vector" | "both" (default: "graph")
+    - metadata (form): JSON metadata (optional)
+  
+  Response:
+    {
+      "status": "success",
+      "document_id": "doc_123...",
+      "chunks_count": 15,
+      "storage_type": "graph",
+      "message": "Document processed and stored (15 chunks in 2.34s)"
+    }
+  
+  Example (curl):
+    curl -X POST http://localhost:8000/upload-document \
+      -F "file=@document.txt" \
+      -F "storage_type=graph" \
+      -F 'metadata={"source":"test","lang":"en"}'
+
+
+POST /query
+  Query the RAG system with document context
+  
+  Parameters:
+    {
+      "query": "What is X?",
+      "top_k": 10,
+      "return_structured_output": false
+    }
+  
+  Response:
+    {
+      "response": "LLM answer here...",
+      "context": ["source 1", "source 2", ...],
+      "tokens_used": {"input": 150, "output": 200},
+      "model": "gpt-4o-mini"
+    }
+  
+  Example (curl):
+    curl -X POST http://localhost:8000/query \
+      -H "Content-Type: application/json" \
+      -d '{"query":"What is knowledge graph?","top_k":5}'
+
+
+GET /health
+  Service health check
+  
+  Response:
+    {
+      "status": "healthy",
+      "timestamp": 1710316800,
+      "service": "rag-service",
+      "llm_provider": "openai",
+      "llm_model": "gpt-4o-mini",
+      "embedding_model": "text-embedding-3-large"
+    }
+
+
+GET /models
+  Get available models and storage configuration
+  
+  Response:
+    {
+      "llm": {"provider": "openai", "model": "gpt-4o-mini"},
+      "embedding": {"model": "text-embedding-3-large", "dimensions": 3072},
+      "storage": {...}
+    }
+
+
+GET /status
+  Get full RAG system status
+  
+  Response:
+    {
+      "service": "rag-service",
+      "status": "running",
+      "llm_provider": "openai",
+      "embedding_model": "text-embedding-3-large",
+      "storage": {
+        "type": "hybrid",
+        "graph": "PostgreSQL",
+        "vector": "Qdrant",
+        "session": "Redis"
+      }
+    }
+
+
+PYTHON CLIENT USAGE
+-------------------
+
+Basic example:
+
+  from client.rag_client import RAGClient, StorageType
+  
+  client = RAGClient("http://localhost:8000")
+  
+  # Check service
+  if not client.check_health():
+    print("Service not available")
+    exit(1)
+  
+  # Upload document
+  result = client.upload_document(
+    "document.txt",
+    storage_type=StorageType.GRAPH,
+    metadata={"source": "user", "lang": "en"}
+  )
+  
+  if result:
+    print(f"Document ID: {result['document_id']}")
+    print(f"Chunks: {result['chunks_count']}")
+  
+  # Query
+  query_result = client.query("What is the main topic?", top_k=5)
+  if query_result:
+    print(f"Answer: {query_result['response']}")
+    print(f"Context: {query_result['context']}")
+
+
+STORAGE TYPES EXPLAINED
+-----------------------
+
+GRAPH (default, recommended for RAG):
+  - Stores entities, relations, and knowledge graph
+  - Best for: Entity recognition, relation extraction
+  - Backend: PostgreSQL with pgvector extension
+  - Use when: You want structured understanding
+  
+  Query: "Find all products developed by Google"
+  Graph finds: nodes (Google, products) + edges (develops)
+
+VECTOR (best for similarity search):
+  - Stores only embeddings in vector database
+  - Best for: Semantic similarity, retrieval
+  - Backend: Qdrant (vector search engine)
+  - Use when: You want semantic matching only
+  
+  Query: "Find documents similar to X"
+  Vector finds: embeddings closest to query embedding
+
+BOTH (hybrid approach):
+  - Stores in both PostgreSQL (graph) and Qdrant (vector)
+  - Best for: Rich retrieval with both structured and semantic search
+  - Use when: You want maximum flexibility
+  
+  Query: "Find Google products OR find similar to X"
+  Hybrid uses both graph relations and vector similarity
+
+
+ENVIRONMENT VARIABLES
+---------------------
+
+LLM Configuration:
+  LLM_PROVIDER        openai | azure | ollama | gemini
+  LLM_API_KEY         Your API key
+  LLM_MODEL           gpt-4o-mini | gpt-4 | llama3.2 | etc
+  EMBEDDING_MODEL     text-embedding-3-large | etc
+  EMBEDDING_DIM       3072 (for OpenAI), 768 (for others)
+
+Storage Configuration:
+  POSTGRES_URL        postgresql://user:pass@host/db
+  QDRANT_URL          http://qdrant:6333
+  REDIS_URL           redis://redis:6379/0
+
+Service Configuration:
+  RAG_SERVICE_HOST    0.0.0.0
+  RAG_SERVICE_PORT    8000
+  LOG_LEVEL           INFO | DEBUG | WARNING
+  CHUNK_SIZE          1024 (text processing chunk size)
+  CHUNK_OVERLAP       20 (overlap between chunks)
+
+
+DOCKER COMPOSE SETUP
+--------------------
+
+Services defined in docker-compose.yml:
+
+  postgres:
+    - PostgreSQL 16.2 database
+    - Stores: knowledge graph, entities, relations
+    - Port: 5432
+  
+  qdrant:
+    - Qdrant vector database
+    - Stores: document embeddings
+    - Port: 6333
+  
+  redis:
+    - Redis cache
+    - Stores: conversation sessions, temporary cache
+    - Port: 6379
+  
+  rag-service:
+    - LightRAG FastAPI service
+    - Provides: HTTP endpoints for upload and query
+    - Port: 8000
+    - Depends on: postgres, qdrant, redis
+  
+  whisper-service:
+    - Speech-to-text service
+    - Port: 8001
+
+Start single service:
+  docker-compose up rag-service
+
+Start all services:
+  docker-compose up -d
+
+View logs:
+  docker-compose logs -f rag-service
+
+Stop services:
+  docker-compose down
+
+
+TROUBLESHOOTING
+---------------
+
+Service won't start:
+  1. Check logs: docker-compose logs rag-service
+  2. Verify LLM_API_KEY is set in .env
+  3. Ensure dependencies are healthy: docker-compose ps
+  4. Check port 8000 is not in use: lsof -i :8000
+
+Connection refused:
+  1. Ensure all services started: docker-compose ps
+  2. Wait for startup: services have 30s healthcheck start_period
+  3. Check container is running: docker ps | grep rag-service
+
+LLM errors:
+  1. Verify API key is correct
+  2. Check provider is correct (openai, azure, ollama, etc)
+  3. Check rate limits on your API account
+  4. Ensure model name exists in your account
+
+Database errors:
+  1. Verify PostgreSQL is running: docker-compose logs postgres
+  2. Check credentials in .env match docker-compose.yml
+  3. Ensure init-postgres.sql exists and runs
+  4. Check path: ./scripts/init-postgres.sql
+
+
+PERFORMANCE TUNING
+------------------
+
+Document Upload:
+  - CHUNK_SIZE: Larger chunks = fewer API calls but loses detail
+    Range: 512-2048
+    Default: 1024
+    Recommendation: 1024-1536 for optimal balance
+
+  - CHUNK_OVERLAP: More overlap = better context but slower processing
+    Range: 0-100
+    Default: 20
+    Recommendation: 20-50 for entity-heavy documents
+
+Vector Search (Qdrant):
+  - Configured with 3072 dimensions (for OpenAI embeddings)
+  - Adjust dimension if using different embedding model
+
+PostgreSQL:
+  - Enable pgvector extension for vector similarity
+  - Index entities and relations for fast lookups
+  - Vacuum regularly: VACUUM FULL; REINDEX;
+
+Redis:
+  - Used for session cache with TTL
+  - Default TTL: 86400 seconds (24 hours)
+  - No special tuning needed for small deployments
+
+
+INTEGRATION WITH OTHER SERVICES
+--------------------------------
+
+With Whisper Service:
+  1. Upload audio via Whisper API (port 8001)
+  2. Save transcribed text to file
+  3. Upload text to RAG Service (port 8000)
+  4. Query RAG with transcribed content
+
+Example workflow:
+  # Step 1: Transcribe audio
+  transcribed = whisper_client.transcribe("audio.mp3")
+  
+  # Step 2: Save transcription
+  with open("transcript.txt", "w") as f:
+    f.write(transcribed)
+  
+  # Step 3: Upload to RAG
+  result = rag_client.upload_document(
+    "transcript.txt",
+    storage_type=StorageType.GRAPH
+  )
+  
+  # Step 4: Query
+  answer = rag_client.query("What was discussed?")
+
+
+DEVELOPMENT
+-----------
+
+Build RAG service image:
+  cd service/RAG
+  ./build.sh latest
+  docker tag noble-rag-service:latest noble-rag-service:dev
+
+Test changes:
+  python test/test_rag_service.py
+
+Rebuild with docker-compose:
+  docker-compose build rag-service
+  docker-compose up rag-service
+
+Access service directly:
+  curl http://localhost:8000/health
+  python -c "from client.rag_client import RAGClient; print(RAGClient().check_health())"

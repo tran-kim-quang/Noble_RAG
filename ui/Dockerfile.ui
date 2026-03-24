@@ -1,0 +1,26 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy common requirements and install
+COPY service/RAG/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy necessary directories to Python path
+COPY ui/ /app/ui/
+COPY client/ /app/client/
+COPY scripts/ /app/scripts/
+COPY service/RAG/app.py /app/service/RAG/app.py
+
+ENV LLM_PROVIDER=openai
+ENV WEB_UI_HOST=0.0.0.0
+ENV WEB_UI_PORT=8501
+
+EXPOSE 8501
+
+CMD ["python", "-m", "ui.rag_web_ui"]

@@ -1,4 +1,206 @@
+version: '3.8'
+
+name: noble_rag
+
 services:
+  # ==================== PostgreSQL ====================
+  postgres:
+    build:
+      context: ./infra/postgres
+    container_name: noble_rag_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rag_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rag_password}
+      POSTGRES_DB: ${POSTGRES_DB:-noble_rag}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-postgres.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag_user} -d ${POSTGRES_DB:-noble_rag}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - noble_rag_net
+    restart: unless-stopped
+
+  # ==================== Qdrant ====================
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: noble_rag_qdrant
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      LOG_LEVEL: INFO
+    networks:
+      - noble_rag_net
+    restart: unless-stopped
+
+  # ==================== Redis ====================
+  redis:
+    image: redis:7.2-alpine
+    container_name: noble_rag_redis
+    ports:
+      - "${REDIS_PORT:-6380}:6379"
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      ${REDIS_PASSWORD:+--requirepass} ${REDIS_PASSWORD:-}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - noble_rag_net
+    restart: unless-stopped
+
+  # ==================== Ollama (Local Embedding Runtime) ====================
+  ollama:
+    image: ollama/ollama:latest
+    container_name: noble_rag_ollama
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - noble_rag_net
+    restart: unless-stopped
+
+  # Pull embedding model once if missing (idempotent)
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: noble_rag_ollama_init
+    entrypoint: ["/bin/sh", "-c"]
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-embeddinggemma:300m}
+    command: >
+      '
+      set -e;
+      model="$${EMBEDDING_MODEL}";
+      echo "[ollama-init] Ensuring model: $${model}";
+      if ollama list | awk "NR>1 {print \$1}" | grep -Fx "$${model}" >/dev/null 2>&1; then
+        echo "[ollama-init] Model already exists: $${model}";
+      else
+        echo "[ollama-init] Pulling model: $${model}";
+        ollama pull "$${model}";
+      fi;
+      echo "[ollama-init] Done";
+      '
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks:
+      - noble_rag_net
+    restart: "no"
+
+  # ==================== pgAdmin (Optional - for PostgreSQL UI) ====================
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: noble_rag_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - noble_rag_net
+    restart: unless-stopped
+
+  # ==================== RAG Service (LightRAG) ====================
+  rag-service:
+    build:
+      context: .
+      dockerfile: ./service/RAG/Dockerfile
+    container_name: noble_rag_service
+    ports:
+      - "${RAG_SERVICE_PORT:-8000}:8000"
+    environment:
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_API_URL=${LLM_API_URL:-}
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-openai}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-large}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-3072}
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
+      - POSTGRES_URL=postgresql://${POSTGRES_USER:-rag_user}:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/${POSTGRES_DB:-noble_rag}
+      - QDRANT_URL=http://qdrant:6333
+      - REDIS_URL=redis://redis:6379/0
+      - CHUNK_SIZE=${CHUNK_SIZE:-1024}
+      - CHUNK_OVERLAP=${CHUNK_OVERLAP:-20}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - RAG_SERVICE_PORT=8000
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      ollama-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - noble_rag_net
+    restart: unless-stopped
+
+  # ==================== RAG Web UI ====================
+  rag-ui:
+    build:
+      context: .
+      dockerfile: ./ui/Dockerfile.ui
+    container_name: noble_rag_ui
+    ports:
+      - "${WEB_UI_PORT:-8501}:8501"
+    volumes:
+      - .:/app
+    environment:
+      - RAG_SERVICE_URL=http://rag-service:8000
+      - WEB_UI_HOST=0.0.0.0
+      - WEB_UI_PORT=8501
+      - PYTHONPATH=/app
+    depends_on:
+      rag-service:
+        condition: service_healthy
+    networks:
+      - noble_rag_net
+    restart: unless-stopped
+
+  # ==================== Whisper Service ====================
   whisper-service:
     build:
       context: ./service/whisper-service
@@ -25,7 +227,22 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    networks:
+      - noble_rag_net
     restart: unless-stopped
 
 volumes:
+  postgres_data:
+    driver: local
+  qdrant_data:
+    driver: local
+  redis_data:
+    driver: local
+  ollama_data:
+    driver: local
   whisper_cache:
+    driver: local
+
+networks:
+  noble_rag_net:
+    driver: bridge
