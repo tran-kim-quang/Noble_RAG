@@ -1,0 +1,57 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python cache
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+
+# Virtual environments
+.venv
+venv
+env
+.env.local
+.env.*.local
+
+# Test files (không cần trong image)
+test/
+tests/
+
+# Docs (không cần trong image)
+docs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker (không copy Dockerfile vào chính nó)
+**/Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# OS
+.DS_Store
+Thumbs.db
+
+# LightRAG storage (chứa vector data lớn — dùng volume thay thế)
+service/RAG/rag_storage/
+service/RAG/cache/
+rag_storage/
+
+# Logs
+*.log
+logs/
+
+# Whisper service (không cần trong RAG/UI image)
+service/whisper-service/
+
+# Node modules (nếu có)
+node_modules/

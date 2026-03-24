@@ -168,12 +168,103 @@ WHERE filename = 'sample_doc.txt'
 LIMIT 1;
 */
 
--- ==================== Grant Permissions ====================
--- Grant appropriate permissions to the rag_user
+-- ==================== Grant Permissions (rag schema) ====================
 GRANT USAGE ON SCHEMA rag TO rag_user;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA rag TO rag_user;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA rag TO rag_user;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA rag TO rag_user;
-
--- Allow creating temporary tables
 ALTER DEFAULT PRIVILEGES IN SCHEMA rag GRANT SELECT ON TABLES TO rag_user;
+
+
+-- ==================== Sales Agent Schema ====================
+CREATE SCHEMA IF NOT EXISTS sales;
+SET search_path TO sales, rag, public;
+
+-- Lead profiles
+CREATE TABLE IF NOT EXISTS sales.lead_profiles (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    session_id      VARCHAR(255) NOT NULL UNIQUE,
+    profile_data    JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_lead_profiles_session_id ON sales.lead_profiles(session_id);
+CREATE INDEX idx_lead_profiles_updated_at ON sales.lead_profiles(updated_at DESC);
+CREATE INDEX idx_lead_profiles_data ON sales.lead_profiles USING GIN(profile_data);
+
+-- Conversation sessions
+CREATE TABLE IF NOT EXISTS sales.conversation_sessions (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    session_id      VARCHAR(255) NOT NULL UNIQUE,
+    current_state   VARCHAR(100) DEFAULT 'greeting',
+    previous_state  VARCHAR(100),
+    turn_count      INT DEFAULT 0,
+    started_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    last_active_at  TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_conv_sessions_session_id ON sales.conversation_sessions(session_id);
+
+-- Conversation turns (full log for analytics)
+CREATE TABLE IF NOT EXISTS sales.conversation_turns (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    session_id      VARCHAR(255) NOT NULL,
+    turn_number     INT NOT NULL,
+    user_text       TEXT,
+    agent_response  TEXT,
+    sales_state     VARCHAR(100),
+    detected_intent VARCHAR(100),
+    missing_slots   JSONB DEFAULT '[]',
+    retrieved_context_count INT DEFAULT 0,
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_conv_turns_session_id ON sales.conversation_turns(session_id);
+CREATE INDEX idx_conv_turns_created_at ON sales.conversation_turns(created_at DESC);
+
+-- Sales events
+CREATE TABLE IF NOT EXISTS sales.sales_events (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    session_id  VARCHAR(255) NOT NULL,
+    event_type  VARCHAR(100) NOT NULL,
+    event_data  JSONB DEFAULT '{}',
+    sales_state VARCHAR(100),
+    created_at  TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_sales_events_session_id ON sales.sales_events(session_id);
+CREATE INDEX idx_sales_events_event_type ON sales.sales_events(event_type);
+CREATE INDEX idx_sales_events_created_at ON sales.sales_events(created_at DESC);
+
+-- Appointment requests
+CREATE TABLE IF NOT EXISTS sales.appointment_requests (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    session_id      VARCHAR(255) NOT NULL,
+    request_type    VARCHAR(100) NOT NULL,  -- site_visit, call, shortlist
+    status          VARCHAR(50) DEFAULT 'pending',
+    notes           TEXT,
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_appt_session_id ON sales.appointment_requests(session_id);
+
+-- Triggers for updated_at
+CREATE OR REPLACE FUNCTION sales.update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_lead_profiles_updated_at
+    BEFORE UPDATE ON sales.lead_profiles
+    FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+
+CREATE TRIGGER trigger_appointment_updated_at
+    BEFORE UPDATE ON sales.appointment_requests
+    FOR EACH ROW EXECUTE FUNCTION sales.update_updated_at_column();
+
+-- Grant permissions on sales schema
+GRANT USAGE ON SCHEMA sales TO rag_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA sales TO rag_user;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA sales TO rag_user;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA sales TO rag_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA sales GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO rag_user;

@@ -1,18 +1,0 @@
-  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current
-                                 Dload  Upload   Total   Spent    Left  Speed
-  0     0    0     0    0     0      0      0 --:--:-- --:--:-- --:--:--     0100   134    0    85  100    49     56     32  0:00:01  0:00:01 --:--:--    88100   134    0    85  100    49     33     19  0:00:02  0:00:02 --:--:--    53100   134    0    85  100    49     24     13  0:00:03  0:00:03 --:--:--    38100   134    0    85  100    49     18     10  0:00:04  0:00:04 --:--:--    29100   134    0    85  100    49     15      8  0:00:06  0:00:05  0:00:01    24100   134    0    85  100    49     13      7  0:00:07  0:00:06  0:00:01     0100   134    0    85  100    49     11      6  0:00:08  0:00:07  0:00:01     0100   134    0    85  100    49      9      5  0:00:09  0:00:08  0:00:01     0100   134    0    85  100    49      8      5  0:00:09  0:00:09 --:--:--     0100   134    0    85  100    49      8      4  0:00:12  0:00:10  0:00:02     0100   134    0    85  100    49      7      4  0:00:12  0:00:11  0:00:01     0100   134    0    85  100    49      6      3  0:00:16  0:00:12  0:00:04     0100   134    0    85  100    49      6      3  0:00:16  0:00:13  0:00:03     0100   134    0    85  100    49      5      3  0:00:16  0:00:14  0:00:02     0100   134    0    85  100    49      5      3  0:00:16  0:00:15  0:00:01     0100   188    0   139  100    49      8      3  0:00:16  0:00:16 --:--:--    11100   317    0   268  100    49     15      2  0:00:24  0:00:17  0:00:07    40100   443    0   394  100    49     22      2  0:00:24  0:00:17  0:00:07    71100   474    0   425  100    49     22      2  0:00:24  0:00:18  0:00:06    77100   787    0   738  100    49     36      2  0:00:24  0:00:19  0:00:05   147100   894    0   845  100    49     39      2  0:00:24  0:00:21  0:00:03   129100  1098    0  1049  100    49     48      2  0:00:24  0:00:21  0:00:03   169
-{"chunk": "Em đã nhận câu hỏi và đang xử lý ngay ạ...", "done": false}
-{"chunk": "Dạ, em chào Anh/Chị!", "done": false}
-{"chunk": "Dựa trên thông tin hiện có, em xin được giải đáp câu hỏi của Anh/Chị như sau:", "done": false}
-{"chunk": "Trong kho tài liệu có hai dự án mang thương hiệu \"Noble\" với vị trí khác nhau:", "done": false}
-{"chunk": "1.", "done": false}
-{"chunk": "**Dự án Noble Crystal Long Biên**: Tọa lạc tại **đường Nguyễn Văn Linh, quận Long Biên, Hà Nội**.", "done": false}
-{"chunk": "2.", "done": false}
-{"chunk": "**Dự án Noble Palace Tây Thăng Long**: Tọa lạc tại **Tân Lập, Đan Phượng, Hà Nội**.", "done": false}
-{"chunk": "Anh/Chị đang quan tâm đến thông tin chi tiết về dự án nào ạ?", "done": false}
-{"chunk": "Em có thể tư vấn thêm về vị trí cụ thể, tiện ích hoặc chính sách bán hàng của từng dự án.", "done": false}
-{"chunk": "", "done": true, "model": "deepseek-chat"}
-
-real	0m21.655s
-user	0m0.007s
-sys	0m0.000s

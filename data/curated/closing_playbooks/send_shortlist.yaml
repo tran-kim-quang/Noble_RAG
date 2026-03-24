@@ -1,0 +1,20 @@
+cta: send_shortlist
+label: "Gửi shortlist sản phẩm"
+triggers:
+  - "gửi thêm thông tin"
+  - "gửi shortlist"
+  - "xem thêm sản phẩm"
+  - "giới thiệu thêm"
+
+script: |
+  Dạ, em sẽ chuẩn bị shortlist [2-3 sản phẩm] phù hợp nhất với nhu cầu của Anh/Chị, bao gồm:
+  - Tên dự án và vị trí
+  - Mức giá tham khảo
+  - Diện tích và loại hình
+  - Điểm mạnh phù hợp với nhu cầu Anh/Chị
+  - Chính sách thanh toán và hỗ trợ vay
+  
+  Anh/Chị muốn em gửi qua Zalo hay email ạ?
+  Và cho em xin thông tin liên lạc để gửi tài liệu không ạ?
+
+note: "Gửi trong vòng 30 phút làm việc sau khi có thông tin liên lạc."
