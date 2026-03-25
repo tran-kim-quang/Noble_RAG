@@ -76,6 +76,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     rag_service_port: int = 8001
     rag_service_host: str = "0.0.0.0"
+    session_export_dir: str = "./exports/sessions"
 
     @model_validator(mode="after")
     def _assemble_derived_fields(self) -> "Settings":

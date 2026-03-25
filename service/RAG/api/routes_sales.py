@@ -7,9 +7,16 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from models.api_models import LeadUpdateRequest, SalesChatRequest, SalesChatResponse
-from memory.lead_profile_store import load_lead_profile, save_lead_profile
-from memory.session_store import load_session_context
+from memory.chat_history_store import delete_chat_history, load_chat_history
+from memory.lead_profile_store import (
+    delete_lead_profile_cache,
+    ensure_sales_schema,
+    load_lead_profile,
+    save_lead_profile,
+)
+from memory.session_store import delete_session_context, load_session_context
 from sales.graph import sales_graph
+from sales.session_export import export_session_to_txt
 
 router = APIRouter(prefix="/sales", tags=["sales"])
 log = logging.getLogger("rag-service")
@@ -23,6 +30,7 @@ async def sales_chat(request: SalesChatRequest):
     """
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="message cannot be empty")
+    await ensure_sales_schema()
 
     initial_state: Dict[str, Any] = {
         "session_id": request.session_id,
@@ -127,5 +135,37 @@ async def generate_followup(session_id: str):
         {
             "session_id": session_id,
             "response": result.get("final_response", ""),
+        }
+    )
+
+
+@router.post("/session/{session_id}/close")
+async def close_session(session_id: str):
+    """Export session data to txt and clear ephemeral session caches."""
+    await ensure_sales_schema()
+    profile = await load_lead_profile(session_id) or {}
+    ctx = await load_session_context(session_id)
+    history = await load_chat_history(session_id)
+
+    if not profile and not history:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    export_path = export_session_to_txt(
+        session_id=session_id,
+        lead_profile=profile,
+        session_context=ctx,
+        chat_history=history,
+    )
+
+    await delete_chat_history(session_id)
+    await delete_session_context(session_id)
+    await delete_lead_profile_cache(session_id)
+
+    return JSONResponse(
+        {
+            "session_id": session_id,
+            "status": "closed",
+            "export_path": export_path,
+            "messages_exported": len(history),
         }
     )

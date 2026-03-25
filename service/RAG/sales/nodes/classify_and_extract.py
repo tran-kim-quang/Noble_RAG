@@ -28,7 +28,9 @@ Trả về DUY NHẤT một JSON với cấu trúc chính xác sau:
   "objection_type": null | "gia_cao" | "phap_ly" | "vi_tri" | "chua_du_tien" | "suy_nghi_them" | "khac",
   "buy_signal": true | false,
   "confidence": 0.0-1.0,
-  "purpose": null | "mua_o" | "dau_tu_cho_thue" | "dau_tu_tang_gia" | "giu_tai_san" | "tham_khao",
+  "family_member_count": null | <số người trong gia đình>,
+  "children_count": null | <số con nhỏ>,
+  "purpose": null | "mua_o" | "kinh_doanh" | "dau_tu_cho_thue" | "dau_tu_tang_gia" | "giu_tai_san" | "tham_khao",
   "property_type": null | "can_ho" | "nha_pho" | "biet_thu" | "shophouse" | "dat_nen",
   "budget_text": null | "<chuỗi mô tả ngân sách>",
   "budget_min": null | <số tỷ đồng float>,
@@ -50,7 +52,12 @@ Trả về DUY NHẤT một JSON với cấu trúc chính xác sau:
 - out_of_scope: chủ đề không liên quan bất động sản
 - other: không xác định rõ
 
-Nếu không có thông tin cho slot nào, để null hoặc [].
+Quy tắc trích xuất:
+- "Gia đình 4 người", "vợ chồng và 2 con nhỏ" => family_member_count=4, children_count=2.
+- "Để ở" => purpose="mua_o".
+- "Kinh doanh", "mở cửa hàng", "buôn bán" => purpose="kinh_doanh".
+- Ưu tiên trích xuất location_preference khi khách nói "gần Long Biên", "ở Hà Nội", "quanh Cầu Giấy"...
+- Nếu không có thông tin cho slot nào, để null hoặc [].
 
 Lịch sử gần đây:
 {history_str}
@@ -60,7 +67,7 @@ CHỈ TRẢ VỀ JSON."""
 
 _INTENT_FIELDS = {"intent", "objection_type", "buy_signal", "confidence"}
 _SLOT_FIELDS = {
-    "purpose", "property_type", "budget_text", "budget_min", "budget_max",
+    "family_member_count", "children_count", "purpose", "property_type", "budget_text", "budget_min", "budget_max",
     "location_preference", "timeline", "financing_need", "key_concerns", "contact_phone",
 }
 

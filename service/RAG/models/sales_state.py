@@ -22,4 +22,9 @@ STATES_NEEDING_RETRIEVAL = {
     SalesState.CLOSING_NEXT_STEP,
 }
 
-REQUIRED_SLOTS_FOR_PITCH = ["purpose", "budget_text", "property_type"]
+REQUIRED_SLOTS_FOR_PITCH = [
+    "family_member_count",
+    "children_count",
+    "purpose",
+    "location_preference",
+]

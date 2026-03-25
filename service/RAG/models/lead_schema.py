@@ -5,6 +5,8 @@ from typing import Optional, List
 class LeadProfile(BaseModel):
     lead_id: str
     name: Optional[str] = None
+    family_member_count: Optional[int] = None
+    children_count: Optional[int] = None
     purpose: Optional[str] = "khong_ro"
     property_type: Optional[str] = "khong_ro"
     budget_min: Optional[float] = None

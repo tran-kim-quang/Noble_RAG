@@ -14,6 +14,7 @@ Endpoints:
   GET  /sales/state/{session_id}
   POST /sales/recommendations/refresh
   POST /sales/followup/generate
+  POST /sales/session/{session_id}/close
 """
 
 import uvicorn
@@ -22,6 +23,7 @@ from fastapi import FastAPI
 from core.config import get_settings
 from core.dependencies import rag
 from core.logging import setup_logging, get_logger
+from memory.lead_profile_store import ensure_sales_schema
 from api.routes_health import router as health_router
 from api.routes_documents import router as documents_router
 from api.routes_query import router as query_router
@@ -41,7 +43,12 @@ app = FastAPI(
 @app.on_event("startup")
 async def startup_event():
     await rag.initialize_storages()
+    await ensure_sales_schema()
     log.info("LightRAG storages initialised.")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    log.info("Đã đóng các kết nối và dọn dẹp ứng dụng.")
 
 
 app.include_router(health_router)

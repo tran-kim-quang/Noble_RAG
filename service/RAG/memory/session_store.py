@@ -8,6 +8,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from memory.redis_store import redis_get_json, redis_set_json
+from memory.redis_store import redis_delete
 from core.config import get_settings
 
 log = logging.getLogger("rag-service")
@@ -44,3 +45,7 @@ async def increment_turn_count(session_id: str) -> int:
     ctx["conversation_turn_count"] = ctx.get("conversation_turn_count", 0) + 1
     await save_session_context(session_id, ctx)
     return ctx["conversation_turn_count"]
+
+
+async def delete_session_context(session_id: str) -> bool:
+    return await redis_delete(_redis_url(), _key(session_id))

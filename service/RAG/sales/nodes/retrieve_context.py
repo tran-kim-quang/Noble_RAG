@@ -10,9 +10,9 @@ log = logging.getLogger("rag-service")
 
 _STATE_QUERY_TEMPLATES: Dict[str, str] = {
     "product_matching": (
-        "Dự án bất động sản phù hợp với: "
-        "mục đích {purpose}, ngân sách {budget}, khu vực {location}, loại hình {property_type}. "
-        "Cung cấp thông tin về dự án, mức giá, pháp lý, chính sách thanh toán."
+        "Tư vấn dự án bất động sản Noble phù hợp với gia đình {family_size} người, "
+        "có {children_count} con nhỏ, mục đích {purpose}, ưu tiên gần khu vực {location}. "
+        "Nêu rõ dự án nào phù hợp, vì sao phù hợp với gia đình và các tiện ích nổi bật liên quan."
     ),
     "comparison": (
         "So sánh các dự án bất động sản Noble về: giá, vị trí, pháp lý, tiến độ, "
@@ -37,6 +37,8 @@ def _build_retrieval_query(state: Dict[str, Any]) -> str:
 
     lead = state.get("lead_profile") or {}
     query = template.format(
+        family_size=lead.get("family_member_count") or "không rõ",
+        children_count=lead.get("children_count") or "không rõ",
         purpose=lead.get("purpose") or "không xác định",
         budget=lead.get("budget_text") or "không xác định",
         location=", ".join(lead.get("location_preference") or []) or "linh hoạt",

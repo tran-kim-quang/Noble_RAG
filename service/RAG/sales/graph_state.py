@@ -27,7 +27,6 @@ class SalesAgentState(TypedDict, total=False):
 
     # Retrieval
     retrieved_context: List[Dict[str, Any]]
-    recommended_project_ids: List[str]
 
     # Response
     draft_response: Optional[str]

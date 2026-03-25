@@ -9,6 +9,7 @@ import logging
 from typing import Any, Dict, List
 
 from memory.redis_store import redis_get_json, redis_set_json
+from memory.redis_store import redis_delete
 from core.config import get_settings
 
 HISTORY_MAX_TURNS = 10
@@ -52,3 +53,7 @@ async def append_turn(
     history.append({"role": "assistant", "content": assistant_text})
     await save_chat_history(session_id, history, max_turns)
     return history
+
+
+async def delete_chat_history(session_id: str) -> bool:
+    return await redis_delete(_redis_url(), _key(session_id))

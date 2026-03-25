@@ -36,10 +36,11 @@ class DocumentRecord(BaseModel):
 
 # ── Query endpoint ─────────────────────────────────────────────────────────
 class QueryRequest(BaseModel):
-    query: str
+    query: str = ""
+    message: Optional[str] = None
     top_k: int = 8
     return_structured_output: bool = False
-    session_id: Optional[str] = "default_session"
+    session_id: Optional[str] = None
 
 
 class QueryResponse(BaseModel):

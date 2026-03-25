@@ -39,12 +39,13 @@ def update_lead_profile(state: SalesAgentState) -> Dict[str, Any]:
             profile[key] = value
 
     # Update lead temperature heuristic
-    budget_known = not _is_empty(profile.get("budget_text")) or not _is_empty(profile.get("budget_min"))
+    family_known = not _is_empty(profile.get("family_member_count"))
+    children_known = not _is_empty(profile.get("children_count"))
     purpose_known = not _is_empty(profile.get("purpose"))
     location_known = not _is_empty(profile.get("location_preference"))
 
-    filled_count = sum([budget_known, purpose_known, location_known])
-    if filled_count >= 3:
+    filled_count = sum([family_known, children_known, purpose_known, location_known])
+    if filled_count >= 4:
         profile["lead_temperature"] = "hot"
     elif filled_count >= 2:
         profile["lead_temperature"] = "warm"

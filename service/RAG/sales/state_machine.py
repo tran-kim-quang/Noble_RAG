@@ -29,15 +29,6 @@ def resolve_next_state(state: Dict[str, Any]) -> str:
     if missing:
         return "need_discovery"
 
-    # Budget not yet captured → alignment
-    has_budget = (
-        lead_profile.get("budget_min") is not None
-        or lead_profile.get("budget_max") is not None
-        or lead_profile.get("budget_text")
-    )
-    if not has_budget:
-        return "budget_alignment"
-
     # Intent-based transitions
     if intent == "comparison":
         return "comparison"
