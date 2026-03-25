@@ -10,9 +10,11 @@ log = logging.getLogger("rag-service")
 
 _STATE_QUERY_TEMPLATES: Dict[str, str] = {
     "product_matching": (
-        "Tư vấn dự án bất động sản Noble phù hợp với mục đích {purpose}, loại hình {property_type}, "
-        "ngân sách {budget}, ưu tiên gần khu vực {location}, gia đình {family_size} người, "
-        "có {children_count} con nhỏ. Chỉ nêu phương án phù hợp với các tiêu chí này "
+        "Tư vấn dự án bất động sản Noble phù hợp với mục đích {purpose}, "
+        "loại hình ưu tiên {property_type}, ngân sách tham khảo {budget}, "
+        "ưu tiên gần khu vực {location}, gia đình {family_size} người, "
+        "có {children_count} con nhỏ. {matching_guidance} "
+        "Chỉ nêu phương án phù hợp với các tiêu chí này "
         "và các dữ kiện có trong kho tri thức."
     ),
     "comparison": (
@@ -43,11 +45,31 @@ def _build_retrieval_query(state: Dict[str, Any]) -> str:
         purpose=lead.get("purpose") or "không xác định",
         budget=lead.get("budget_text") or "không xác định",
         location=", ".join(lead.get("location_preference") or []) or "linh hoạt",
-        property_type=lead.get("property_type") or "không xác định",
+        property_type=lead.get("property_type") or "không nêu rõ",
+        matching_guidance=_build_matching_guidance(lead),
         objection_type=state.get("objection_type") or "chung",
         user_text=state.get("user_text") or "",
     )
     return query
+
+
+def _build_matching_guidance(lead: Dict[str, Any]) -> str:
+    purpose = lead.get("purpose")
+    property_type = lead.get("property_type")
+    family_size = lead.get("family_member_count")
+    children_count = lead.get("children_count")
+
+    if property_type:
+        return f"Ưu tiên đúng loại hình khách đã nêu: {property_type}."
+
+    if purpose == "mua_o" and (family_size or children_count):
+        return (
+            "Khách đang mua để ở cho gia đình nhưng chưa chốt loại hình. "
+            "Ưu tiên mô tả phương án theo tiêu chí sống phù hợp cho gia đình, "
+            "không ép sang một loại hình cụ thể nếu dữ liệu chưa đủ."
+        )
+
+    return "Nếu khách chưa chốt loại hình, ưu tiên phương án phù hợp với nhu cầu thực tế thay vì áp sẵn một loại hình."
 
 
 async def retrieve_context(state: SalesAgentState) -> Dict[str, Any]:

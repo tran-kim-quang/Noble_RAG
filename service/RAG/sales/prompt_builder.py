@@ -22,7 +22,7 @@ NGUYÊN TẮC BẮT BUỘC
 2. Chỉ sử dụng thông tin có trong context, knowledge base RAG hoặc tool results.
 3. Nếu thiếu dữ liệu, nói rõ chưa đủ thông tin và hỏi thêm hoặc đề xuất bước tiếp theo.
 4. Không cam kết lợi nhuận, không hứa chắc tăng giá, không dùng lời lẽ thao túng.
-5. Chỉ được pitch dự án khi đã có đủ các tiêu chí cốt lõi: mục đích, loại hình sản phẩm, ngân sách, khu vực ưu tiên.
+5. Chỉ được pitch dự án khi đã có đủ 4 tiêu chí cốt lõi: số người trong gia đình, số con nhỏ, mục đích mua, khu vực ưu tiên.
 6. Sau mỗi lượt trả lời, tạo ra một bước tiến nhỏ trong sales funnel.
 7. Không hỏi lại thông tin đã có trong HỒ SƠ KHÁCH HÀNG.
 8. Nếu chưa đủ điều kiện pitch theo state machine, không được tư vấn dự án cụ thể; chỉ xác nhận nhu cầu đã hiểu và hỏi thêm đúng phần còn thiếu.
@@ -54,6 +54,9 @@ NHIỆM VỤ
 - Chỉ hỏi để lấy các slot còn thiếu trong nhóm tiêu chí cốt lõi.
 - Không tư vấn dự án, không nêu ví dụ dự án, không nêu ví dụ khu vực.
 - Không suy diễn địa điểm, loại hình, ngân sách hoặc chân dung gia đình nếu khách chưa nói.
+- Nếu khách chưa xác định rõ nhu cầu ở, có thể gợi ý 1-2 tiêu chí chọn nơi ở trung lập dựa trên thông tin đã có về gia đình, con cái, mục đích mua.
+- Các gợi ý phải ở mức tiêu chí sống, ví dụ: gần công viên, gần trường học, an toàn, thuận tiện đi làm, cộng đồng yên tĩnh.
+- Không được lái khách sang một loại hình sản phẩm cụ thể nếu khách chưa tự nêu.
 - Mỗi lượt tối đa 1 câu hỏi chính; tối đa 1 câu phụ nếu thật sự cần.
 - Nếu câu khách rất ngắn hoặc chỉ là chào hỏi, chỉ hỏi 1 câu duy nhất.
 - Không hỏi lại các thông tin đã có trong hồ sơ khách.
@@ -69,7 +72,8 @@ NHIỆM VỤ
 NHIỆM VỤ
 - Đề xuất tối đa 3 lựa chọn phù hợp với hồ sơ khách.
 - Mỗi lựa chọn phải có: (1) tên dự án/sản phẩm, (2) vì sao phù hợp, (3) 1 điểm cần lưu ý.
-- Luôn gắn đề xuất với nhu cầu thật của khách như để ở, gia đình có con nhỏ, ngân sách, khu vực, tài chính.""",
+- Luôn gắn đề xuất với nhu cầu thật của khách như để ở, gia đình có con nhỏ, ngân sách, khu vực, tài chính.
+- Nếu khách chưa chốt loại hình sản phẩm, trình bày theo mức độ phù hợp với nhu cầu sống trước, không ép vào một loại hình cụ thể.""",
 
     "comparison": """TRẠNG THÁI: COMPARISON
 NHIỆM VỤ
@@ -133,6 +137,8 @@ def build_prompt(state: Dict[str, Any]) -> str:
             has_context = True
             context_block = "\n\nNGỮ CẢNH TỪ KHO TÀI LIỆU:\n" + "\n---\n".join(snippets[:5])
 
+    discovery_guidance = _build_discovery_guidance(next_state, lead_profile, missing_slots)
+
     output_rules = _build_output_rules(next_state, has_context)
 
     prompt = (
@@ -140,6 +146,7 @@ def build_prompt(state: Dict[str, Any]) -> str:
         f"{state_prompt}\n\n"
         f"HỒ SƠ KHÁCH HÀNG:\n{lead_summary}\n\n"
         f"THÔNG TIN CÒN THIẾU:\n{missing_slots_text}"
+        f"{discovery_guidance}"
         f"{context_block}\n\n"
         f"Tin nhắn của khách: {user_text}\n\n"
         "YÊU CẦU TRẢ LỜI:\n"
@@ -152,6 +159,29 @@ def build_prompt(state: Dict[str, Any]) -> str:
         "Trả lời (theo phong cách sales, tự nhiên, đúng state):"
     )
     return prompt
+
+
+def _build_discovery_guidance(next_state: str, lead_profile: Dict[str, Any], missing_slots: List[str]) -> str:
+    if next_state != "need_discovery":
+        return ""
+
+    hints: List[str] = []
+    purpose = lead_profile.get("purpose")
+    family_size = lead_profile.get("family_member_count")
+    children_count = lead_profile.get("children_count")
+
+    if purpose == "mua_o":
+        hints.append("Khách đang thiên về nhu cầu ở thực.")
+    if family_size and family_size >= 3:
+        hints.append("Gia đình đông người thường quan tâm không gian sống đủ rộng và sinh hoạt thuận tiện.")
+    if children_count and children_count > 0:
+        hints.append("Gia đình có con nhỏ thường quan tâm tiêu chí gần trường học, công viên, khu vui chơi và môi trường an toàn.")
+    if "location_preference" in missing_slots and hints:
+        hints.append("Nếu cần gợi mở, hãy dùng các tiêu chí sống trên để giúp khách tự xác định khu vực phù hợp.")
+
+    if not hints:
+        return ""
+    return "\n\nGỢI Ý KHÁM PHÁ NHU CẦU:\n- " + "\n- ".join(hints)
 
 
 def _build_output_rules(next_state: str, has_context: bool) -> str:

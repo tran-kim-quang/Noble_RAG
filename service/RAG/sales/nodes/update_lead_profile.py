@@ -4,7 +4,7 @@ import logging
 from typing import Any, Dict, List
 
 from sales.graph_state import SalesAgentState
-from models.sales_state import BUDGET_SLOT_ALIASES, REQUIRED_SLOTS_FOR_PITCH
+from models.sales_state import REQUIRED_SLOTS_FOR_PITCH
 
 log = logging.getLogger("rag-service")
 
@@ -39,15 +39,18 @@ def update_lead_profile(state: SalesAgentState) -> Dict[str, Any]:
             profile[key] = value
 
     # Lead temperature should reflect practical sales qualification first.
-    purpose_known = not _is_empty(profile.get("purpose"))
-    property_type_known = not _is_empty(profile.get("property_type"))
-    location_known = not _is_empty(profile.get("location_preference"))
-    budget_known = any(not _is_empty(profile.get(slot)) for slot in BUDGET_SLOT_ALIASES)
     family_known = not _is_empty(profile.get("family_member_count"))
     children_known = not _is_empty(profile.get("children_count"))
+    purpose_known = not _is_empty(profile.get("purpose"))
+    location_known = not _is_empty(profile.get("location_preference"))
+    property_type_known = not _is_empty(profile.get("property_type"))
+    budget_known = any(
+        not _is_empty(profile.get(slot))
+        for slot in ("budget_text", "budget_min", "budget_max")
+    )
 
-    core_filled_count = sum([purpose_known, property_type_known, location_known, budget_known])
-    enrich_filled_count = sum([family_known, children_known])
+    core_filled_count = sum([family_known, children_known, purpose_known, location_known])
+    enrich_filled_count = sum([property_type_known, budget_known])
     if core_filled_count >= 4:
         profile["lead_temperature"] = "hot"
     elif core_filled_count >= 3 or (core_filled_count >= 2 and enrich_filled_count >= 1):
@@ -60,8 +63,6 @@ def update_lead_profile(state: SalesAgentState) -> Dict[str, Any]:
     for slot in REQUIRED_SLOTS_FOR_PITCH:
         if _is_empty(profile.get(slot)):
             missing.append(slot)
-    if all(_is_empty(profile.get(slot)) for slot in BUDGET_SLOT_ALIASES):
-        missing.append("budget")
 
     log.info(
         "update_lead_profile: temp=%s missing=%s",

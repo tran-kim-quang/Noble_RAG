@@ -74,6 +74,8 @@ async def _repair_response(state: SalesAgentState, invalid_response: str) -> str
         "- Nếu state là greeting hoặc need_discovery: tối đa 2 câu, chỉ 1 câu hỏi.\n"
         "- Chỉ hỏi về các slot còn thiếu.\n"
         "- Không nêu tên dự án hoặc địa danh ví dụ nếu chưa có context.\n"
+        "- Nếu khách chưa rõ nhu cầu ở, có thể gợi ý tiêu chí sống trung lập dựa trên gia đình, con cái, mục đích mua.\n"
+        "- Không ép khách sang một loại hình sản phẩm nếu khách chưa tự nêu.\n"
         "- Giữ giọng điệu tự nhiên, xưng em, gọi Anh/Chị.\n\n"
         f"Câu trả lời cần viết lại:\n{invalid_response}"
     )
