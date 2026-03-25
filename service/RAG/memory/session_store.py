@@ -35,6 +35,7 @@ async def load_session_context(session_id: str) -> Dict[str, Any]:
     return {
         "session_id": session_id,
         "current_state": "greeting",
+        "current_script_step": "S1_opening",
         "previous_state": None,
         "last_agent_action": None,
         "conversation_turn_count": 0,

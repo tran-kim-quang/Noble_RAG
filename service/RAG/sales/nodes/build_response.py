@@ -85,6 +85,7 @@ async def _repair_response(state: SalesAgentState, invalid_response: str) -> str
 
 async def build_response(state: SalesAgentState) -> Dict[str, Any]:
     next_state = state.get("next_sales_state") or "need_discovery"
+    response_action = state.get("response_action") or ""
     if next_state in _GROUNDED_STATES and not _has_retrieved_context(state):
         fallback = _fallback_without_context(state)
         return {"draft_response": fallback, "final_response": fallback}
@@ -99,9 +100,13 @@ async def build_response(state: SalesAgentState) -> Dict[str, Any]:
             response_text = _enforce_short_form(response_text, max_sentences=2)
             if _question_count(response_text) > 1:
                 response_text = await _repair_response(state, response_text)
+        if response_action in {"match_options", "explain_option_detail"}:
+            if _question_count(response_text) > 0:
+                response_text = _enforce_short_form(response_text, max_sentences=4)
         log.info(
-            "build_response: state=%s response_len=%d",
+            "build_response: state=%s action=%s response_len=%d",
             next_state,
+            response_action,
             len(response_text),
         )
         return {"draft_response": response_text, "final_response": response_text}

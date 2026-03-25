@@ -17,6 +17,8 @@ async def persist_turn(state: SalesAgentState) -> Dict[str, Any]:
     user_text: str = state.get("user_text") or ""
     final_response: str = state.get("final_response") or state.get("draft_response") or ""
     next_state: str = state.get("next_sales_state") or "greeting"
+    next_script_step: str = state.get("next_script_step") or "S1_opening"
+    response_action: str = state.get("response_action") or next_state
 
     # Append current turn to history
     history = list(state.get("chat_history") or [])
@@ -27,15 +29,18 @@ async def persist_turn(state: SalesAgentState) -> Dict[str, Any]:
     # Update and persist lead profile
     lead_profile = dict(state.get("lead_profile") or {})
     lead_profile["current_state"] = next_state
+    lead_profile["current_script_step"] = next_script_step
     lead_profile["last_user_intent"] = state.get("detected_intent")
     lead_profile["last_next_action"] = next_state
+    lead_profile["last_action"] = response_action
     await save_lead_profile(session_id, lead_profile)
 
     # Update session context
     session_context = dict(state.get("session_context") or {})
     session_context["previous_state"] = state.get("current_sales_state")
     session_context["current_state"] = next_state
-    session_context["last_agent_action"] = next_state
+    session_context["current_script_step"] = next_script_step
+    session_context["last_agent_action"] = response_action
     session_context["conversation_turn_count"] = (
         session_context.get("conversation_turn_count", 0) + 1
     )

@@ -2,17 +2,17 @@
 
 from typing import Any, Dict
 
-from models.sales_state import STATES_NEEDING_RETRIEVAL, SalesState
+from models.sales_state import ResponseAction, TEMPLATE_ACTIONS
 
 
-def route_after_state_resolution(state: Dict[str, Any]) -> str:
-    """Return the next node name after resolve_sales_state."""
-    next_state_str: str = state.get("next_sales_state") or "need_discovery"
+def route_after_action_resolution(state: Dict[str, Any]) -> str:
+    """Route to template rendering or grounded generation by response action."""
+    action_str = state.get("response_action") or ResponseAction.ASK_OPENING.value
     try:
-        next_state = SalesState(next_state_str)
+        action = ResponseAction(action_str)
     except ValueError:
-        next_state = SalesState.NEED_DISCOVERY
+        action = ResponseAction.ASK_OPENING
 
-    if next_state in STATES_NEEDING_RETRIEVAL:
-        return "retrieve_context"
-    return "build_response"
+    if action in TEMPLATE_ACTIONS:
+        return "render_response_from_template"
+    return "retrieve_context"

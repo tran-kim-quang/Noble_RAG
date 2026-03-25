@@ -112,6 +112,8 @@ NHIỆM VỤ
 
 def build_prompt(state: Dict[str, Any]) -> str:
     next_state: str = state.get("next_sales_state") or "need_discovery"
+    next_script_step: str = state.get("next_script_step") or ""
+    response_action: str = state.get("response_action") or ""
     user_text: str = state.get("user_text") or ""
     lead_profile: Dict[str, Any] = state.get("lead_profile") or {}
     retrieved_context: List[Dict[str, Any]] = state.get("retrieved_context") or []
@@ -144,6 +146,8 @@ def build_prompt(state: Dict[str, Any]) -> str:
     prompt = (
         f"{SYSTEM_PROMPT}\n\n"
         f"{state_prompt}\n\n"
+        f"SCRIPT STEP HIỆN TẠI: {next_script_step}\n"
+        f"RESPONSE ACTION: {response_action}\n\n"
         f"HỒ SƠ KHÁCH HÀNG:\n{lead_summary}\n\n"
         f"THÔNG TIN CÒN THIẾU:\n{missing_slots_text}"
         f"{discovery_guidance}"
@@ -151,8 +155,9 @@ def build_prompt(state: Dict[str, Any]) -> str:
         f"Tin nhắn của khách: {user_text}\n\n"
         "YÊU CẦU TRẢ LỜI:\n"
         "- Ưu tiên trả lời đúng trọng tâm câu khách vừa hỏi.\n"
-        "- Chỉ hỏi thêm nếu thật sự cần cho bước tiếp theo.\n"
-        "- Nếu hỏi thêm, chỉ hỏi các mục đang thiếu.\n"
+        "- Nếu RESPONSE ACTION là match_options hoặc explain_option_detail: không được hỏi thêm slot mới.\n"
+        "- Nếu RESPONSE ACTION là match_options: chỉ đề xuất tối đa 2 phương án.\n"
+        "- Nếu khách mua để ở mà chưa chốt loại hình, không được tự đẩy sang shophouse.\n"
         "- Không lặp lại cùng một câu hỏi nếu hồ sơ đã có dữ liệu.\n"
         "- Không tự thêm ví dụ địa điểm hoặc dự án nếu các ví dụ đó không có trong hồ sơ khách hoặc ngữ cảnh retrieve.\n"
         f"{output_rules}\n\n"

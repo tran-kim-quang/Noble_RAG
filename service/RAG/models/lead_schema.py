@@ -26,16 +26,19 @@ class LeadProfile(BaseModel):
     shortlisted_projects: List[str] = Field(default_factory=list)
     rejected_projects: List[str] = Field(default_factory=list)
     current_state: str = "greeting"
+    current_script_step: str = "S1_opening"
     lead_temperature: Optional[str] = "cold"
     preferred_contact_channel: Optional[str] = "chat"
     contact_phone: Optional[str] = None
     last_user_intent: Optional[str] = None
     last_next_action: Optional[str] = None
+    last_action: Optional[str] = None
 
 
 class SessionContext(BaseModel):
     session_id: str
     current_state: str = "greeting"
+    current_script_step: str = "S1_opening"
     previous_state: Optional[str] = None
     last_agent_action: Optional[str] = None
     last_retrieved_context_ids: List[str] = Field(default_factory=list)

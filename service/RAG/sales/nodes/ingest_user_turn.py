@@ -23,6 +23,7 @@ async def ingest_user_turn(state: SalesAgentState) -> Dict[str, Any]:
         lead_profile = {
             "lead_id": session_id,
             "current_state": "greeting",
+            "current_script_step": "S1_opening",
             "lead_temperature": "cold",
         }
 
@@ -39,5 +40,6 @@ async def ingest_user_turn(state: SalesAgentState) -> Dict[str, Any]:
         "lead_profile": lead_profile,
         "session_context": session_context,
         "current_sales_state": session_context.get("current_state", "greeting"),
+        "current_script_step": session_context.get("current_script_step", lead_profile.get("current_script_step", "S1_opening")),
         "errors": [],
     }

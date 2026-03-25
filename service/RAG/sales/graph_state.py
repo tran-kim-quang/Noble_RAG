@@ -23,9 +23,13 @@ class SalesAgentState(TypedDict, total=False):
     # State machine
     current_sales_state: Optional[str]
     next_sales_state: Optional[str]
+    current_script_step: Optional[str]
+    next_script_step: Optional[str]
+    response_action: Optional[str]
     missing_slots: List[str]
 
     # Retrieval
+    retrieved_candidates: List[Dict[str, Any]]
     retrieved_context: List[Dict[str, Any]]
     has_retrieved_context: bool
 

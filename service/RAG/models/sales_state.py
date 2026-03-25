@@ -15,11 +15,53 @@ class SalesState(str, Enum):
     OUT_OF_SCOPE = "out_of_scope"
 
 
+class ScriptStep(str, Enum):
+    S1_OPENING = "S1_opening"
+    S2_ASK_FAMILY_SIZE = "S2_ask_family_size"
+    S3_ASK_CHILDREN = "S3_ask_children"
+    S4_ASK_PURPOSE = "S4_ask_purpose"
+    S5_ASK_LOCATION = "S5_ask_location"
+    M1_MATCH_OPTIONS = "M1_match_options"
+    M2_EXPLAIN_OPTION_DETAIL = "M2_explain_option_detail"
+    M3_INTEREST_CHECK = "M3_interest_check"
+    O1_HANDLE_OBJECTION = "O1_handle_objection"
+    C1_SOFT_CLOSE = "C1_soft_close"
+    F1_FOLLOWUP_CLOSEOUT = "F1_followup_closeout"
+    OUT_OF_SCOPE = "out_of_scope"
+
+
+class ResponseAction(str, Enum):
+    ASK_OPENING = "ask_opening"
+    ASK_FAMILY_SIZE = "ask_family_size"
+    ASK_CHILDREN = "ask_children"
+    ASK_PURPOSE = "ask_purpose"
+    ASK_LOCATION = "ask_location"
+    MATCH_OPTIONS = "match_options"
+    EXPLAIN_OPTION_DETAIL = "explain_option_detail"
+    CHECK_INTEREST = "check_interest"
+    HANDLE_OBJECTION = "handle_objection"
+    SOFT_CLOSE = "soft_close"
+    FOLLOWUP_CLOSEOUT = "followup_closeout"
+    REDIRECT_OUT_OF_SCOPE = "redirect_out_of_scope"
+
+
 STATES_NEEDING_RETRIEVAL = {
     SalesState.PRODUCT_MATCHING,
     SalesState.COMPARISON,
     SalesState.OBJECTION_HANDLING,
     SalesState.CLOSING_NEXT_STEP,
+}
+
+TEMPLATE_ACTIONS = {
+    ResponseAction.ASK_OPENING,
+    ResponseAction.ASK_FAMILY_SIZE,
+    ResponseAction.ASK_CHILDREN,
+    ResponseAction.ASK_PURPOSE,
+    ResponseAction.ASK_LOCATION,
+    ResponseAction.CHECK_INTEREST,
+    ResponseAction.SOFT_CLOSE,
+    ResponseAction.FOLLOWUP_CLOSEOUT,
+    ResponseAction.REDIRECT_OUT_OF_SCOPE,
 }
 
 REQUIRED_SLOTS_FOR_PITCH = [

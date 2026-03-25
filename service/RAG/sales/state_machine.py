@@ -40,6 +40,9 @@ def resolve_next_state(state: Dict[str, Any]) -> str:
     if intent == "ask_recommendation":
         return "product_matching"
 
+    if current_state in ("greeting", "need_discovery", "qualification"):
+        return "product_matching"
+
     # Safe default: keep current non-greeting flow, otherwise continue discovery.
     if current_state in ("product_matching", "comparison"):
         return current_state
