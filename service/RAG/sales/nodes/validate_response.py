@@ -4,7 +4,7 @@ import logging
 from typing import Any, Dict, List
 
 from sales.graph_state import SalesAgentState
-from sales.response_templates import render_template_response
+from sales.response_templates import render_match_options_from_candidates, render_template_response
 from utils.text import split_into_sentences
 
 log = logging.getLogger("rag-service")
@@ -30,9 +30,29 @@ def _validate_matching_response(state: SalesAgentState, text: str) -> List[str]:
         if "shophouse" in lower:
             errors.append("matching_should_not_push_shophouse")
     stripped = text.strip()
-    if stripped.endswith(("1.", "1)", "1:", "-", ":")):
+    if looks_truncated(stripped):
         errors.append("matching_response_incomplete")
+    if (state.get("response_action") or "") == "match_options":
+        if len((state.get("retrieved_candidates") or [])[:2]) >= 2:
+            option_count = sum(1 for line in stripped.splitlines() if line.strip().startswith(("1.", "2.")))
+            if option_count < 2:
+                errors.append("matching_should_have_two_options")
+        if len(stripped) < 60:
+            errors.append("matching_too_short")
     return errors
+
+
+def looks_truncated(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if stripped.endswith((":", "1.", "2.", "-", "•")):
+        return True
+    if "Lý do phù hợp:" in stripped:
+        trailing = stripped.split("Lý do phù hợp:", 1)[1]
+        if "- " not in trailing:
+            return True
+    return False
 
 
 def _fallback_from_retrieved_context(state: SalesAgentState) -> str:
@@ -71,11 +91,11 @@ def validate_response_node(state: SalesAgentState) -> Dict[str, Any]:
         log.warning("validate_response: action=%s errors=%s", action, errors)
         if action.startswith("ask_") or action in {"soft_close", "followup_closeout", "redirect_out_of_scope", "check_interest"}:
             fallback = render_template_response(action, state)
-        elif "matching_should_not_push_shophouse" in errors:
-            fallback = (
-                "Em đang ưu tiên các phương án phù hợp để ở cho gia đình mình. "
-                "Để tránh gợi ý lệch nhu cầu, em sẽ rà lại đúng các dự án phù hợp rồi gửi Anh/Chị ngay."
-            )
+        elif action == "match_options" and any(
+            error in errors
+            for error in {"matching_response_incomplete", "matching_should_have_two_options", "matching_too_short"}
+        ):
+            fallback = render_match_options_from_candidates(state, state.get("retrieved_candidates") or [])
         elif "matching_response_incomplete" in errors:
             fallback = _fallback_from_retrieved_context(state)
         else:

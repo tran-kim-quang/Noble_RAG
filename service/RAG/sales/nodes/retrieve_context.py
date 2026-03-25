@@ -1,10 +1,12 @@
 """Node 6: Retrieve knowledge from LightRAG based on current sales state."""
 
 import logging
+import re
 from typing import Any, Dict, List
 
 from sales.graph_state import SalesAgentState
 from rag.retriever import query_rag
+from utils.text import split_into_sentences
 
 log = logging.getLogger("rag-service")
 
@@ -88,9 +90,79 @@ async def retrieve_context(state: SalesAgentState) -> Dict[str, Any]:
     context_items: List[Dict[str, Any]] = []
     if raw_answer and raw_answer.strip():
         context_items.append({"content": raw_answer, "source": "lightrag"})
+    candidates = _extract_candidates(raw_answer)
 
-    log.info("retrieve_context: got %d items", len(context_items))
+    log.info("retrieve_context: got %d items %d candidates", len(context_items), len(candidates))
     return {
+        "retrieved_candidates": candidates,
         "retrieved_context": context_items,
         "has_retrieved_context": bool(context_items),
     }
+
+
+def _extract_candidates(raw_answer: str) -> List[Dict[str, Any]]:
+    text = (raw_answer or "").strip()
+    if not text:
+        return []
+
+    candidates = _extract_candidates_from_numbered_blocks(text)
+    if candidates:
+        return candidates[:2]
+    return _extract_candidates_from_project_mentions(text)[:2]
+
+
+def _extract_candidates_from_numbered_blocks(text: str) -> List[Dict[str, Any]]:
+    matches = list(re.finditer(r"(?m)^\s*(\d+)[\.\)]\s+(.+)$", text))
+    if not matches:
+        return []
+
+    candidates: List[Dict[str, Any]] = []
+    for idx, match in enumerate(matches):
+        start = match.start()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        block = text[start:end].strip()
+        first_line = match.group(2).strip()
+        project_name = re.split(r"\s*[-:]\s*", first_line, maxsplit=1)[0].strip()
+        fit_reasons: List[str] = []
+        risk_notes: List[str] = []
+        for line in block.splitlines()[1:]:
+            clean = line.strip(" -\t")
+            if not clean:
+                continue
+            lower = clean.lower()
+            if lower.startswith(("lưu ý", "rủi ro", "hạn chế", "cân nhắc")):
+                risk_notes.append(clean)
+            elif not lower.startswith("lý do phù hợp"):
+                fit_reasons.append(clean.rstrip("."))
+        candidates.append(
+            {
+                "project_name": project_name or f"Phương án {idx + 1}",
+                "fit_reasons": fit_reasons[:2],
+                "risk_notes": risk_notes[:1],
+                "content": block,
+            }
+        )
+    return candidates
+
+
+def _extract_candidates_from_project_mentions(text: str) -> List[Dict[str, Any]]:
+    pattern = re.compile(r"(Noble[^\n,.;:]+)", re.IGNORECASE)
+    names: List[str] = []
+    for match in pattern.findall(text):
+        clean = match.strip()
+        if clean and clean.lower() not in {item.lower() for item in names}:
+            names.append(clean)
+
+    sentences = split_into_sentences(text)
+    candidates: List[Dict[str, Any]] = []
+    for name in names[:2]:
+        related = [sentence for sentence in sentences if name.lower() in sentence.lower()]
+        candidates.append(
+            {
+                "project_name": name,
+                "fit_reasons": [sentence.rstrip(".") for sentence in related[:2]],
+                "risk_notes": [],
+                "content": " ".join(related[:3]).strip(),
+            }
+        )
+    return candidates

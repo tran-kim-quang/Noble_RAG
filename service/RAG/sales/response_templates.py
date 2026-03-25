@@ -1,6 +1,9 @@
 """Deterministic response templates for scripted sales steps."""
 
+import re
 from typing import Any, Dict, List
+
+from utils.text import split_into_sentences
 
 
 _SLOT_LABELS = {
@@ -14,6 +17,53 @@ _SLOT_LABELS = {
 def _missing_slots_text(missing_slots: List[str]) -> str:
     labels = [_SLOT_LABELS.get(slot, slot) for slot in missing_slots]
     return ", ".join(labels)
+
+
+def _extract_reason_candidates(content: str) -> List[str]:
+    reasons: List[str] = []
+    for line in content.splitlines():
+        clean = line.strip(" -\t")
+        if not clean:
+            continue
+        lower = clean.lower()
+        if lower.startswith(("lý do", "lưu ý", "cần lưu ý")):
+            continue
+        reasons.append(clean.rstrip("."))
+    if reasons:
+        return reasons[:2]
+
+    sentences = split_into_sentences(content)
+    return [sentence.rstrip(".") for sentence in sentences[:2]]
+
+
+def render_match_options_from_candidates(state: Dict[str, Any], candidates: List[Dict[str, Any]]) -> str:
+    top2 = [candidate for candidate in candidates if isinstance(candidate, dict)][:2]
+    if len(top2) < 2:
+        return (
+            "Dựa trên thông tin hiện tại, em chưa lọc được 2 phương án thật sự rõ ràng để gửi Anh/Chị. "
+            "Anh/Chị cho em thêm 1 tiêu chí ưu tiên nhất để em lọc sát hơn nhé."
+        )
+
+    lines = ["Dựa trên nhu cầu hiện tại, em thấy có 2 phương án phù hợp để Anh/Chị tham khảo:"]
+    for idx, candidate in enumerate(top2, start=1):
+        name = str(candidate.get("project_name") or f"Phương án {idx}").strip()
+        reasons = [str(reason).strip().rstrip(".") for reason in candidate.get("fit_reasons") or [] if str(reason).strip()]
+        if not reasons:
+            reasons = _extract_reason_candidates(str(candidate.get("content") or ""))
+        reasons = reasons[:2]
+        risk_notes = [str(note).strip() for note in candidate.get("risk_notes") or [] if str(note).strip()]
+
+        lines.append(f"{idx}. {name}")
+        if reasons:
+            lines.append("Lý do phù hợp:")
+            for reason in reasons:
+                lines.append(f"- {reason}")
+        if risk_notes:
+            lines.append(f"Lưu ý: {risk_notes[0]}")
+        lines.append("")
+
+    lines.append("Nếu Anh/Chị muốn, em sẽ đi sâu hơn vào phương án phù hợp hơn với gia đình mình ạ.")
+    return "\n".join(lines).strip()
 
 
 def render_template_response(action: str, state: Dict[str, Any]) -> str:

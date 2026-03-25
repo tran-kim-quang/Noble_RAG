@@ -11,6 +11,35 @@ _DISCOVERY_SLOT_ORDER = [
     ("location_preference", ScriptStep.S5_ASK_LOCATION, ResponseAction.ASK_LOCATION),
 ]
 
+_DETAIL_KEYWORDS = (
+    "chi tiết",
+    "cụ thể",
+    "nói rõ",
+    "thêm về",
+    "phân tích",
+    "so sánh",
+    "phương án 1",
+    "phương án 2",
+    "option 1",
+    "option 2",
+)
+
+
+def _wants_option_detail(state: Dict[str, Any], intent: str) -> bool:
+    if intent == "comparison":
+        return True
+
+    user_text = (state.get("user_text") or "").strip().lower()
+    if any(keyword in user_text for keyword in _DETAIL_KEYWORDS):
+        return True
+
+    for candidate in state.get("retrieved_candidates") or []:
+        project_name = str(candidate.get("project_name") or "").strip().lower()
+        if project_name and project_name in user_text:
+            return True
+
+    return False
+
 
 def resolve_script_step_and_action(state: Dict[str, Any]) -> Tuple[str, str]:
     next_state = state.get("next_sales_state") or "need_discovery"
@@ -44,9 +73,13 @@ def resolve_script_step_and_action(state: Dict[str, Any]) -> Tuple[str, str]:
         return ScriptStep.M2_EXPLAIN_OPTION_DETAIL.value, ResponseAction.EXPLAIN_OPTION_DETAIL.value
 
     if next_state == "product_matching":
-        if current_state == "product_matching" or current_step == ScriptStep.M1_MATCH_OPTIONS.value:
+        if current_step == ScriptStep.M1_MATCH_OPTIONS.value:
+            if _wants_option_detail(state, intent):
+                return ScriptStep.M2_EXPLAIN_OPTION_DETAIL.value, ResponseAction.EXPLAIN_OPTION_DETAIL.value
             if intent in ("follow_up", "buy_signal"):
                 return ScriptStep.M3_INTEREST_CHECK.value, ResponseAction.CHECK_INTEREST.value
+            return ScriptStep.M1_MATCH_OPTIONS.value, ResponseAction.MATCH_OPTIONS.value
+        if current_step == ScriptStep.M2_EXPLAIN_OPTION_DETAIL.value and _wants_option_detail(state, intent):
             return ScriptStep.M2_EXPLAIN_OPTION_DETAIL.value, ResponseAction.EXPLAIN_OPTION_DETAIL.value
         return ScriptStep.M1_MATCH_OPTIONS.value, ResponseAction.MATCH_OPTIONS.value
 

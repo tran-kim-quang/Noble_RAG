@@ -5,6 +5,7 @@ from typing import Any, Dict, List
 
 from sales.graph_state import SalesAgentState
 from sales.prompt_builder import build_prompt
+from sales.response_templates import render_match_options_from_candidates
 from core.dependencies import llm_model_func
 from utils.text import split_into_sentences
 
@@ -89,6 +90,12 @@ async def build_response(state: SalesAgentState) -> Dict[str, Any]:
     if next_state in _GROUNDED_STATES and not _has_retrieved_context(state):
         fallback = _fallback_without_context(state)
         return {"draft_response": fallback, "final_response": fallback}
+    if response_action == "match_options":
+        deterministic = render_match_options_from_candidates(
+            state,
+            state.get("retrieved_candidates") or [],
+        )
+        return {"draft_response": deterministic, "final_response": deterministic}
 
     prompt = build_prompt(state)
     history = state.get("chat_history") or []
