@@ -32,6 +32,8 @@ class SalesAgentState(TypedDict, total=False):
     retrieved_candidates: List[Dict[str, Any]]
     retrieved_context: List[Dict[str, Any]]
     has_retrieved_context: bool
+    project_qa_blocked: bool
+    resolved_project_name: Optional[str]
 
     # Response
     draft_response: Optional[str]

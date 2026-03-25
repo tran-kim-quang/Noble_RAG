@@ -1,6 +1,7 @@
 """Basic validator to keep responses aligned with script action."""
 
 import logging
+import re
 from typing import Any, Dict, List
 
 from sales.graph_state import SalesAgentState
@@ -39,6 +40,20 @@ def _validate_matching_response(state: SalesAgentState, text: str) -> List[str]:
                 errors.append("matching_should_have_two_options")
         if len(stripped) < 60:
             errors.append("matching_too_short")
+    return errors
+
+
+def _validate_project_qa_response(text: str) -> List[str]:
+    errors: List[str] = []
+    stripped = text.strip()
+    if _contains_greeting(stripped):
+        errors.append("project_qa_should_not_regreet")
+    if looks_truncated(stripped):
+        errors.append("project_qa_incomplete")
+    if stripped.count("**") % 2 != 0:
+        errors.append("project_qa_broken_markdown")
+    if re.search(r"\*\s+\d", stripped):
+        errors.append("project_qa_broken_markdown")
     return errors
 
 
@@ -86,6 +101,8 @@ def validate_response_node(state: SalesAgentState) -> Dict[str, Any]:
 
     if action in {"match_options", "explain_option_detail"}:
         errors.extend(_validate_matching_response(state, final_response))
+    if action == "project_qa":
+        errors.extend(_validate_project_qa_response(final_response))
 
     if errors:
         log.warning("validate_response: action=%s errors=%s", action, errors)
@@ -96,6 +113,10 @@ def validate_response_node(state: SalesAgentState) -> Dict[str, Any]:
             for error in {"matching_response_incomplete", "matching_should_have_two_options", "matching_too_short"}
         ):
             fallback = render_match_options_from_candidates(state, state.get("retrieved_candidates") or [])
+        elif action == "project_qa" and any(
+            error in errors for error in {"project_qa_incomplete", "project_qa_broken_markdown"}
+        ):
+            fallback = _fallback_from_retrieved_context(state)
         elif "matching_response_incomplete" in errors:
             fallback = _fallback_from_retrieved_context(state)
         else:

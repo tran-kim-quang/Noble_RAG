@@ -52,11 +52,15 @@ NHIỆM VỤ
     "need_discovery": """TRẠNG THÁI: NEED_DISCOVERY
 NHIỆM VỤ
 - Chỉ hỏi để lấy các slot còn thiếu trong nhóm tiêu chí cốt lõi.
-- Không tư vấn dự án, không nêu ví dụ dự án, không nêu ví dụ khu vực.
+- Nếu có NGỮ CẢNH TỪ KHO TÀI LIỆU, có thể phản hồi ngắn gọn theo tri thức dự án để định hướng cho khách trước khi hỏi tiếp.
+- Không chốt dự án cụ thể khi vẫn thiếu tiêu chí cốt lõi.
+- Không nêu ví dụ dự án hoặc khu vực cụ thể nếu dữ liệu retrieve không chỉ rõ.
 - Không suy diễn địa điểm, loại hình, ngân sách hoặc chân dung gia đình nếu khách chưa nói.
 - Nếu khách chưa xác định rõ nhu cầu ở, có thể gợi ý 1-2 tiêu chí chọn nơi ở trung lập dựa trên thông tin đã có về gia đình, con cái, mục đích mua.
 - Các gợi ý phải ở mức tiêu chí sống, ví dụ: gần công viên, gần trường học, an toàn, thuận tiện đi làm, cộng đồng yên tĩnh.
 - Không được lái khách sang một loại hình sản phẩm cụ thể nếu khách chưa tự nêu.
+- Nếu khách vừa hỏi tư vấn/recommendation khi thông tin còn thiếu, hãy trả lời ngắn theo dữ liệu retrieve rồi chốt bằng đúng 1 câu hỏi để lấy slot còn thiếu quan trọng nhất.
+- Nếu khách đã nêu một tiêu chí rõ như gần trường học, tiện đi làm, yên tĩnh, có thể phản hồi 1-2 ý bám theo tiêu chí đó từ tài liệu thay vì chỉ hỏi lại máy móc.
 - Mỗi lượt tối đa 1 câu hỏi chính; tối đa 1 câu phụ nếu thật sự cần.
 - Nếu câu khách rất ngắn hoặc chỉ là chào hỏi, chỉ hỏi 1 câu duy nhất.
 - Không hỏi lại các thông tin đã có trong hồ sơ khách.
@@ -67,6 +71,14 @@ NHIỆM VỤ
 - Trạng thái này hiếm khi dùng.
 - Không ưu tiên hỏi ngân sách.
 - Nếu thiếu 1 trong 4 tiêu chí cốt lõi thì quay lại hỏi đúng tiêu chí đó.""",
+
+    "project_qa": """TRẠNG THÁI: PROJECT_QA
+NHIỆM VỤ
+- Trả lời trực tiếp câu hỏi người dùng về dự án/sản phẩm/chính sách.
+- Chỉ dùng dữ liệu có trong NGỮ CẢNH TỪ KHO TÀI LIỆU.
+- Không ép hội thoại quay về flow discovery nếu câu hỏi hiện tại có thể trả lời được.
+- Không tự biến câu trả lời thành shortlist 2 phương án nếu khách không yêu cầu.
+- Chỉ gợi ý bước tiếp theo rất nhẹ ở cuối nếu thật sự phù hợp.""",
 
     "product_matching": """TRẠNG THÁI: PRODUCT_MATCHING
 NHIỆM VỤ
@@ -183,6 +195,8 @@ def _build_discovery_guidance(next_state: str, lead_profile: Dict[str, Any], mis
         hints.append("Gia đình có con nhỏ thường quan tâm tiêu chí gần trường học, công viên, khu vui chơi và môi trường an toàn.")
     if "location_preference" in missing_slots and hints:
         hints.append("Nếu cần gợi mở, hãy dùng các tiêu chí sống trên để giúp khách tự xác định khu vực phù hợp.")
+    if missing_slots:
+        hints.append("Nếu có context từ kho tài liệu, có thể tóm tắt 1 định hướng ngắn trước khi hỏi đúng 1 slot còn thiếu.")
 
     if not hints:
         return ""
@@ -190,7 +204,7 @@ def _build_discovery_guidance(next_state: str, lead_profile: Dict[str, Any], mis
 
 
 def _build_output_rules(next_state: str, has_context: bool) -> str:
-    grounded_states = {"product_matching", "comparison", "objection_handling", "closing_next_step"}
+    grounded_states = {"project_qa", "product_matching", "comparison", "objection_handling", "closing_next_step"}
     rules = ["RÀNG BUỘC HÌNH THỨC:"]
 
     if next_state == "greeting":
@@ -200,7 +214,9 @@ def _build_output_rules(next_state: str, has_context: bool) -> str:
         ])
     elif next_state == "need_discovery":
         rules.extend([
-            "- Tối đa 2 câu.",
+            "- Nếu không có context: tối đa 2 câu.",
+            "- Nếu có context: tối đa 3 câu.",
+            "- Nếu có context, câu đầu có thể là định hướng tư vấn ngắn bám theo tài liệu.",
             "- Chỉ hỏi về các slot đang thiếu.",
             "- Chỉ có 1 câu hỏi chính.",
         ])

@@ -6,6 +6,7 @@ class SalesState(str, Enum):
     QUALIFICATION = "qualification"
     NEED_DISCOVERY = "need_discovery"
     BUDGET_ALIGNMENT = "budget_alignment"
+    PROJECT_QA = "project_qa"
     PRODUCT_MATCHING = "product_matching"
     COMPARISON = "comparison"
     OBJECTION_HANDLING = "objection_handling"
@@ -21,6 +22,7 @@ class ScriptStep(str, Enum):
     S3_ASK_CHILDREN = "S3_ask_children"
     S4_ASK_PURPOSE = "S4_ask_purpose"
     S5_ASK_LOCATION = "S5_ask_location"
+    Q1_PROJECT_QA = "Q1_project_qa"
     M1_MATCH_OPTIONS = "M1_match_options"
     M2_EXPLAIN_OPTION_DETAIL = "M2_explain_option_detail"
     M3_INTEREST_CHECK = "M3_interest_check"
@@ -36,6 +38,7 @@ class ResponseAction(str, Enum):
     ASK_CHILDREN = "ask_children"
     ASK_PURPOSE = "ask_purpose"
     ASK_LOCATION = "ask_location"
+    PROJECT_QA = "project_qa"
     MATCH_OPTIONS = "match_options"
     EXPLAIN_OPTION_DETAIL = "explain_option_detail"
     CHECK_INTEREST = "check_interest"
@@ -46,6 +49,7 @@ class ResponseAction(str, Enum):
 
 
 STATES_NEEDING_RETRIEVAL = {
+    SalesState.PROJECT_QA,
     SalesState.PRODUCT_MATCHING,
     SalesState.COMPARISON,
     SalesState.OBJECTION_HANDLING,

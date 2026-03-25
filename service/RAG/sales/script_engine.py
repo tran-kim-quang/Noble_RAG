@@ -60,6 +60,9 @@ def resolve_script_step_and_action(state: Dict[str, Any]) -> Tuple[str, str]:
                 return step.value, action.value
         return ScriptStep.S5_ASK_LOCATION.value, ResponseAction.ASK_LOCATION.value
 
+    if next_state == "project_qa":
+        return ScriptStep.Q1_PROJECT_QA.value, ResponseAction.PROJECT_QA.value
+
     if next_state == "objection_handling":
         return ScriptStep.O1_HANDLE_OBJECTION.value, ResponseAction.HANDLE_OBJECTION.value
 

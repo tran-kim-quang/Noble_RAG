@@ -5,6 +5,9 @@ from typing import Any, Dict
 from models.sales_state import ResponseAction, TEMPLATE_ACTIONS
 
 
+_DISCOVERY_RETRIEVAL_INTENTS = {"ask_recommendation", "project_info", "comparison", "objection"}
+
+
 def route_after_action_resolution(state: Dict[str, Any]) -> str:
     """Route to template rendering or grounded generation by response action."""
     action_str = state.get("response_action") or ResponseAction.ASK_OPENING.value
@@ -12,6 +15,18 @@ def route_after_action_resolution(state: Dict[str, Any]) -> str:
         action = ResponseAction(action_str)
     except ValueError:
         action = ResponseAction.ASK_OPENING
+
+    if (
+        state.get("next_sales_state") == "need_discovery"
+        and action in {
+            ResponseAction.ASK_FAMILY_SIZE,
+            ResponseAction.ASK_CHILDREN,
+            ResponseAction.ASK_PURPOSE,
+            ResponseAction.ASK_LOCATION,
+        }
+        and (state.get("detected_intent") or "") in _DISCOVERY_RETRIEVAL_INTENTS
+    ):
+        return "retrieve_context"
 
     if action in TEMPLATE_ACTIONS:
         return "render_response_from_template"

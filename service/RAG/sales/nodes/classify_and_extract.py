@@ -24,7 +24,7 @@ _COMBINED_PROMPT = """Bạn là bộ phân tích hội thoại bất động s�
 
 Trả về DUY NHẤT một JSON với cấu trúc chính xác sau:
 {{
-  "intent": "greeting" | "ask_recommendation" | "comparison" | "objection" | "buy_signal" | "follow_up" | "out_of_scope" | "other",
+  "intent": "greeting" | "ask_recommendation" | "project_info" | "comparison" | "objection" | "buy_signal" | "follow_up" | "out_of_scope" | "other",
   "objection_type": null | "gia_cao" | "phap_ly" | "vi_tri" | "chua_du_tien" | "suy_nghi_them" | "khac",
   "buy_signal": true | false,
   "confidence": 0.0-1.0,
@@ -45,6 +45,7 @@ Trả về DUY NHẤT một JSON với cấu trúc chính xác sau:
 Định nghĩa intent:
 - greeting: chào hỏi, giới thiệu bản thân
 - ask_recommendation: hỏi về dự án, muốn tư vấn, muốn giới thiệu sản phẩm
+- project_info: hỏi thông tin cụ thể về dự án/sản phẩm/chính sách/pháp lý/tiện ích/vị trí mà cần trả lời trực tiếp theo dữ liệu có sẵn, không phải xin agent tư vấn shortlist
 - comparison: muốn so sánh 2+ lựa chọn
 - objection: phản đối, băn khoăn về giá/pháp lý/vị trí/tài chính
 - buy_signal: hỏi bảng giá, còn căn không, muốn đặt cọc, muốn đi xem, muốn gặp sales
@@ -54,10 +55,13 @@ Trả về DUY NHẤT một JSON với cấu trúc chính xác sau:
 
 Quy tắc trích xuất:
 - "Gia đình 4 người", "vợ chồng và 2 con nhỏ" => family_member_count=4, children_count=2.
+- "Sống 1 mình", "ở một mình", "độc thân" => family_member_count=1, children_count=0.
+- "Vợ chồng chưa có con", "hai vợ chồng" => family_member_count=2, children_count=0 nếu người dùng không nhắc tới con.
 - "Để ở" => purpose="mua_o".
 - "Kinh doanh", "mở cửa hàng", "buôn bán" => purpose="kinh_doanh".
 - Ưu tiên trích xuất location_preference khi khách nói "gần Long Biên", "ở Hà Nội", "quanh Cầu Giấy"...
 - Nếu không có thông tin cho slot nào, để null hoặc [].
+- Khi người dùng mô tả rõ tình trạng sống một mình hoặc chưa có con, hãy điền giá trị số 0 thay vì null cho children_count.
 
 Lịch sử gần đây:
 {history_str}

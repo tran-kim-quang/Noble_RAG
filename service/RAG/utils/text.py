@@ -1,5 +1,5 @@
 import re
-from typing import List
+from typing import Iterator, List
 
 
 def split_into_sentences(text: str) -> List[str]:
@@ -16,3 +16,21 @@ def truncate(text: str, max_chars: int = 200) -> str:
 
 def normalize_whitespace(text: str) -> str:
     return re.sub(r'\s+', ' ', text).strip()
+
+
+def iter_stream_chunks(full_answer: str) -> Iterator[str]:
+    text = (full_answer or "").strip()
+    if not text:
+        return
+
+    if "\n" in text:
+        for line in text.splitlines():
+            clean = line.strip()
+            if clean:
+                yield clean
+        return
+
+    for sent in re.split(r"(?<=[.!?])\s+", text):
+        clean = sent.strip()
+        if clean:
+            yield clean

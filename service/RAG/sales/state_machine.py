@@ -24,6 +24,8 @@ def resolve_next_state(state: Dict[str, Any]) -> str:
             return "greeting"
 
     # Intent-based transitions
+    if intent == "project_info":
+        return "project_qa"
     if intent == "comparison":
         return "comparison"
     if intent == "objection":

@@ -10,7 +10,22 @@ from utils.text import split_into_sentences
 
 log = logging.getLogger("rag-service")
 
+_PROJECT_NAME_PATTERN = re.compile(r"(Noble[^\n,.;:!?()]*)", re.IGNORECASE)
+
 _STATE_QUERY_TEMPLATES: Dict[str, str] = {
+    "need_discovery": (
+        "Dựa trên kho tri thức dự án Noble, trích ra các dữ kiện và định hướng tư vấn liên quan trực tiếp đến nhu cầu hiện có của khách. "
+        "Không chốt dự án cụ thể nếu còn thiếu tiêu chí cốt lõi. "
+        "Ưu tiên thông tin thực tế về tiện ích, phong cách sống, nhóm sản phẩm, vị trí, kết nối, hoặc điểm phù hợp với nhu cầu sau: "
+        "mục đích {purpose}, loại hình {property_type}, khu vực {location}, gia đình {family_size} người, "
+        "có {children_count} con nhỏ. "
+        "Nếu dữ liệu chưa đủ để kết luận, hãy nêu 2-4 dữ kiện/định hướng hữu ích nhất để sales dùng trả lời ngắn gọn rồi hỏi tiếp. "
+        "Câu khách: {user_text}"
+    ),
+    "project_qa": (
+        "Trả lời trực tiếp câu hỏi sau về dự án/sản phẩm/chính sách của Noble bằng dữ kiện có trong kho tri thức. "
+        "Nếu dữ liệu thiếu thì nêu rõ phần chưa đủ. Câu hỏi: {user_text}"
+    ),
     "product_matching": (
         "Tư vấn dự án bất động sản Noble phù hợp với mục đích {purpose}, "
         "loại hình ưu tiên {property_type}, ngân sách tham khảo {budget}, "
@@ -55,6 +70,28 @@ def _build_retrieval_query(state: Dict[str, Any]) -> str:
     return query
 
 
+def _extract_project_name(text: str) -> str:
+    match = _PROJECT_NAME_PATTERN.search(text or "")
+    return match.group(1).strip() if match else ""
+
+
+def _resolve_project_name_from_user_context(state: Dict[str, Any]) -> str:
+    current = _extract_project_name(state.get("user_text") or "")
+    if current:
+        return current
+
+    history = state.get("chat_history") or []
+    for message in reversed(history):
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role") or "") != "user":
+            continue
+        found = _extract_project_name(str(message.get("content") or ""))
+        if found:
+            return found
+    return ""
+
+
 def _build_matching_guidance(lead: Dict[str, Any]) -> str:
     purpose = lead.get("purpose")
     property_type = lead.get("property_type")
@@ -75,6 +112,20 @@ def _build_matching_guidance(lead: Dict[str, Any]) -> str:
 
 
 async def retrieve_context(state: SalesAgentState) -> Dict[str, Any]:
+    if (state.get("response_action") or "") == "project_qa":
+        resolved_project_name = _resolve_project_name_from_user_context(state)
+        if not resolved_project_name:
+            log.info("retrieve_context: project_qa blocked because project name is unresolved")
+            return {
+                "retrieved_candidates": [],
+                "retrieved_context": [],
+                "has_retrieved_context": False,
+                "project_qa_blocked": True,
+                "resolved_project_name": None,
+            }
+        state = dict(state)
+        state["resolved_project_name"] = resolved_project_name
+
     query = _build_retrieval_query(state)
     if not query:
         log.info("retrieve_context: no query needed for state=%s", state.get("next_sales_state"))
@@ -97,6 +148,8 @@ async def retrieve_context(state: SalesAgentState) -> Dict[str, Any]:
         "retrieved_candidates": candidates,
         "retrieved_context": context_items,
         "has_retrieved_context": bool(context_items),
+        "project_qa_blocked": False,
+        "resolved_project_name": state.get("resolved_project_name"),
     }
 
 

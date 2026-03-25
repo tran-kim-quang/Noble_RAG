@@ -14,19 +14,26 @@ _SLOT_LABELS = {
 }
 
 
+def _normalize_candidate_line(line: str) -> str:
+    return re.sub(r"\s+", " ", line.strip(" -\t#")).strip()
+
+
 def _missing_slots_text(missing_slots: List[str]) -> str:
     labels = [_SLOT_LABELS.get(slot, slot) for slot in missing_slots]
     return ", ".join(labels)
 
 
-def _extract_reason_candidates(content: str) -> List[str]:
+def _extract_reason_candidates(content: str, project_name: str = "") -> List[str]:
     reasons: List[str] = []
+    project_name_lower = project_name.strip().lower()
     for line in content.splitlines():
-        clean = line.strip(" -\t")
+        clean = _normalize_candidate_line(line)
         if not clean:
             continue
         lower = clean.lower()
-        if lower.startswith(("lý do", "lưu ý", "cần lưu ý")):
+        if lower.startswith(("lý do", "lưu ý", "cần lưu ý", "dự án ")):
+            continue
+        if project_name_lower and clean.lower() == project_name_lower:
             continue
         reasons.append(clean.rstrip("."))
     if reasons:
@@ -49,7 +56,7 @@ def render_match_options_from_candidates(state: Dict[str, Any], candidates: List
         name = str(candidate.get("project_name") or f"Phương án {idx}").strip()
         reasons = [str(reason).strip().rstrip(".") for reason in candidate.get("fit_reasons") or [] if str(reason).strip()]
         if not reasons:
-            reasons = _extract_reason_candidates(str(candidate.get("content") or ""))
+            reasons = _extract_reason_candidates(str(candidate.get("content") or ""), project_name=name)
         reasons = reasons[:2]
         risk_notes = [str(note).strip() for note in candidate.get("risk_notes") or [] if str(note).strip()]
 

@@ -1,17 +1,18 @@
 """Node 7: Build and generate the response using LLM."""
 
 import logging
+import re
 from typing import Any, Dict, List
 
 from sales.graph_state import SalesAgentState
 from sales.prompt_builder import build_prompt
 from sales.response_templates import render_match_options_from_candidates
 from core.dependencies import llm_model_func
-from utils.text import split_into_sentences
+from utils.text import normalize_whitespace, split_into_sentences
 
 log = logging.getLogger("rag-service")
 
-_GROUNDED_STATES = {"product_matching", "comparison", "objection_handling", "closing_next_step"}
+_GROUNDED_STATES = {"project_qa", "product_matching", "comparison", "objection_handling", "closing_next_step"}
 _DISCOVERY_STATES = {"greeting", "need_discovery"}
 
 
@@ -33,6 +34,23 @@ def _enforce_short_form(text: str, max_sentences: int) -> str:
     if len(sentences) <= max_sentences:
         return text.strip()
     return " ".join(sentences[:max_sentences]).strip()
+
+
+def _discovery_max_sentences(state: SalesAgentState) -> int:
+    return 3 if _has_retrieved_context(state) else 2
+
+
+def _sanitize_project_qa_text(text: str) -> str:
+    clean = (text or "").strip()
+    if not clean:
+        return ""
+    clean = re.sub(r"(?<=\d)\.\s+(?=\d{3}\b)", ".", clean)
+    clean = clean.replace("**", "")
+    clean = clean.replace("__", "")
+    clean = re.sub(r"\*\s+", "", clean)
+    clean = re.sub(r"\s+\)", ")", clean)
+    clean = re.sub(r"\(\s+", "(", clean)
+    return normalize_whitespace(clean)
 
 
 def _fallback_without_context(state: SalesAgentState) -> str:
@@ -67,12 +85,16 @@ def _fallback_without_context(state: SalesAgentState) -> str:
 async def _repair_response(state: SalesAgentState, invalid_response: str) -> str:
     next_state = state.get("next_sales_state") or "need_discovery"
     missing_slots = ", ".join(state.get("missing_slots") or []) or "không có"
+    has_context = _has_retrieved_context(state)
     repair_prompt = (
         "Hãy viết lại câu trả lời sales dưới đây để tuân thủ đúng policy.\n\n"
         f"STATE: {next_state}\n"
         f"MISSING_SLOTS: {missing_slots}\n"
+        f"HAS_CONTEXT: {'yes' if has_context else 'no'}\n"
         "RULES:\n"
-        "- Nếu state là greeting hoặc need_discovery: tối đa 2 câu, chỉ 1 câu hỏi.\n"
+        "- Nếu state là greeting: tối đa 2 câu, chỉ 1 câu hỏi.\n"
+        "- Nếu state là need_discovery và HAS_CONTEXT=no: tối đa 2 câu, chỉ 1 câu hỏi.\n"
+        "- Nếu state là need_discovery và HAS_CONTEXT=yes: tối đa 3 câu; 1-2 câu đầu tóm tắt định hướng dựa trên context, câu cuối cùng là tối đa 1 câu hỏi.\n"
         "- Chỉ hỏi về các slot còn thiếu.\n"
         "- Không nêu tên dự án hoặc địa danh ví dụ nếu chưa có context.\n"
         "- Nếu khách chưa rõ nhu cầu ở, có thể gợi ý tiêu chí sống trung lập dựa trên gia đình, con cái, mục đích mua.\n"
@@ -81,12 +103,18 @@ async def _repair_response(state: SalesAgentState, invalid_response: str) -> str
         f"Câu trả lời cần viết lại:\n{invalid_response}"
     )
     repaired = await llm_model_func(repair_prompt, history_messages=[])
-    return _enforce_short_form(str(repaired).strip(), max_sentences=2)
+    return _enforce_short_form(str(repaired).strip(), max_sentences=3 if has_context else 2)
 
 
 async def build_response(state: SalesAgentState) -> Dict[str, Any]:
     next_state = state.get("next_sales_state") or "need_discovery"
     response_action = state.get("response_action") or ""
+    if response_action == "project_qa" and state.get("project_qa_blocked"):
+        project_prompt = (
+            "Để em trả lời chính xác về số lượng căn, phân khu, pháp lý hay tiện ích, "
+            "Anh/Chị cho em xin đúng tên dự án Noble mình đang quan tâm nhé?"
+        )
+        return {"draft_response": project_prompt, "final_response": project_prompt}
     if next_state in _GROUNDED_STATES and not _has_retrieved_context(state):
         fallback = _fallback_without_context(state)
         return {"draft_response": fallback, "final_response": fallback}
@@ -104,9 +132,11 @@ async def build_response(state: SalesAgentState) -> Dict[str, Any]:
         raw = await llm_model_func(prompt, history_messages=history)
         response_text = str(raw).strip()
         if next_state in _DISCOVERY_STATES:
-            response_text = _enforce_short_form(response_text, max_sentences=2)
+            response_text = _enforce_short_form(response_text, max_sentences=_discovery_max_sentences(state))
             if _question_count(response_text) > 1:
                 response_text = await _repair_response(state, response_text)
+        if response_action == "project_qa":
+            response_text = _sanitize_project_qa_text(response_text)
         if response_action in {"match_options", "explain_option_detail"}:
             if _question_count(response_text) > 0:
                 response_text = _enforce_short_form(response_text, max_sentences=4)
