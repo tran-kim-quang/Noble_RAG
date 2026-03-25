@@ -10,9 +10,10 @@ log = logging.getLogger("rag-service")
 
 _STATE_QUERY_TEMPLATES: Dict[str, str] = {
     "product_matching": (
-        "Tư vấn dự án bất động sản Noble phù hợp với gia đình {family_size} người, "
-        "có {children_count} con nhỏ, mục đích {purpose}, ưu tiên gần khu vực {location}. "
-        "Nêu rõ dự án nào phù hợp, vì sao phù hợp với gia đình và các tiện ích nổi bật liên quan."
+        "Tư vấn dự án bất động sản Noble phù hợp với mục đích {purpose}, loại hình {property_type}, "
+        "ngân sách {budget}, ưu tiên gần khu vực {location}, gia đình {family_size} người, "
+        "có {children_count} con nhỏ. Chỉ nêu phương án phù hợp với các tiêu chí này "
+        "và các dữ kiện có trong kho tri thức."
     ),
     "comparison": (
         "So sánh các dự án bất động sản Noble về: giá, vị trí, pháp lý, tiến độ, "
@@ -67,4 +68,7 @@ async def retrieve_context(state: SalesAgentState) -> Dict[str, Any]:
         context_items.append({"content": raw_answer, "source": "lightrag"})
 
     log.info("retrieve_context: got %d items", len(context_items))
-    return {"retrieved_context": context_items}
+    return {
+        "retrieved_context": context_items,
+        "has_retrieved_context": bool(context_items),
+    }

@@ -6,8 +6,6 @@ are deterministic and auditable.
 
 from typing import Any, Dict, List
 
-from models.sales_state import REQUIRED_SLOTS_FOR_PITCH
-
 
 def resolve_next_state(state: Dict[str, Any]) -> str:
     intent: str = state.get("detected_intent") or ""
@@ -22,12 +20,8 @@ def resolve_next_state(state: Dict[str, Any]) -> str:
 
     # First turn → greet
     if current_state == "greeting" and not lead_profile.get("purpose"):
-        if intent in ("greeting", "") or not intent:
+        if intent in ("greeting", "", "other") or not intent:
             return "greeting"
-
-    # Missing required slots → discover
-    if missing:
-        return "need_discovery"
 
     # Intent-based transitions
     if intent == "comparison":
@@ -36,12 +30,19 @@ def resolve_next_state(state: Dict[str, Any]) -> str:
         return "objection_handling"
     if buy_signal or intent == "buy_signal":
         return "closing_next_step"
+    if intent == "follow_up":
+        return current_state if current_state != "greeting" else "need_discovery"
+
+    # Missing required slots → discover
+    if missing:
+        return "need_discovery"
+
     if intent == "ask_recommendation":
         return "product_matching"
-    if intent == "follow_up":
-        return "follow_up"
 
-    # Default: keep current state or recommend if qualified
+    # Safe default: keep current non-greeting flow, otherwise continue discovery.
     if current_state in ("product_matching", "comparison"):
         return current_state
-    return "product_matching"
+    if current_state in ("objection_handling", "closing_next_step"):
+        return current_state
+    return "need_discovery"

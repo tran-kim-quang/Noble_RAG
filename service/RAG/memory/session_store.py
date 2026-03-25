@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 
 from memory.redis_store import redis_get_json, redis_set_json
 from memory.redis_store import redis_delete
+from memory.local_snapshot_store import load_local_session_snapshot
 from core.config import get_settings
 
 log = logging.getLogger("rag-service")
@@ -27,6 +28,10 @@ async def load_session_context(session_id: str) -> Dict[str, Any]:
     data = await redis_get_json(_redis_url(), _key(session_id))
     if isinstance(data, dict):
         return data
+    snapshot = load_local_session_snapshot(session_id)
+    snapshot_context = snapshot.get("session_context")
+    if isinstance(snapshot_context, dict) and snapshot_context:
+        return snapshot_context
     return {
         "session_id": session_id,
         "current_state": "greeting",

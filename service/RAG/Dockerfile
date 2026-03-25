@@ -16,9 +16,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # (tất cả subpackage: api, core, sales, memory, models, utils, rag, tools, llm, storage)
 COPY service/RAG/ /app/
 
-# Copy data/curated (system prompt, playbooks, project data)
-COPY data/curated/ /app/data/curated/
-
 # Copy scripts nếu cần (init SQL, utilities)
 COPY scripts/ /app/scripts/
 

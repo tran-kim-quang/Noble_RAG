@@ -23,8 +23,13 @@ STATES_NEEDING_RETRIEVAL = {
 }
 
 REQUIRED_SLOTS_FOR_PITCH = [
-    "family_member_count",
-    "children_count",
     "purpose",
+    "property_type",
     "location_preference",
+]
+
+BUDGET_SLOT_ALIASES = [
+    "budget_text",
+    "budget_min",
+    "budget_max",
 ]

@@ -27,6 +27,7 @@ class SalesAgentState(TypedDict, total=False):
 
     # Retrieval
     retrieved_context: List[Dict[str, Any]]
+    has_retrieved_context: bool
 
     # Response
     draft_response: Optional[str]

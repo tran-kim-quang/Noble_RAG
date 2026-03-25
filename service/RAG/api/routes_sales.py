@@ -14,6 +14,11 @@ from memory.lead_profile_store import (
     load_lead_profile,
     save_lead_profile,
 )
+from memory.local_snapshot_store import (
+    get_local_snapshot_path,
+    load_local_session_snapshot,
+    read_local_session_snapshot_text,
+)
 from memory.session_store import delete_session_context, load_session_context
 from sales.graph import sales_graph
 from sales.session_export import export_session_to_txt
@@ -84,6 +89,27 @@ async def get_sales_state(session_id: str):
             "previous_state": ctx.get("previous_state"),
             "conversation_turn_count": ctx.get("conversation_turn_count", 0),
             "lead_temperature": profile.get("lead_temperature", "cold"),
+        }
+    )
+
+
+@router.get("/session/{session_id}/snapshot")
+async def get_session_snapshot(session_id: str):
+    """Read the local txt snapshot for a session."""
+    snapshot = load_local_session_snapshot(session_id)
+    raw_text = read_local_session_snapshot_text(session_id)
+    if not snapshot and not raw_text:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+
+    return JSONResponse(
+        {
+            "session_id": session_id,
+            "snapshot_path": get_local_snapshot_path(session_id),
+            "updated_at": snapshot.get("updated_at"),
+            "lead_profile": snapshot.get("lead_profile"),
+            "session_context": snapshot.get("session_context"),
+            "chat_history": snapshot.get("chat_history"),
+            "raw_text": raw_text,
         }
     )
 

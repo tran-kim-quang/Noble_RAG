@@ -29,11 +29,6 @@ async def query_rag_stream(request: QueryRequest):
         t_total = time.perf_counter()
         session_id = (request.session_id or "").strip() or f"sales_stream_{uuid.uuid4().hex}"
 
-        yield json.dumps(
-            {"chunk": "  \n*(Em đang phân tích nhu cầu của Anh/Chị...)*", "done": False},
-            ensure_ascii=False,
-        ) + "\n"
-
         try:
             result = await sales_graph.ainvoke(
                 {

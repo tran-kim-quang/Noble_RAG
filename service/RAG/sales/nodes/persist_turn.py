@@ -6,6 +6,7 @@ from typing import Any, Dict
 from sales.graph_state import SalesAgentState
 from memory.chat_history_store import save_chat_history
 from memory.lead_profile_store import save_lead_profile
+from memory.local_snapshot_store import save_local_session_snapshot
 from memory.session_store import save_session_context
 
 log = logging.getLogger("rag-service")
@@ -39,12 +40,19 @@ async def persist_turn(state: SalesAgentState) -> Dict[str, Any]:
         session_context.get("conversation_turn_count", 0) + 1
     )
     await save_session_context(session_id, session_context)
+    snapshot_path = save_local_session_snapshot(
+        session_id=session_id,
+        lead_profile=lead_profile,
+        session_context=session_context,
+        chat_history=history,
+    )
 
     log.info(
-        "persist_turn: session=%s state=%s turn=%d",
+        "persist_turn: session=%s state=%s turn=%d snapshot=%s",
         session_id,
         next_state,
         session_context["conversation_turn_count"],
+        snapshot_path,
     )
 
     return {

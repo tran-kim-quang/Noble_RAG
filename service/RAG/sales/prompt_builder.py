@@ -22,10 +22,10 @@ NGUYÊN TẮC BẮT BUỘC
 2. Chỉ sử dụng thông tin có trong context, knowledge base RAG hoặc tool results.
 3. Nếu thiếu dữ liệu, nói rõ chưa đủ thông tin và hỏi thêm hoặc đề xuất bước tiếp theo.
 4. Không cam kết lợi nhuận, không hứa chắc tăng giá, không dùng lời lẽ thao túng.
-5. Chỉ cần thu tối thiểu 4 tiêu chí để bắt đầu tư vấn: số người trong gia đình, số con nhỏ, mục đích ở hay kinh doanh, khu vực ưu tiên gần đâu.
+5. Chỉ được pitch dự án khi đã có đủ các tiêu chí cốt lõi: mục đích, loại hình sản phẩm, ngân sách, khu vực ưu tiên.
 6. Sau mỗi lượt trả lời, tạo ra một bước tiến nhỏ trong sales funnel.
 7. Không hỏi lại thông tin đã có trong HỒ SƠ KHÁCH HÀNG.
-8. Nếu khách hỏi về dự án, phải ưu tiên tư vấn dự án trước rồi mới xin thêm thông tin còn thiếu.
+8. Nếu chưa đủ điều kiện pitch theo state machine, không được tư vấn dự án cụ thể; chỉ xác nhận nhu cầu đã hiểu và hỏi thêm đúng phần còn thiếu.
 9. Mỗi lượt chỉ nên có một mục tiêu chính: tư vấn, xử lý băn khoăn, hoặc chốt bước tiếp theo.
 10. Khi chưa có retrieved context về dự án hoặc vị trí, không được tự nêu ví dụ về tên dự án, quận, khu vực, tuyến đường hay địa danh cụ thể.
 11. Nếu đang hỏi để lấy khu vực ưu tiên, chỉ hỏi chung như "Anh/Chị ưu tiên gần khu vực nào?" và không tự gợi ý địa điểm mẫu.
@@ -40,9 +40,10 @@ PHONG CÁCH
 _STATE_PROMPTS: Dict[str, str] = {
     "greeting": """TRẠNG THÁI: GREETING
 NHIỆM VỤ
-- Chào khách một cách tự nhiên.
-- Không pitch sản phẩm ngay.
-- Mời khách chia sẻ nhu cầu.""",
+- Chào khách tự nhiên trong 1 câu ngắn.
+- Sau đó hỏi đúng 1 câu mở để khách nói nhu cầu.
+- Không hỏi nhiều ý cùng lúc.
+- Không liệt kê tiêu chí, không pitch, không xin quá nhiều thông tin ở lượt đầu.""",
 
     "qualification": """TRẠNG THÁI: QUALIFICATION
 NHIỆM VỤ
@@ -50,9 +51,11 @@ NHIỆM VỤ
 
     "need_discovery": """TRẠNG THÁI: NEED_DISCOVERY
 NHIỆM VỤ
-- Thu thêm đúng các thông tin còn thiếu trong 4 tiêu chí cốt lõi để tư vấn chính xác.
-- Chỉ hỏi tối đa 2 câu ngắn mỗi lượt.
-- Nếu đã có thể tư vấn sơ bộ từ dữ liệu dự án, hãy tư vấn ngắn trước rồi chỉ hỏi thêm đúng phần còn thiếu.
+- Chỉ hỏi để lấy các slot còn thiếu trong nhóm tiêu chí cốt lõi.
+- Không tư vấn dự án, không nêu ví dụ dự án, không nêu ví dụ khu vực.
+- Không suy diễn địa điểm, loại hình, ngân sách hoặc chân dung gia đình nếu khách chưa nói.
+- Mỗi lượt tối đa 1 câu hỏi chính; tối đa 1 câu phụ nếu thật sự cần.
+- Nếu câu khách rất ngắn hoặc chỉ là chào hỏi, chỉ hỏi 1 câu duy nhất.
 - Không hỏi lại các thông tin đã có trong hồ sơ khách.
 - Nếu thiếu location_preference, chỉ hỏi chung về khu vực ưu tiên, không nêu ví dụ như quận, khu đô thị hay dự án cụ thể.""",
 
@@ -116,6 +119,7 @@ def build_prompt(state: Dict[str, Any]) -> str:
     missing_slots_text = ", ".join(missing_slots) if missing_slots else "không có"
 
     context_block = ""
+    has_context = False
     if retrieved_context:
         snippets = []
         for item in retrieved_context:
@@ -126,7 +130,10 @@ def build_prompt(state: Dict[str, Any]) -> str:
             if content.strip():
                 snippets.append(content.strip())
         if snippets:
+            has_context = True
             context_block = "\n\nNGỮ CẢNH TỪ KHO TÀI LIỆU:\n" + "\n---\n".join(snippets[:5])
+
+    output_rules = _build_output_rules(next_state, has_context)
 
     prompt = (
         f"{SYSTEM_PROMPT}\n\n"
@@ -140,10 +147,35 @@ def build_prompt(state: Dict[str, Any]) -> str:
         "- Chỉ hỏi thêm nếu thật sự cần cho bước tiếp theo.\n"
         "- Nếu hỏi thêm, chỉ hỏi các mục đang thiếu.\n"
         "- Không lặp lại cùng một câu hỏi nếu hồ sơ đã có dữ liệu.\n"
-        "- Không tự thêm ví dụ địa điểm hoặc dự án nếu các ví dụ đó không có trong hồ sơ khách hoặc ngữ cảnh retrieve.\n\n"
+        "- Không tự thêm ví dụ địa điểm hoặc dự án nếu các ví dụ đó không có trong hồ sơ khách hoặc ngữ cảnh retrieve.\n"
+        f"{output_rules}\n\n"
         "Trả lời (theo phong cách sales, tự nhiên, đúng state):"
     )
     return prompt
+
+
+def _build_output_rules(next_state: str, has_context: bool) -> str:
+    grounded_states = {"product_matching", "comparison", "objection_handling", "closing_next_step"}
+    rules = ["RÀNG BUỘC HÌNH THỨC:"]
+
+    if next_state == "greeting":
+        rules.extend([
+            "- Tối đa 2 câu.",
+            "- Chỉ có 1 câu hỏi.",
+        ])
+    elif next_state == "need_discovery":
+        rules.extend([
+            "- Tối đa 2 câu.",
+            "- Chỉ hỏi về các slot đang thiếu.",
+            "- Chỉ có 1 câu hỏi chính.",
+        ])
+
+    if next_state in grounded_states:
+        rules.append("- Chỉ dùng thông tin có trong NGỮ CẢNH TỪ KHO TÀI LIỆU.")
+        if not has_context:
+            rules.append("- Hiện không có retrieved context, nên không được nêu tên dự án hay dữ kiện dự án cụ thể.")
+
+    return "\n".join(rules)
 
 
 def _format_lead_profile(profile: Dict[str, Any]) -> str:

@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 import asyncpg
 
 from memory.redis_store import redis_delete, redis_get_json, redis_set_json
+from memory.local_snapshot_store import load_local_session_snapshot
 from core.config import get_settings
 
 log = logging.getLogger("rag-service")
@@ -35,7 +36,12 @@ async def load_lead_profile(session_id: str) -> Optional[Dict[str, Any]]:
     if data:
         return data
     await ensure_sales_schema()
-    return await _load_from_postgres(session_id)
+    data = await _load_from_postgres(session_id)
+    if data:
+        return data
+    snapshot = load_local_session_snapshot(session_id)
+    profile = snapshot.get("lead_profile")
+    return profile if isinstance(profile, dict) and profile else None
 
 
 async def save_lead_profile(session_id: str, profile: Dict[str, Any]) -> None:

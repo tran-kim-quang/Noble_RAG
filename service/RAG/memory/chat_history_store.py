@@ -10,6 +10,7 @@ from typing import Any, Dict, List
 
 from memory.redis_store import redis_get_json, redis_set_json
 from memory.redis_store import redis_delete
+from memory.local_snapshot_store import load_local_session_snapshot
 from core.config import get_settings
 
 HISTORY_MAX_TURNS = 10
@@ -29,6 +30,10 @@ async def load_chat_history(session_id: str) -> List[Dict[str, Any]]:
     if isinstance(data, list):
         log.debug("chat_history loaded: session=%s msgs=%d", session_id, len(data))
         return data
+    snapshot = load_local_session_snapshot(session_id)
+    history = snapshot.get("chat_history")
+    if isinstance(history, list):
+        return history
     return []
 
 
