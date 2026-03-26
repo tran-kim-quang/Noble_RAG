@@ -231,6 +231,60 @@ services:
       - noble_rag_net
     restart: unless-stopped
 
+  # ==================== Livestream TikTok Service ====================
+  livestream-service:
+    build:
+      context: ./service/livestream-tiktok-service
+    container_name: noble_rag_livestream
+    ports:
+      - "8002:8002"
+    environment:
+      TIKTOK_USERNAME: ${TIKTOK_USERNAME:-}
+      TIKTOK_LIVE_RETRY_SEC: ${TIKTOK_LIVE_RETRY_SEC:-30}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_QUEUE_KEY: livestream:comments
+      REDIS_ROOM_MAX_COMMENTS: ${REDIS_ROOM_MAX_COMMENTS:-2000}
+      LIVESTREAM_SERVICE_PORT: 8002
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8002/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - noble_rag_net
+    restart: unless-stopped
+
+  # ==================== Livestream AI Responder ====================
+  # Đọc comment từ Redis queue → gửi tới RAG Sales Agent → log phản hồi
+  livestream-ai-responder:
+    build:
+      context: ./service/livestream-ai-responder
+    container_name: noble_rag_livestream_responder
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      REDIS_QUEUE_KEY: livestream:comments
+      POP_TIMEOUT: "5"
+      RAG_SERVICE_URL: http://rag-service:8000
+      LIVESTREAM_SESSION_ID: ${LIVESTREAM_SESSION_ID:-livestream_session}
+      RAG_REQUEST_TIMEOUT: "60"
+      MAX_RAG_RETRIES: "2"
+      RETRY_DELAY_SEC: "2.0"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      redis:
+        condition: service_healthy
+      rag-service:
+        condition: service_healthy
+      livestream-service:
+        condition: service_started
+    networks:
+      - noble_rag_net
+    restart: unless-stopped
+
 volumes:
   postgres_data:
     driver: local

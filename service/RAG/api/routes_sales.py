@@ -195,3 +195,32 @@ async def close_session(session_id: str):
             "messages_exported": len(history),
         }
     )
+
+
+@router.get("/history/{session_id}")
+async def get_chat_history(session_id: str):
+    """
+    Get all chat messages (human and AI) for a specific session.
+    Useful for frontend to poll or display livestream session conversation history.
+    """
+    history = await load_chat_history(session_id)
+    if not history:
+        # Don't 404, just return empty list as session might be new
+        return JSONResponse({"session_id": session_id, "history": []})
+
+    formatted_history = []
+    for msg in history:
+        # history returned from store usually contains langchain objects or dicts
+        # format according to your storage implementation pattern
+        formatted_history.append({
+            "role": msg.type if hasattr(msg, "type") else msg.get("role", "unknown"),
+            "content": msg.content if hasattr(msg, "content") else msg.get("content", ""),
+            "timestamp": msg.additional_kwargs.get("timestamp") if hasattr(msg, "additional_kwargs") else msg.get("timestamp")
+        })
+
+    return JSONResponse(
+        {
+            "session_id": session_id,
+            "history": formatted_history
+        }
+    )

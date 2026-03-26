@@ -28,6 +28,7 @@ from api.routes_health import router as health_router
 from api.routes_documents import router as documents_router
 from api.routes_query import router as query_router
 from api.routes_sales import router as sales_router
+from api.routes_livestream import router as livestream_router
 
 setup_logging()
 log = get_logger("rag-service")
@@ -55,6 +56,7 @@ app.include_router(health_router)
 app.include_router(documents_router)
 app.include_router(query_router)
 app.include_router(sales_router)
+app.include_router(livestream_router)
 
 
 if __name__ == "__main__":
