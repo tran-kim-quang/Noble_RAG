@@ -2,6 +2,7 @@
 
 import json
 import logging
+import random
 import time
 import uuid
 from typing import Any
@@ -42,6 +43,17 @@ _SEARCH_PERSONA = (
     "Với câu hỏi ngoài kho tri thức dự án, hãy trả lời trực tiếp, tự nhiên, ngắn gọn nhưng hữu ích. "
     "Nếu thông tin phụ thuộc thời gian, hãy ưu tiên dữ liệu vừa tìm được."
 )
+_THINKING_ACK_MESSAGES = [
+    "Em đã nhận được thông tin rồi ạ, Anh/Chị chờ em một chút để em kiểm tra nhanh nhé.",
+    "Em nhận yêu cầu của Anh/Chị rồi, cho em ít giây để em xử lý và phản hồi chuẩn nhất nhé.",
+    "Em đang tiếp nhận nội dung của Anh/Chị, em rà nhanh dữ liệu rồi trả lời ngay ạ.",
+    "Em đã ghi nhận câu hỏi, Anh/Chị đợi em một lát để em đối chiếu thông tin cho chính xác nhé.",
+    "Em nhận được rồi ạ, em đang xử lý nhanh để gửi lại câu trả lời ngắn gọn cho Anh/Chị.",
+]
+
+
+def _build_thinking_ack() -> str:
+    return random.choice(_THINKING_ACK_MESSAGES)
 
 
 async def _run_sales_flow_streaming(session_id: str, user_text: str):
@@ -99,6 +111,8 @@ async def query_rag_stream(request: QueryRequest):
         session_id = (request.session_id or "").strip() or f"sales_stream_{uuid.uuid4().hex}"
 
         try:
+            # UX-first: send an immediate acknowledgment before heavier routing/retrieval.
+            yield json.dumps({"chunk": _build_thinking_ack(), "done": False, "phase": "thinking_ack"}, ensure_ascii=False) + "\n"
             history = await load_chat_history(session_id)
             yield json.dumps({"chunk": "", "done": False, "phase": "route"}, ensure_ascii=False) + "\n"
             category, routed_query = await route_query(user_text, history)
