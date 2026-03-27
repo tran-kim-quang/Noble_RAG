@@ -1,5 +1,6 @@
 """Node 8: Persist chat history, lead profile, and session context."""
 
+import asyncio
 import logging
 from typing import Any, Dict
 
@@ -10,6 +11,31 @@ from memory.local_snapshot_store import save_local_session_snapshot
 from memory.session_store import save_session_context
 
 log = logging.getLogger("rag-service")
+
+
+async def _persist_worker(
+    session_id: str,
+    next_state: str,
+    history: list[Dict[str, Any]],
+    lead_profile: Dict[str, Any],
+    session_context: Dict[str, Any],
+) -> None:
+    await save_chat_history(session_id, history)
+    await save_lead_profile(session_id, lead_profile)
+    await save_session_context(session_id, session_context)
+    snapshot_path = save_local_session_snapshot(
+        session_id=session_id,
+        lead_profile=lead_profile,
+        session_context=session_context,
+        chat_history=history,
+    )
+    log.info(
+        "persist_turn(async): session=%s state=%s turn=%d snapshot=%s",
+        session_id,
+        next_state,
+        session_context.get("conversation_turn_count", 0),
+        snapshot_path,
+    )
 
 
 async def persist_turn(state: SalesAgentState) -> Dict[str, Any]:
@@ -24,18 +50,12 @@ async def persist_turn(state: SalesAgentState) -> Dict[str, Any]:
     history = list(state.get("chat_history") or [])
     history.append({"role": "user", "content": user_text})
     history.append({"role": "assistant", "content": final_response})
-    await save_chat_history(session_id, history)
-
-    # Update and persist lead profile
     lead_profile = dict(state.get("lead_profile") or {})
     lead_profile["current_state"] = next_state
     lead_profile["current_script_step"] = next_script_step
     lead_profile["last_user_intent"] = state.get("detected_intent")
     lead_profile["last_next_action"] = next_state
     lead_profile["last_action"] = response_action
-    await save_lead_profile(session_id, lead_profile)
-
-    # Update session context
     session_context = dict(state.get("session_context") or {})
     session_context["previous_state"] = state.get("current_sales_state")
     session_context["current_state"] = next_state
@@ -44,20 +64,17 @@ async def persist_turn(state: SalesAgentState) -> Dict[str, Any]:
     session_context["conversation_turn_count"] = (
         session_context.get("conversation_turn_count", 0) + 1
     )
-    await save_session_context(session_id, session_context)
-    snapshot_path = save_local_session_snapshot(
-        session_id=session_id,
-        lead_profile=lead_profile,
-        session_context=session_context,
-        chat_history=history,
+    task = asyncio.create_task(
+        _persist_worker(
+            session_id=session_id,
+            next_state=next_state,
+            history=history,
+            lead_profile=lead_profile,
+            session_context=session_context,
+        )
     )
-
-    log.info(
-        "persist_turn: session=%s state=%s turn=%d snapshot=%s",
-        session_id,
-        next_state,
-        session_context["conversation_turn_count"],
-        snapshot_path,
+    task.add_done_callback(
+        lambda t: log.error("persist_turn async failed: %s", t.exception()) if t.exception() else None
     )
 
     return {

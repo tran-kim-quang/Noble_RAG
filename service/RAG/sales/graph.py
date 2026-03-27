@@ -3,13 +3,19 @@
 from langgraph.graph import StateGraph, END
 
 from sales.graph_state import SalesAgentState
-from sales.edges import route_after_action_resolution
+from sales.edges import (
+    route_after_action_resolution,
+    route_after_fast_parse,
+    route_after_retrieve_context,
+)
 from sales.nodes.ingest_user_turn import ingest_user_turn
+from sales.nodes.fast_parse_user_turn import fast_parse_user_turn
 from sales.nodes.classify_and_extract import classify_and_extract
 from sales.nodes.update_lead_profile import update_lead_profile
 from sales.nodes.resolve_sales_state import resolve_sales_state_node
 from sales.nodes.resolve_script_step import resolve_script_step_node
 from sales.nodes.decide_response_action import decide_response_action_node
+from sales.nodes.fast_ack_response import fast_ack_response
 from sales.nodes.render_response_from_template import render_response_from_template
 from sales.nodes.retrieve_context import retrieve_context
 from sales.nodes.build_response import build_response
@@ -21,11 +27,13 @@ from sales.nodes.finalize_output import finalize_output
 builder = StateGraph(SalesAgentState)
 
 builder.add_node("ingest_user_turn", ingest_user_turn)
+builder.add_node("fast_parse_user_turn", fast_parse_user_turn)
 builder.add_node("classify_and_extract", classify_and_extract)
 builder.add_node("update_lead_profile", update_lead_profile)
 builder.add_node("resolve_sales_state", resolve_sales_state_node)
 builder.add_node("resolve_script_step", resolve_script_step_node)
 builder.add_node("decide_response_action", decide_response_action_node)
+builder.add_node("fast_ack_response", fast_ack_response)
 builder.add_node("render_response_from_template", render_response_from_template)
 builder.add_node("retrieve_context", retrieve_context)
 builder.add_node("build_response", build_response)
@@ -37,7 +45,15 @@ builder.add_node("finalize_output", finalize_output)
 builder.set_entry_point("ingest_user_turn")
 
 # ── Linear edges ──────────────────────────────────────────────────────────
-builder.add_edge("ingest_user_turn", "classify_and_extract")
+builder.add_edge("ingest_user_turn", "fast_parse_user_turn")
+builder.add_conditional_edges(
+    "fast_parse_user_turn",
+    route_after_fast_parse,
+    {
+        "classify_and_extract": "classify_and_extract",
+        "update_lead_profile": "update_lead_profile",
+    },
+)
 builder.add_edge("classify_and_extract", "update_lead_profile")
 builder.add_edge("update_lead_profile", "resolve_sales_state")
 builder.add_edge("resolve_sales_state", "resolve_script_step")
@@ -53,7 +69,15 @@ builder.add_conditional_edges(
     },
 )
 
-builder.add_edge("retrieve_context", "build_response")
+builder.add_conditional_edges(
+    "retrieve_context",
+    route_after_retrieve_context,
+    {
+        "fast_ack_response": "fast_ack_response",
+        "build_response": "build_response",
+    },
+)
+builder.add_edge("fast_ack_response", "build_response")
 builder.add_edge("render_response_from_template", "validate_response")
 builder.add_edge("build_response", "validate_response")
 builder.add_edge("validate_response", "persist_turn")

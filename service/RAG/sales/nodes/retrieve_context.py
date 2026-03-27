@@ -70,6 +70,22 @@ def _build_retrieval_query(state: Dict[str, Any]) -> str:
     return query
 
 
+def _build_retrieval_query_lite(state: Dict[str, Any]) -> str:
+    user_text = (state.get("user_text") or "").strip()
+    next_state = state.get("next_sales_state") or "project_qa"
+    project_name = state.get("resolved_project_name") or _resolve_project_name_from_user_context(state)
+
+    if next_state == "project_qa" and project_name:
+        return f"Thông tin chính xác và ngắn gọn về {project_name}: {user_text}"
+    if next_state == "comparison":
+        return f"So sánh ngắn gọn theo câu hỏi: {user_text}"
+    if next_state == "objection_handling":
+        return f"Xử lý băn khoăn phổ biến bất động sản cho câu: {user_text}"
+    if next_state == "closing_next_step":
+        return f"Gợi ý bước tiếp theo phù hợp cho khách với yêu cầu: {user_text}"
+    return user_text
+
+
 def _extract_project_name(text: str) -> str:
     match = _PROJECT_NAME_PATTERN.search(text or "")
     return match.group(1).strip() if match else ""
@@ -126,16 +142,25 @@ async def retrieve_context(state: SalesAgentState) -> Dict[str, Any]:
         state = dict(state)
         state["resolved_project_name"] = resolved_project_name
 
-    query = _build_retrieval_query(state)
+    retrieval_mode = (state.get("retrieval_mode") or "full").lower()
+    if retrieval_mode == "lite":
+        query = _build_retrieval_query_lite(state)
+        top_k = 3
+        history = (state.get("chat_history") or [])[-2:]
+    else:
+        query = _build_retrieval_query(state)
+        top_k = 5
+        history = state.get("chat_history") or []
+
     if not query:
         log.info("retrieve_context: no query needed for state=%s", state.get("next_sales_state"))
         return {"retrieved_context": []}
 
-    log.info("retrieve_context: query='%s...'", query[:80])
+    log.info("retrieve_context: mode=%s query='%s...'", retrieval_mode, query[:80])
     raw_answer = await query_rag(
         query,
-        top_k=5,
-        history=state.get("chat_history") or [],
+        top_k=top_k,
+        history=history,
     )
 
     context_items: List[Dict[str, Any]] = []
@@ -150,6 +175,7 @@ async def retrieve_context(state: SalesAgentState) -> Dict[str, Any]:
         "has_retrieved_context": bool(context_items),
         "project_qa_blocked": False,
         "resolved_project_name": state.get("resolved_project_name"),
+        "retrieval_mode": retrieval_mode,
     }
 
 

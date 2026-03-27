@@ -8,6 +8,15 @@ from models.sales_state import ResponseAction, TEMPLATE_ACTIONS
 _DISCOVERY_RETRIEVAL_INTENTS = {"ask_recommendation", "project_info", "comparison", "objection"}
 
 
+def route_after_fast_parse(state: Dict[str, Any]) -> str:
+    """Route to fallback reasoning only when fast parse is uncertain."""
+    lane = state.get("fast_lane") or "lane_c"
+    confidence = float(state.get("fast_path_confidence") or 0.0)
+    if lane == "lane_c" or confidence < 0.55:
+        return "classify_and_extract"
+    return "update_lead_profile"
+
+
 def route_after_action_resolution(state: Dict[str, Any]) -> str:
     """Route to template rendering or grounded generation by response action."""
     action_str = state.get("response_action") or ResponseAction.ASK_OPENING.value
@@ -31,3 +40,9 @@ def route_after_action_resolution(state: Dict[str, Any]) -> str:
     if action in TEMPLATE_ACTIONS:
         return "render_response_from_template"
     return "retrieve_context"
+
+
+def route_after_retrieve_context(state: Dict[str, Any]) -> str:
+    if (state.get("fast_lane") or "") == "lane_b":
+        return "fast_ack_response"
+    return "build_response"

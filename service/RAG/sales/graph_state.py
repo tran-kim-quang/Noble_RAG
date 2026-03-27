@@ -19,6 +19,10 @@ class SalesAgentState(TypedDict, total=False):
 
     # Intermediate slot extraction
     extracted_slots: Dict[str, Any]
+    fast_path_confidence: Optional[float]
+    fast_lane: Optional[str]
+    retrieval_mode: Optional[str]
+    fast_ack_response: Optional[str]
 
     # State machine
     current_sales_state: Optional[str]

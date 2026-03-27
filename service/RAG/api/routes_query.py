@@ -12,11 +12,17 @@ from fastapi.responses import StreamingResponse
 from core.config import get_settings
 from memory.chat_history_store import load_chat_history
 from rag.retriever import route_query, summarize_search_answer
-from sales.edges import route_after_action_resolution
+from sales.edges import (
+    route_after_action_resolution,
+    route_after_fast_parse,
+    route_after_retrieve_context,
+)
 from models.api_models import QueryRequest
 from sales.nodes.build_response import build_response
 from sales.nodes.classify_and_extract import classify_and_extract
 from sales.nodes.decide_response_action import decide_response_action_node
+from sales.nodes.fast_ack_response import fast_ack_response
+from sales.nodes.fast_parse_user_turn import fast_parse_user_turn
 from sales.nodes.finalize_output import finalize_output
 from sales.nodes.ingest_user_turn import ingest_user_turn
 from sales.nodes.persist_turn import persist_turn
@@ -48,8 +54,14 @@ async def _run_sales_flow_streaming(session_id: str, user_text: str):
     yield {"chunk": "", "done": False, "phase": "ingest"}
     state.update(await ingest_user_turn(state))
 
-    yield {"chunk": "", "done": False, "phase": "classify"}
-    state.update(await classify_and_extract(state))
+    yield {"chunk": "", "done": False, "phase": "fast_parse"}
+    state.update(await fast_parse_user_turn(state))
+
+    next_after_fast = route_after_fast_parse(state)
+    if next_after_fast == "classify_and_extract":
+        yield {"chunk": "", "done": False, "phase": "classify"}
+        state.update(await classify_and_extract(state))
+
     state.update(update_lead_profile(state))
     state.update(resolve_sales_state_node(state))
     state.update(resolve_script_step_node(state))
@@ -62,6 +74,11 @@ async def _run_sales_flow_streaming(session_id: str, user_text: str):
     else:
         yield {"chunk": "", "done": False, "phase": "retrieve"}
         state.update(await retrieve_context(state))
+        if route_after_retrieve_context(state) == "fast_ack_response":
+            state.update(fast_ack_response(state))
+            ack = (state.get("fast_ack_response") or "").strip()
+            if ack:
+                yield {"chunk": ack, "done": False, "phase": "ack"}
         yield {"chunk": "", "done": False, "phase": "respond"}
         state.update(await build_response(state))
 
