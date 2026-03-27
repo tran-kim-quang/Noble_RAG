@@ -290,7 +290,7 @@ async def close_session(session_id: str):
 async def get_chat_history(session_id: str):
     """
     Get all chat messages (human and AI) for a specific session.
-    Useful for frontend to poll or display livestream session conversation history.
+    Useful for frontend to poll or display session conversation history.
     """
     history = await load_chat_history(session_id)
     if not history:
