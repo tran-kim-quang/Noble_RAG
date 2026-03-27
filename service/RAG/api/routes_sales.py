@@ -1,6 +1,9 @@
 """Sales agent API endpoints."""
 
+import json
 import logging
+import random
+import time
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -22,9 +25,17 @@ from memory.local_snapshot_store import (
 from memory.session_store import delete_session_context, load_session_context
 from sales.graph import sales_graph
 from sales.session_export import export_session_to_txt
+from utils.text import iter_stream_chunks
 
 router = APIRouter(prefix="/sales", tags=["sales"])
 log = logging.getLogger("rag-service")
+_THINKING_ACK_MESSAGES = [
+    "Em đã nhận được thông tin rồi ạ, Anh/Chị chờ em một chút để em kiểm tra nhanh nhé.",
+    "Em nhận yêu cầu của Anh/Chị rồi, cho em ít giây để em xử lý và phản hồi chuẩn nhất nhé.",
+    "Em đang tiếp nhận nội dung của Anh/Chị, em rà nhanh dữ liệu rồi trả lời ngay ạ.",
+    "Em đã ghi nhận câu hỏi, Anh/Chị đợi em một lát để em đối chiếu thông tin cho chính xác nhé.",
+    "Em nhận được rồi ạ, em đang xử lý nhanh để gửi lại câu trả lời ngắn gọn cho Anh/Chị.",
+]
 
 
 @router.post("/chat", response_model=SalesChatResponse)
@@ -57,6 +68,84 @@ async def sales_chat(request: SalesChatRequest):
         lead_profile=result.get("lead_profile"),
         missing_slots=result.get("missing_slots"),
     )
+
+
+@router.post("/chat/stream")
+async def sales_chat_stream(request: SalesChatRequest):
+    """Streaming sales chat with immediate thinking_ack for better UX."""
+    if not request.message.strip():
+        raise HTTPException(status_code=400, detail="message cannot be empty")
+    await ensure_sales_schema()
+
+    initial_state: Dict[str, Any] = {
+        "session_id": request.session_id,
+        "user_text": request.message.strip(),
+        "raw_transcript": request.raw_transcript,
+        "errors": [],
+    }
+
+    async def generate():
+        t_total = time.perf_counter()
+        yield json.dumps(
+            {
+                "chunk": random.choice(_THINKING_ACK_MESSAGES),
+                "done": False,
+                "phase": "thinking_ack",
+                "session_id": request.session_id,
+            },
+            ensure_ascii=False,
+        ) + "\n"
+
+        try:
+            result = await sales_graph.ainvoke(initial_state)
+        except Exception as e:
+            log.error("sales_graph.ainvoke(stream) error: %s", e)
+            fallback = "Xin lỗi, em gặp lỗi khi xử lý yêu cầu. Anh/Chị thử lại giúp em nhé."
+            yield json.dumps(
+                {
+                    "chunk": fallback,
+                    "done": False,
+                    "phase": "error",
+                    "session_id": request.session_id,
+                },
+                ensure_ascii=False,
+            ) + "\n"
+            yield json.dumps(
+                {"chunk": "", "done": True, "phase": "complete", "session_id": request.session_id},
+                ensure_ascii=False,
+            ) + "\n"
+            return
+
+        full_answer = (result.get("final_response") or "").strip()
+        if not full_answer:
+            full_answer = "Xin lỗi, em chưa có đủ dữ liệu để tư vấn. Anh/Chị chia sẻ thêm giúp em nhé."
+
+        for chunk in iter_stream_chunks(full_answer):
+            yield json.dumps(
+                {
+                    "chunk": chunk,
+                    "done": False,
+                    "phase": "response",
+                    "session_id": request.session_id,
+                },
+                ensure_ascii=False,
+            ) + "\n"
+
+        yield json.dumps(
+            {
+                "chunk": "",
+                "done": True,
+                "phase": "complete",
+                "session_id": request.session_id,
+                "sales_state": result.get("next_sales_state"),
+                "missing_slots": result.get("missing_slots"),
+                "lead_profile": result.get("lead_profile"),
+                "latency_sec": round(time.perf_counter() - t_total, 3),
+            },
+            ensure_ascii=False,
+        ) + "\n"
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
 
 
 @router.get("/lead/{session_id}")

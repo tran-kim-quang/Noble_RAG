@@ -9,6 +9,7 @@ Endpoints:
   DELETE /documents/{id}
   GET  /health  /models  /status
   POST /sales/chat
+  POST /sales/chat/stream
   GET  /sales/lead/{session_id}
   PATCH /sales/lead/{session_id}
   GET  /sales/state/{session_id}
