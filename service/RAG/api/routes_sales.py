@@ -106,7 +106,7 @@ async def sales_chat_stream(request: SalesChatRequest):
             task = asyncio.create_task(sales_graph.ainvoke(initial_state))
             deep_idx = 0
             while True:
-                done, _ = await asyncio.wait({task}, timeout=2.0)
+                done, _ = await asyncio.wait({task}, timeout=5.0)
                 if task in done:
                     result = task.result()
                     break
