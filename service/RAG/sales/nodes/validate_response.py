@@ -23,8 +23,6 @@ def _validate_matching_response(state: SalesAgentState, text: str) -> List[str]:
     lower = text.lower()
     if _contains_greeting(text):
         errors.append("matching_should_not_greet")
-    if "ngân sách" in lower or "budget" in lower:
-        errors.append("matching_should_not_ask_budget")
     lead = state.get("lead_profile") or {}
     property_type = lead.get("property_type")
     if lead.get("purpose") == "mua_o" and property_type in (None, "", "khong_ro"):
@@ -34,10 +32,6 @@ def _validate_matching_response(state: SalesAgentState, text: str) -> List[str]:
     if looks_truncated(stripped):
         errors.append("matching_response_incomplete")
     if (state.get("response_action") or "") == "match_options":
-        if len((state.get("retrieved_candidates") or [])[:2]) >= 2:
-            option_count = sum(1 for line in stripped.splitlines() if line.strip().startswith(("1.", "2.")))
-            if option_count < 2:
-                errors.append("matching_should_have_two_options")
         if len(stripped) < 60:
             errors.append("matching_too_short")
     return errors
@@ -110,7 +104,7 @@ def validate_response_node(state: SalesAgentState) -> Dict[str, Any]:
             fallback = render_template_response(action, state)
         elif action == "match_options" and any(
             error in errors
-            for error in {"matching_response_incomplete", "matching_should_have_two_options", "matching_too_short"}
+            for error in {"matching_response_incomplete", "matching_too_short"}
         ):
             fallback = render_match_options_from_candidates(state, state.get("retrieved_candidates") or [])
         elif action == "project_qa" and any(

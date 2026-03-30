@@ -16,6 +16,9 @@ class SalesAgentState(TypedDict, total=False):
     detected_intent: Optional[str]
     objection_type: Optional[str]
     buy_signal: Optional[bool]
+    turn_role: Optional[str]
+    should_retrieve: Optional[bool]
+    retrieval_goal: Optional[str]
 
     # Intermediate slot extraction
     extracted_slots: Dict[str, Any]
@@ -35,6 +38,8 @@ class SalesAgentState(TypedDict, total=False):
     # Retrieval
     retrieved_candidates: List[Dict[str, Any]]
     retrieved_context: List[Dict[str, Any]]
+    catalog_projects: List[Dict[str, Any]]
+    project_facts: List[Dict[str, Any]]
     has_retrieved_context: bool
     project_qa_blocked: bool
     resolved_project_name: Optional[str]

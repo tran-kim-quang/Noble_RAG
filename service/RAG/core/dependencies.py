@@ -54,7 +54,7 @@ def _init_llm():
     provider = settings.llm_provider.lower()
     log.info("Initialising LLM provider='%s' model='%s'", provider, settings.llm_model)
 
-    if provider == "openai":
+    if provider in {"openai", "deepseek"}:
         async def llm_func(prompt, system_prompt=None, history_messages=None, **kwargs):
             if history_messages is None:
                 history_messages = []
@@ -97,7 +97,7 @@ def _init_llm():
         )
 
     raise ValueError(
-        f"Unsupported LLM provider: {provider}. Use 'openai' or 'ollama'."
+        f"Unsupported LLM provider: {provider}. Use 'deepseek', 'openai', or 'ollama'."
     )
 
 

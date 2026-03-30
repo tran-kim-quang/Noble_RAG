@@ -13,13 +13,15 @@ def resolve_next_state(state: Dict[str, Any]) -> str:
     buy_signal: bool = bool(state.get("buy_signal", False))
     lead_profile: Dict[str, Any] = state.get("lead_profile") or {}
     current_state: str = state.get("current_sales_state") or "greeting"
+    history = state.get("chat_history") or []
+    is_first_turn = len(history) == 0
 
     # Hard exits
     if intent == "out_of_scope":
         return "out_of_scope"
 
-    # First turn → greet
-    if current_state == "greeting" and not lead_profile.get("purpose"):
+    # Keep the opening greeting only on the actual first user turn.
+    if current_state == "greeting" and is_first_turn and not lead_profile.get("purpose"):
         if intent in ("greeting", "", "other") or not intent:
             return "greeting"
 
@@ -33,7 +35,11 @@ def resolve_next_state(state: Dict[str, Any]) -> str:
     if buy_signal or intent == "buy_signal":
         return "closing_next_step"
     if intent == "follow_up":
-        return current_state if current_state != "greeting" else "need_discovery"
+        if current_state == "greeting":
+            return "need_discovery"
+        if current_state == "need_discovery" and not missing:
+            return "product_matching"
+        return current_state
 
     # Missing required slots → discover
     if missing:

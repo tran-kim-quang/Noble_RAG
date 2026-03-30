@@ -24,11 +24,13 @@ COPY scripts/ /app/scripts/
 ENV PYTHONPATH=/app
 
 # Default env (bị override bởi docker-compose environment block)
-ENV LLM_PROVIDER=openai
-ENV LLM_MODEL=gpt-4o-mini
+ENV LLM_PROVIDER=deepseek
+ENV LLM_MODEL=deepseek-chat
+ENV LLM_API_URL=https://api.deepseek.com/v1
 ENV EMBEDDING_PROVIDER=ollama
 ENV EMBEDDING_MODEL=embeddinggemma:300m
 ENV EMBEDDING_DIM=768
+ENV FAST_INTENT_MODEL=qwen2.5:7b-instruct
 ENV LOG_LEVEL=INFO
 ENV RAG_SERVICE_PORT=8000
 ENV RAG_SERVICE_HOST=0.0.0.0

@@ -79,6 +79,7 @@ _SLOT_FIELDS = {
 async def classify_and_extract(state: SalesAgentState) -> Dict[str, Any]:
     user_text: str = state.get("user_text") or ""
     history = state.get("chat_history") or []
+    fast_slots = dict(state.get("extracted_slots") or {})
 
     history_str = "\n".join(
         [f"{m['role']}: {m['content']}" for m in history[-4:]]
@@ -99,7 +100,12 @@ async def classify_and_extract(state: SalesAgentState) -> Dict[str, Any]:
         intent = str(data.get("intent", "other"))
         buy_signal = bool(data.get("buy_signal", False))
         objection_type = data.get("objection_type")
-        slots = {k: data.get(k) for k in _SLOT_FIELDS}
+        slots = dict(fast_slots)
+        for key in _SLOT_FIELDS:
+            value = data.get(key)
+            if value in (None, [], ""):
+                continue
+            slots[key] = value
 
         log.info(
             "classify_and_extract: intent=%s buy_signal=%s slots=%d",
@@ -121,5 +127,5 @@ async def classify_and_extract(state: SalesAgentState) -> Dict[str, Any]:
             "detected_intent": "other",
             "buy_signal": False,
             "objection_type": None,
-            "extracted_slots": {},
+            "extracted_slots": fast_slots,
         }

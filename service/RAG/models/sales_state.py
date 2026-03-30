@@ -38,6 +38,7 @@ class ResponseAction(str, Enum):
     ASK_CHILDREN = "ask_children"
     ASK_PURPOSE = "ask_purpose"
     ASK_LOCATION = "ask_location"
+    CATALOG_OVERVIEW = "catalog_overview"
     PROJECT_QA = "project_qa"
     MATCH_OPTIONS = "match_options"
     EXPLAIN_OPTION_DETAIL = "explain_option_detail"
@@ -63,6 +64,7 @@ TEMPLATE_ACTIONS = {
     ResponseAction.ASK_PURPOSE,
     ResponseAction.ASK_LOCATION,
     ResponseAction.CHECK_INTEREST,
+    ResponseAction.HANDLE_OBJECTION,
     ResponseAction.SOFT_CLOSE,
     ResponseAction.FOLLOWUP_CLOSEOUT,
     ResponseAction.REDIRECT_OUT_OF_SCOPE,

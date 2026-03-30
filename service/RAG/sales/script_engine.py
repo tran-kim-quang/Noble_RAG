@@ -55,6 +55,15 @@ def resolve_script_step_and_action(state: Dict[str, Any]) -> Tuple[str, str]:
         return ScriptStep.S1_OPENING.value, ResponseAction.ASK_OPENING.value
 
     if next_state == "need_discovery":
+        lead = state.get("lead_profile") or {}
+        if (
+            (state.get("turn_role") or "") == "ask_catalog_overview"
+            and not any(
+                lead.get(key)
+                for key in ("family_member_count", "children_count", "purpose", "location_preference")
+            )
+        ):
+            return ScriptStep.S1_OPENING.value, ResponseAction.CATALOG_OVERVIEW.value
         for slot_name, step, action in _DISCOVERY_SLOT_ORDER:
             if slot_name in missing_slots:
                 return step.value, action.value

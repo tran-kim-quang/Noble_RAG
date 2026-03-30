@@ -15,15 +15,15 @@ class Settings(BaseSettings):
     )
 
     # LLM
-    llm_provider: str = "openai"
-    llm_model: str = "gpt-4o-mini"
+    llm_provider: str = "deepseek"
+    llm_model: str = "deepseek-chat"
     llm_api_key: str = ""
-    llm_api_url: str = ""
+    llm_api_url: str = "https://api.deepseek.com/v1"
 
     # Embedding
     embedding_provider: str = ""
-    embedding_model: str = "text-embedding-3-large"
-    embedding_dim: int = 3072
+    embedding_model: str = "embeddinggemma:300m"
+    embedding_dim: int = 768
 
     # Storage URLs — assembled from individual vars below if empty
     postgres_url: str = ""

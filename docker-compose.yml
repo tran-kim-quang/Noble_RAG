@@ -141,14 +141,15 @@ services:
     ports:
       - "${RAG_SERVICE_PORT:-8000}:8000"
     environment:
-      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
-      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+      - LLM_PROVIDER=${LLM_PROVIDER:-deepseek}
+      - LLM_MODEL=${LLM_MODEL:-deepseek-chat}
       - LLM_API_KEY=${LLM_API_KEY:-}
-      - LLM_API_URL=${LLM_API_URL:-}
-      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-openai}
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-large}
-      - EMBEDDING_DIM=${EMBEDDING_DIM:-3072}
+      - LLM_API_URL=${LLM_API_URL:-https://api.deepseek.com/v1}
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-ollama}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-embeddinggemma:300m}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-768}
       - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
+      - FAST_INTENT_MODEL=${FAST_INTENT_MODEL:-qwen2.5:7b-instruct}
       - POSTGRES_URL=postgresql://${POSTGRES_USER:-rag_user}:${POSTGRES_PASSWORD:-rag_password}@postgres:5432/${POSTGRES_DB:-noble_rag}
       - QDRANT_URL=http://qdrant:6333
       - REDIS_URL=redis://redis:6379/0

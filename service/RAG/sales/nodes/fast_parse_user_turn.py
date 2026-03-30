@@ -1,12 +1,11 @@
-"""Fast rule-based parser for first-turn latency optimization."""
+"""Context-aware turn understanding with thin rules for latency-sensitive cases."""
 
 import json
 import logging
-import os
 import re
 from typing import Any, Dict, Optional
 
-from lightrag.llm.ollama import ollama_model_complete
+from core.dependencies import llm_model_func
 from sales.graph_state import SalesAgentState
 from utils.json_extract import extract_first_json_object
 
@@ -19,9 +18,6 @@ _LOCATION_PATTERN = re.compile(
 )
 _FAMILY_PATTERN = re.compile(r"\b(\d{1,2})\s*(?:nguoi|người)\b", re.IGNORECASE)
 _CHILDREN_PATTERN = re.compile(r"\b(\d{1,2})\s*(?:con|be|bé)\b", re.IGNORECASE)
-_FAST_INTENT_MODEL = os.getenv("FAST_INTENT_MODEL", "ollama2.5:7b")
-_FAST_INTENT_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-
 _SHORT_SLOT_MAX_WORDS = 8
 _INTENT_CLASSES = {
     "greeting",
@@ -34,6 +30,58 @@ _INTENT_CLASSES = {
     "out_of_scope",
     "other",
 }
+_TURN_ROLES = {
+    "answer_previous_question",
+    "ask_catalog_overview",
+    "ask_project_info",
+    "ask_comparison",
+    "raise_objection",
+    "show_buy_signal",
+    "ask_recommendation",
+    "continue_previous_topic",
+    "greeting",
+    "other",
+}
+_RETRIEVAL_GOALS = {
+    "none",
+    "shortlist",
+    "project_qa",
+    "comparison",
+    "objection_support",
+    "closing_next_step",
+}
+_SLOT_FIELDS = {
+    "family_member_count",
+    "children_count",
+    "purpose",
+    "property_type",
+    "budget_text",
+    "budget_min",
+    "budget_max",
+    "location_preference",
+    "timeline",
+    "financing_need",
+    "key_concerns",
+    "contact_phone",
+}
+_INVALID_LOCATION_TOKENS = (
+    "dự án",
+    "du an",
+    "noble",
+    "pháp lý",
+    "phap ly",
+    "so sánh",
+    "so sanh",
+    "giá",
+    "gia",
+    "tiện ích",
+    "tien ich",
+    "chính sách",
+    "chinh sach",
+    "nào",
+    "nao",
+    "?",
+)
 
 
 def _normalize_text(text: str) -> str:
@@ -42,7 +90,70 @@ def _normalize_text(text: str) -> str:
 
 def _extract_project_name(text: str) -> Optional[str]:
     match = _PROJECT_NAME_PATTERN.search(text or "")
-    return match.group(1).strip() if match else None
+    if not match:
+        return None
+    candidate = _normalize_text(match.group(1))
+    if re.search(r"\b(nao|nào|gi|gì|the nao|thế nào|co nhung|có những|hien co|hiện có)\b", candidate, re.IGNORECASE):
+        return None
+    return candidate
+
+
+def _normalize_slot_value(key: str, value: Any) -> Any:
+    if value in (None, "", []):
+        return None
+    if key in {"family_member_count", "children_count"}:
+        try:
+            return int(value)
+        except Exception:
+            return None
+    if key in {"budget_min", "budget_max"}:
+        try:
+            return float(value)
+        except Exception:
+            return None
+    if key == "location_preference":
+        if isinstance(value, str):
+            value = [value]
+        if isinstance(value, list):
+            clean_items = []
+            seen = set()
+            for item in value:
+                text = _normalize_text(str(item))
+                if not text:
+                    continue
+                lower = text.lower()
+                if lower in seen:
+                    continue
+                seen.add(lower)
+                clean_items.append(text)
+            return clean_items or None
+        return None
+    if key == "key_concerns":
+        if isinstance(value, str):
+            value = [value]
+        if isinstance(value, list):
+            clean_items = [_normalize_text(str(item)) for item in value if _normalize_text(str(item))]
+            return clean_items or None
+        return None
+    if key == "financing_need":
+        if isinstance(value, bool):
+            return value
+        if str(value).strip().lower() in {"true", "1", "yes"}:
+            return True
+        if str(value).strip().lower() in {"false", "0", "no"}:
+            return False
+        return None
+    return _normalize_text(str(value))
+
+
+def _sanitize_slot_updates(payload: Dict[str, Any]) -> Dict[str, Any]:
+    slots: Dict[str, Any] = {}
+    for key in _SLOT_FIELDS:
+        normalized = _normalize_slot_value(key, payload.get(key))
+        if normalized in (None, "", []):
+            continue
+        slots[key] = normalized
+    return slots
 
 
 def _parse_family_slots(text_lower: str) -> Dict[str, Any]:
@@ -87,6 +198,11 @@ def _parse_location_slot(text: str) -> Dict[str, Any]:
         clean = re.sub(r"\s+", " ", raw).strip(" .,!?:;")
         if len(clean) < 2:
             continue
+        lower = clean.lower()
+        if any(token in lower for token in _INVALID_LOCATION_TOKENS):
+            continue
+        if len(clean.split()) > 4:
+            continue
         matches.append(clean)
 
     deduped = []
@@ -102,32 +218,146 @@ def _parse_location_slot(text: str) -> Dict[str, Any]:
     return {}
 
 
-async def _detect_intent_with_ollama(
-    text: str,
-    current_state: str,
-    chat_history: list[Dict[str, Any]],
-) -> Dict[str, Any]:
-    history_str = "\n".join(
+def _parse_contextual_slot_reply(text: str, state: SalesAgentState) -> Dict[str, Any]:
+    normalized = _normalize_text(text)
+    text_lower = normalized.lower()
+    words = [token for token in re.split(r"\s+", normalized) if token]
+    if not words:
+        return {}
+
+    current_state = state.get("current_sales_state") or "greeting"
+    current_step = state.get("current_script_step") or ""
+    missing_slots = set(state.get("missing_slots") or [])
+
+    if current_state != "need_discovery":
+        return {}
+    if "?" in normalized:
+        return {}
+
+    if "location_preference" in missing_slots and current_step.endswith("ask_location"):
+        if not _extract_project_name(normalized) and len(words) <= 4:
+            return {"location_preference": [normalized]}
+
+    if "family_member_count" in missing_slots and current_step.endswith("ask_family_size"):
+        if re.fullmatch(r"\d{1,2}", text_lower):
+            return {"family_member_count": int(text_lower)}
+
+    if "children_count" in missing_slots and current_step.endswith("ask_children"):
+        if re.fullmatch(r"\d{1,2}", text_lower):
+            return {"children_count": int(text_lower)}
+        if text_lower in {"khong", "không", "chua co", "chưa có", "khong co", "0"}:
+            return {"children_count": 0}
+
+    return {}
+
+
+def _infer_turn_from_slots(state: SalesAgentState, slots: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not slots:
+        return None
+
+    current_state = state.get("current_sales_state") or "greeting"
+    if current_state == "greeting":
+        return {
+            "turn_role": "answer_previous_question",
+            "intent": "other",
+            "confidence": 0.55,
+            "should_retrieve": False,
+            "retrieval_goal": "none",
+            "buy_signal": False,
+            "objection_type": None,
+        }
+    if current_state == "need_discovery":
+        missing_slots = set(state.get("missing_slots") or [])
+        should_retrieve = bool(missing_slots) and set(slots).issuperset(missing_slots)
+        return {
+            "turn_role": "answer_previous_question",
+            "intent": "follow_up",
+            "confidence": 0.6,
+            "should_retrieve": should_retrieve,
+            "retrieval_goal": "shortlist" if should_retrieve else "none",
+            "buy_signal": False,
+            "objection_type": None,
+        }
+    return {
+        "turn_role": "continue_previous_topic",
+        "intent": "other",
+        "confidence": 0.5,
+        "should_retrieve": False,
+        "retrieval_goal": "none",
+        "buy_signal": False,
+        "objection_type": None,
+    }
+
+
+def _recent_history_text(chat_history: list[Dict[str, Any]]) -> str:
+    return "\n".join(
         f"{(item.get('role') or 'unknown')}: {(item.get('content') or '').strip()}"
-        for item in chat_history[-3:]
+        for item in chat_history[-6:]
         if isinstance(item, dict)
     ) or "(chưa có)"
 
-    prompt = f"""Bạn là bộ phân loại intent hội thoại sales bất động sản.
+
+async def _understand_turn_with_llm(
+    text: str,
+    state: SalesAgentState,
+) -> Dict[str, Any]:
+    chat_history = state.get("chat_history") or []
+    history_str = _recent_history_text(chat_history)
+    current_state = state.get("current_sales_state") or "greeting"
+    current_step = state.get("current_script_step") or "S1_opening"
+    missing_slots = ", ".join(state.get("missing_slots") or []) or "không có"
+    last_assistant_message = ""
+    for item in reversed(chat_history):
+        if isinstance(item, dict) and str(item.get("role") or "") == "assistant":
+            last_assistant_message = (item.get("content") or "").strip()
+            break
+
+    prompt = f"""Bạn là bộ hiểu hội thoại sales bất động sản theo ngữ cảnh lịch sử chat.
+Nhiệm vụ:
+1. Hiểu tin nhắn hiện tại là đang trả lời câu hỏi trước đó hay mở ý mới.
+2. Điền slot nếu khách đang trả lời câu hỏi discovery.
+3. Chỉ yêu cầu truy xuất tri thức dự án khi thật sự cần.
+
 Chỉ trả về JSON hợp lệ duy nhất theo schema:
 {{
+  "turn_role": "answer_previous_question" | "ask_catalog_overview" | "ask_project_info" | "ask_comparison" | "raise_objection" | "show_buy_signal" | "ask_recommendation" | "continue_previous_topic" | "greeting" | "other",
   "intent": "greeting" | "ask_recommendation" | "project_info" | "comparison" | "objection" | "buy_signal" | "follow_up" | "out_of_scope" | "other",
   "confidence": 0.0,
+  "should_retrieve": false,
+  "retrieval_goal": "none" | "shortlist" | "project_qa" | "comparison" | "objection_support" | "closing_next_step",
   "buy_signal": false,
-  "objection_type": null
+  "objection_type": null,
+  "resolved_project_name": null,
+  "slot_updates": {{
+    "family_member_count": null,
+    "children_count": null,
+    "purpose": null,
+    "property_type": null,
+    "budget_text": null,
+    "budget_min": null,
+    "budget_max": null,
+    "location_preference": [],
+    "timeline": null,
+    "financing_need": null,
+    "key_concerns": [],
+    "contact_phone": null
+  }}
 }}
 
 Quy tắc:
-- Không giải thích.
-- Nếu không chắc, dùng intent="other" và confidence thấp.
+- Nếu khách chỉ đang trả lời câu hỏi discovery ngay trước đó, ưu tiên turn_role="answer_previous_question", intent="other" và điền slot_updates.
+- Nếu bot vừa hỏi khu vực và khách trả lời kiểu ngắn như "Long Bien", "Tay Ho", coi đó là location_preference.
+- Câu như "có những dự án Noble nào", "hiện có dự án nào" là turn_role="ask_catalog_overview", intent="ask_recommendation", should_retrieve=true và retrieval_goal="shortlist".
+- Câu như "gợi ý dự án phù hợp", "tư vấn dự án phù hợp" là ask_recommendation, không phải ask_catalog_overview.
+- Chỉ dùng project_info khi khách hỏi thông tin trực tiếp về một dự án/sản phẩm/chính sách cụ thể.
+- Nếu tên dự án không rõ hoặc chỉ là cụm hỏi chung như "noble nào", để resolved_project_name=null.
 - objection_type chỉ nhận: "gia_cao" | "phap_ly" | "vi_tri" | "chua_du_tien" | "suy_nghi_them" | "khac" | null
+- Nếu không chắc, giữ should_retrieve=false và confidence thấp.
 
 Current sales state: {current_state}
+Current script step: {current_step}
+Missing slots: {missing_slots}
+Last assistant message: {last_assistant_message or "(không có)"}
 Lịch sử gần đây:
 {history_str}
 
@@ -135,24 +365,32 @@ Tin nhắn khách:
 \"\"\"{text}\"\"\""""
 
     try:
-        raw = await ollama_model_complete(
+        raw = await llm_model_func(
             prompt,
-            model=_FAST_INTENT_MODEL,
-            host=_FAST_INTENT_HOST,
-            options={"temperature": 0, "num_predict": 180},
+            enable_cot=False,
+            response_format={"type": "json_object"},
         )
         payload = extract_first_json_object(str(raw))
         if not payload:
-            raise ValueError("No JSON in Ollama intent response")
+            raise ValueError("No JSON in contextual understanding response")
         data = json.loads(payload)
     except Exception as e:
-        log.warning("fast_parse intent classify failed: %s", e)
+        log.warning("fast_parse contextual understanding failed: %s", e)
         return {
+            "turn_role": "other",
             "intent": "other",
             "confidence": 0.2,
+            "should_retrieve": False,
+            "retrieval_goal": "none",
             "buy_signal": False,
             "objection_type": None,
+            "resolved_project_name": None,
+            "slot_updates": {},
         }
+
+    turn_role = str(data.get("turn_role") or "other")
+    if turn_role not in _TURN_ROLES:
+        turn_role = "other"
 
     intent = str(data.get("intent") or "other")
     if intent not in _INTENT_CLASSES:
@@ -164,15 +402,29 @@ Tin nhắn khách:
         confidence = 0.4
     confidence = min(1.0, max(0.0, confidence))
 
+    retrieval_goal = str(data.get("retrieval_goal") or "none")
+    if retrieval_goal not in _RETRIEVAL_GOALS:
+        retrieval_goal = "none"
+
     objection_type = data.get("objection_type")
     if objection_type not in {"gia_cao", "phap_ly", "vi_tri", "chua_du_tien", "suy_nghi_them", "khac", None}:
         objection_type = None
 
+    resolved_project_name = _normalize_text(str(data.get("resolved_project_name") or "")) or None
+    if resolved_project_name and re.search(r"\b(nao|nào|gi|gì|the nao|thế nào|co nhung|có những)\b", resolved_project_name, re.IGNORECASE):
+        resolved_project_name = None
+
+    slots = _sanitize_slot_updates(data.get("slot_updates") or {})
     return {
+        "turn_role": turn_role,
         "intent": intent,
         "confidence": confidence,
+        "should_retrieve": bool(data.get("should_retrieve", retrieval_goal != "none")),
+        "retrieval_goal": retrieval_goal,
         "buy_signal": bool(data.get("buy_signal", intent == "buy_signal")),
         "objection_type": objection_type,
+        "resolved_project_name": resolved_project_name,
+        "slot_updates": slots,
     }
 
 
@@ -224,25 +476,66 @@ def _route_lane(state: SalesAgentState, intent: str, slots: Dict[str, Any], conf
 
 async def fast_parse_user_turn(state: SalesAgentState) -> Dict[str, Any]:
     text = _normalize_text(state.get("user_text") or "")
-    text_lower = text.lower()
 
     slots: Dict[str, Any] = {}
-    slots.update(_parse_family_slots(text_lower))
-    slots.update(_parse_purpose_slot(text_lower))
+    slots.update(_parse_family_slots(text.lower()))
+    slots.update(_parse_purpose_slot(text.lower()))
     slots.update(_parse_location_slot(text))
+    slots.update(_parse_contextual_slot_reply(text, state))
 
     project_name = _extract_project_name(text)
-    intent_result = await _detect_intent_with_ollama(
-        text=text,
-        current_state=state.get("current_sales_state") or "greeting",
-        chat_history=state.get("chat_history") or [],
-    )
+    fallback = _infer_turn_from_slots(state, slots) or {
+        "turn_role": "other",
+        "intent": "other",
+        "confidence": 0.2,
+        "should_retrieve": False,
+        "retrieval_goal": "none",
+        "buy_signal": False,
+        "objection_type": None,
+        "resolved_project_name": project_name,
+        "slot_updates": slots,
+    }
+    contextual = await _understand_turn_with_llm(text=text, state=state)
+    slots.update(contextual.get("slot_updates") or {})
+
+    intent_result = {
+        "intent": contextual.get("intent") or fallback["intent"],
+        "confidence": contextual.get("confidence", fallback["confidence"]),
+        "buy_signal": contextual.get("buy_signal", fallback["buy_signal"]),
+        "objection_type": contextual.get("objection_type", fallback["objection_type"]),
+    }
+    if intent_result["intent"] not in _INTENT_CLASSES:
+        intent_result = {
+            "intent": fallback["intent"],
+            "confidence": fallback["confidence"],
+            "buy_signal": fallback["buy_signal"],
+            "objection_type": fallback["objection_type"],
+        }
+
     intent = intent_result["intent"]
+    turn_role = contextual.get("turn_role") or fallback["turn_role"]
+    if turn_role == "answer_previous_question" and slots:
+        intent = "other"
+    if turn_role == "ask_catalog_overview":
+        intent = "ask_recommendation"
+    retrieval_goal = contextual.get("retrieval_goal") or fallback["retrieval_goal"]
+    should_retrieve = bool(contextual.get("should_retrieve", fallback["should_retrieve"]))
+    if retrieval_goal == "shortlist" and intent in {"other", "follow_up"}:
+        intent = "ask_recommendation"
+    if retrieval_goal == "project_qa" and intent == "other":
+        intent = "project_info"
+    if retrieval_goal == "comparison" and intent == "other":
+        intent = "comparison"
+    if retrieval_goal == "objection_support" and intent == "other":
+        intent = "objection"
+    if retrieval_goal == "closing_next_step" and intent == "other":
+        intent = "buy_signal"
+
     confidence = _estimate_confidence(
         text=text,
         intent=intent,
         slots=slots,
-        project_name=project_name,
+        project_name=contextual.get("resolved_project_name") or fallback.get("resolved_project_name") or project_name,
         llm_confidence=float(intent_result.get("confidence") or 0.0),
     )
     lane = _route_lane(state, intent, slots, confidence)
@@ -264,9 +557,12 @@ async def fast_parse_user_turn(state: SalesAgentState) -> Dict[str, Any]:
         "user_text": text,
         "detected_intent": intent,
         "extracted_slots": slots,
-        "resolved_project_name": project_name,
+        "resolved_project_name": contextual.get("resolved_project_name") or fallback.get("resolved_project_name") or project_name,
         "objection_type": objection_type,
         "buy_signal": buy_signal,
+        "turn_role": turn_role,
+        "should_retrieve": should_retrieve,
+        "retrieval_goal": retrieval_goal,
         "fast_path_confidence": confidence,
         "fast_lane": lane,
         "retrieval_mode": retrieval_mode,
