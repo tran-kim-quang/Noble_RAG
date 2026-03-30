@@ -1,5 +1,6 @@
 """Sales agent API endpoints."""
 
+import asyncio
 import json
 import logging
 import random
@@ -35,6 +36,11 @@ _THINKING_ACK_MESSAGES = [
     "Em đang tiếp nhận nội dung của Anh/Chị, em rà nhanh dữ liệu rồi trả lời ngay ạ.",
     "Em đã ghi nhận câu hỏi, Anh/Chị đợi em một lát để em đối chiếu thông tin cho chính xác nhé.",
     "Em nhận được rồi ạ, em đang xử lý nhanh để gửi lại câu trả lời ngắn gọn cho Anh/Chị.",
+]
+_DEEP_THINKING_MESSAGES = [
+    "Em đang rà sâu hơn trong kho dữ liệu để chốt phương án sát nhu cầu của Anh/Chị.",
+    "Em đang đối chiếu thêm các dữ kiện dự án để tránh tư vấn thiếu hoặc lệch thông tin cho mình ạ.",
+    "Em đang kiểm tra kỹ hơn giữa các phương án để ưu tiên đúng dự án hợp với nhu cầu hiện tại của Anh/Chị.",
 ]
 
 
@@ -97,7 +103,23 @@ async def sales_chat_stream(request: SalesChatRequest):
         ) + "\n"
 
         try:
-            result = await sales_graph.ainvoke(initial_state)
+            task = asyncio.create_task(sales_graph.ainvoke(initial_state))
+            deep_idx = 0
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=2.0)
+                if task in done:
+                    result = task.result()
+                    break
+                yield json.dumps(
+                    {
+                        "chunk": _DEEP_THINKING_MESSAGES[deep_idx % len(_DEEP_THINKING_MESSAGES)],
+                        "done": False,
+                        "phase": "thinking_deeper",
+                        "session_id": request.session_id,
+                    },
+                    ensure_ascii=False,
+                ) + "\n"
+                deep_idx += 1
         except Exception as e:
             log.error("sales_graph.ainvoke(stream) error: %s", e)
             fallback = "Xin lỗi, em gặp lỗi khi xử lý yêu cầu. Anh/Chị thử lại giúp em nhé."
@@ -130,6 +152,7 @@ async def sales_chat_stream(request: SalesChatRequest):
                 },
                 ensure_ascii=False,
             ) + "\n"
+            await asyncio.sleep(0)
 
         yield json.dumps(
             {

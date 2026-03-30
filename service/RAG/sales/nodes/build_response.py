@@ -20,6 +20,10 @@ _DISCOVERY_STATES = {"greeting", "need_discovery"}
 
 
 def _has_retrieved_context(state: SalesAgentState) -> bool:
+    if state.get("project_facts"):
+        return True
+    if state.get("catalog_projects"):
+        return True
     context = state.get("retrieved_context") or []
     return any(
         (item.get("content") or item.get("text") or "").strip()
@@ -277,15 +281,18 @@ def _catalog_overview_response(state: SalesAgentState) -> str:
         )
 
     top_projects = projects[:3]
-    lines = ["Dạ, hiện trong kho thông tin Noble em đang thấy các dự án sau ạ:"]
+    lines = ["Dạ, hiện tại em đang thấy một vài hướng dự án nổi bật của Noble để Anh/Chị tham khảo nhanh ạ:"]
     for idx, item in enumerate(top_projects, start=1):
         name = str(item.get("project_name") or f"Dự án {idx}").strip()
         summary = normalize_whitespace(str(item.get("summary") or "").strip())
+        summary = re.sub(r"^[*\-•#\s]+", "", summary).rstrip(".")
         if summary:
             lines.append(f"{idx}. {name}: {summary}.")
         else:
             lines.append(f"{idx}. {name}.")
-    lines.append("Nếu Anh/Chị muốn, em có thể đi sâu tiếp dự án phù hợp nhất với nhu cầu ở hoặc đầu tư của mình ạ.")
+    lines.append(
+        "Nếu Anh/Chị đang nghiêng về nhu cầu ở thực hay đầu tư, em sẽ lọc ngay giúp mình phương án đáng xem nhất thay vì phải tự so từng dự án ạ."
+    )
     return "\n".join(lines)
 
 
@@ -314,6 +321,51 @@ def _default_sales_follow_up(lead: Dict[str, Any]) -> str:
     if lead.get("location_preference"):
         return "Nếu mình đi tiếp, Anh/Chị muốn em bóc tách sâu hơn về điểm mạnh sống thực của dự án này hay loại căn phù hợp nhất với nhu cầu của gia đình mình ạ?"
     return "Nếu mình đi tiếp, Anh/Chị muốn em đi sâu trước về điểm mạnh nổi bật nhất của dự án hay loại căn phù hợp nhất với nhu cầu của mình ạ?"
+
+
+def _pre_score_project_candidate(lead: Dict[str, Any], item: Dict[str, Any]) -> Dict[str, Any]:
+    score = 0
+    matched_needs: List[str] = []
+    location_pref = [str(x).strip().lower() for x in lead.get("location_preference") or [] if str(x).strip()]
+    haystack = " ".join(
+        [
+            str(item.get("project_name") or ""),
+            str(item.get("location") or ""),
+            str(item.get("product_type") or ""),
+            str(item.get("source_summary") or ""),
+            " ".join(str(x) for x in item.get("key_strengths") or []),
+            " ".join(str(x) for x in item.get("family_fit") or []),
+            " ".join(str(x) for x in item.get("child_friendly_features") or []),
+        ]
+    ).lower()
+
+    if location_pref and any(pref in haystack for pref in location_pref):
+        score += 40
+        matched_needs.append("khớp khu vực ưu tiên")
+
+    purpose = str(lead.get("purpose") or "").lower()
+    if purpose in {"mua_o", "de_o", "ở", "owner_occupancy", "mua để ở"}:
+        if any(token in haystack for token in ("căn hộ", "can ho", "apartment", "ở thực", "ở lâu dài")):
+            score += 20
+            matched_needs.append("phù hợp nhu cầu ở thực")
+
+    children_count = int(lead.get("children_count") or 0)
+    if children_count > 0 and item.get("child_friendly_features"):
+        score += 20
+        matched_needs.append("có tiện ích liên quan trẻ nhỏ")
+
+    family_size = int(lead.get("family_member_count") or 0)
+    if family_size >= 3 and item.get("family_fit"):
+        score += 10
+        matched_needs.append("có dấu hiệu phù hợp hộ gia đình")
+
+    if item.get("key_strengths"):
+        score += 5
+
+    clone = dict(item)
+    clone["pre_score"] = score
+    clone["matched_needs"] = matched_needs
+    return clone
 
 
 def _adaptive_recommendation_count(scored_items: List[Dict[str, Any]]) -> int:
@@ -371,7 +423,7 @@ def _render_ranked_product_matching(
 
     top_benefits = top_choice.get("benefits_for_customer") or []
     if top_benefits:
-        lines.append("Nếu nhìn theo đúng nhu cầu của mình, lợi ích rõ nhất là:")
+        lines.append("Nếu đặt vào đúng nhu cầu hiện tại của gia đình mình, lợi ích rõ nhất là:")
         for item in top_benefits[:2]:
             lines.append(f"- {item}")
 
@@ -392,7 +444,9 @@ async def _product_matching_response_with_reasoning(state: SalesAgentState) -> s
     lead = state.get("lead_profile") or {}
     project_facts = [item for item in state.get("project_facts") or [] if isinstance(item, dict)]
     candidate_blocks = []
-    for item in project_facts[:5]:
+    prescored_facts = [_pre_score_project_candidate(lead, item) for item in project_facts[:5]]
+    prescored_facts.sort(key=lambda item: int(item.get("pre_score") or 0), reverse=True)
+    for item in prescored_facts[:3]:
         strengths = [
             normalize_whitespace(str(x)).strip().rstrip(".")
             for x in item.get("key_strengths") or []
@@ -411,6 +465,8 @@ async def _product_matching_response_with_reasoning(state: SalesAgentState) -> s
                 "key_strengths": strengths,
                 "cautions": item.get("cautions") or [],
                 "source_summary": item.get("source_summary"),
+                "pre_score": item.get("pre_score") or 0,
+                "matched_needs": item.get("matched_needs") or [],
             }
         )
 
@@ -437,7 +493,7 @@ async def _product_matching_response_with_reasoning(state: SalesAgentState) -> s
             return render_match_options_from_candidates(state, state.get("retrieved_candidates") or [])
 
     reasoning_prompt = f"""Bạn là chuyên gia sales bất động sản của Noble.
-Nhiệm vụ: dựa trên hồ sơ khách và dữ kiện dự án đã retrieve, xếp hạng các phương án phù hợp rồi diễn giải bằng lợi ích gắn trực tiếp với nhu cầu khách.
+Nhiệm vụ: dựa trên hồ sơ khách và dữ kiện dự án đã retrieve, chốt rất nhanh phương án phù hợp nhất rồi diễn giải bằng lợi ích gắn trực tiếp với nhu cầu khách.
 
 Chỉ trả về JSON hợp lệ duy nhất theo schema:
 {{
@@ -460,9 +516,14 @@ Quy tắc:
 - Xếp hạng tất cả phương án có liên quan, nhưng chỉ trả tối đa 5 recommendations.
 - Nếu chỉ có 1 dự án thực sự phù hợp thì chỉ trả 1 recommendation, không tạo 2 phương án giả.
 - strengths phải là điểm mạnh riêng của dự án.
-- benefits_for_customer phải gắn trực tiếp với hồ sơ khách, không viết chung chung.
+- benefits_for_customer phải gắn trực tiếp với hồ sơ khách theo logic: nhu cầu hoặc ưu tiên nào của khách -> điểm mạnh nào của dự án -> lợi ích thực tế khách nhận được.
+- Không được chỉ liệt kê facts đẹp của dự án rồi đổi cách diễn đạt.
+- Nếu hồ sơ khách không nhắc tới con nhỏ, người lớn tuổi, đầu tư hoặc ngân sách thì không được tự gượng ép lợi ích theo các chiều đó.
+- fit_summary và why_top_choice phải cho thấy vì sao phương án đứng đầu hợp hơn các phương án còn lại trong đúng bối cảnh khách hiện tại.
 - tradeoff chỉ nêu điểm cần lưu ý thật sự, không viết cho có.
 - next_question phải giúp tiến gần chốt hơn, ví dụ đi sâu về loại căn, ngân sách, ưu tiên ở thực, nhu cầu cho con nhỏ.
+- Ưu tiên bám vào pre_score và matched_needs đã cho để kết luận nhanh, không suy diễn vòng vo lại từ đầu.
+- Viết ngắn, quyết đoán, không dùng văn brochure.
 - Giữ giọng sales tự nhiên, nhưng output vẫn phải là JSON.
 
 Hồ sơ khách:
@@ -477,6 +538,7 @@ Dữ kiện dự án đã retrieve:
             reasoning_prompt,
             enable_cot=False,
             response_format={"type": "json_object"},
+            max_tokens=700,
         )
         payload = extract_first_json_object(str(raw))
         if not payload:

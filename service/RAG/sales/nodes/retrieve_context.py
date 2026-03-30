@@ -16,6 +16,8 @@ from utils.text import split_into_sentences
 
 log = logging.getLogger("rag-service")
 settings = get_settings()
+_CATALOG_PROJECTS_CACHE: List[Dict[str, str]] | None = None
+_PROJECT_FACTS_CACHE: List[Dict[str, Any]] | None = None
 
 _STATE_QUERY_TEMPLATES: Dict[str, str] = {
     "need_discovery": (
@@ -249,6 +251,10 @@ def _extract_catalog_projects(rows: List[Dict[str, Any]]) -> List[Dict[str, str]
 
 
 async def _load_catalog_projects() -> List[Dict[str, str]]:
+    global _CATALOG_PROJECTS_CACHE
+    if _CATALOG_PROJECTS_CACHE is not None:
+        return list(_CATALOG_PROJECTS_CACHE)
+
     conn = await asyncpg.connect(settings.postgres_url)
     try:
         rows = await conn.fetch(
@@ -264,7 +270,8 @@ async def _load_catalog_projects() -> List[Dict[str, str]]:
         )
     finally:
         await conn.close()
-    return _extract_catalog_projects([dict(row) for row in rows])
+    _CATALOG_PROJECTS_CACHE = _extract_catalog_projects([dict(row) for row in rows])
+    return list(_CATALOG_PROJECTS_CACHE)
 
 
 async def _extract_project_fact_from_doc(doc_text: str, project_name: str) -> Dict[str, Any]:
@@ -320,6 +327,10 @@ Tài liệu:
 
 
 async def _load_project_facts() -> List[Dict[str, Any]]:
+    global _PROJECT_FACTS_CACHE
+    if _PROJECT_FACTS_CACHE is not None:
+        return list(_PROJECT_FACTS_CACHE)
+
     conn = await asyncpg.connect(settings.postgres_url)
     try:
         rows = await conn.fetch(
@@ -361,7 +372,47 @@ async def _load_project_facts() -> List[Dict[str, Any]]:
         item["doc_id"] = full_doc_id
         item["source"] = str(payload.get("file_path") or "")
         facts.append(item)
-    return facts[:5]
+    _PROJECT_FACTS_CACHE = facts[:5]
+    return list(_PROJECT_FACTS_CACHE)
+
+
+def _project_fact_to_candidate(item: Dict[str, Any]) -> Dict[str, Any]:
+    summary = str(item.get("source_summary") or "").strip()
+    strengths = [str(x).strip() for x in item.get("key_strengths") or [] if str(x).strip()]
+    return {
+        "project_name": str(item.get("project_name") or "").strip(),
+        "fit_reasons": strengths[:2],
+        "risk_notes": [str(x).strip() for x in item.get("cautions") or [] if str(x).strip()][:1],
+        "content": summary,
+    }
+
+
+def _filter_project_facts_for_lead(project_facts: List[Dict[str, Any]], lead: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not project_facts:
+        return []
+
+    preferred_locations = [str(item).strip().lower() for item in lead.get("location_preference") or [] if str(item).strip()]
+    if not preferred_locations:
+        return project_facts[:3]
+
+    exact: List[Dict[str, Any]] = []
+    fallback: List[Dict[str, Any]] = []
+    for item in project_facts:
+        haystack = " ".join(
+            [
+                str(item.get("project_name") or ""),
+                str(item.get("location") or ""),
+                str(item.get("source_summary") or ""),
+                " ".join(str(x) for x in item.get("key_strengths") or []),
+            ]
+        ).lower()
+        if any(location in haystack for location in preferred_locations):
+            exact.append(item)
+        else:
+            fallback.append(item)
+
+    ranked = exact + fallback
+    return ranked[:3]
 
 
 async def retrieve_context(state: SalesAgentState) -> Dict[str, Any]:
@@ -394,6 +445,27 @@ async def retrieve_context(state: SalesAgentState) -> Dict[str, Any]:
             }
         state = dict(state)
         state["resolved_project_name"] = resolved_project_name
+
+    if (state.get("next_sales_state") or "") == "product_matching":
+        project_facts = await _load_project_facts()
+        filtered_facts = _filter_project_facts_for_lead(project_facts, state.get("lead_profile") or {})
+        candidates = [_project_fact_to_candidate(item) for item in filtered_facts if item.get("project_name")]
+        context_items = [
+            {"content": str(item.get("source_summary") or "").strip(), "source": str(item.get("source") or "project_facts")}
+            for item in filtered_facts
+            if str(item.get("source_summary") or "").strip()
+        ]
+        if filtered_facts:
+            log.info("retrieve_context: mode=project_facts candidates=%d", len(filtered_facts))
+            return {
+                "retrieved_candidates": candidates,
+                "retrieved_context": context_items,
+                "project_facts": filtered_facts,
+                "has_retrieved_context": bool(context_items or filtered_facts),
+                "project_qa_blocked": False,
+                "resolved_project_name": state.get("resolved_project_name"),
+                "retrieval_mode": "project_facts",
+            }
 
     retrieval_mode = (state.get("retrieval_mode") or "full").lower()
     if retrieval_mode == "lite":
