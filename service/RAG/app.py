@@ -29,6 +29,7 @@ from api.routes_health import router as health_router
 from api.routes_documents import router as documents_router
 from api.routes_query import router as query_router
 from api.routes_sales import router as sales_router
+from sales.nodes.retrieve_context import warm_retrieval_caches
 
 setup_logging()
 log = get_logger("rag-service")
@@ -45,6 +46,8 @@ app = FastAPI(
 async def startup_event():
     await rag.initialize_storages()
     await ensure_sales_schema()
+    import asyncio
+    asyncio.create_task(warm_retrieval_caches())
     log.info("LightRAG storages initialised.")
 
 @app.on_event("shutdown")

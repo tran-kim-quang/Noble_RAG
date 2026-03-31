@@ -10,6 +10,7 @@ from typing import Any, Dict, List
 def resolve_next_state(state: Dict[str, Any]) -> str:
     intent: str = state.get("detected_intent") or ""
     missing: List[str] = state.get("missing_slots") or []
+    extracted_slots: Dict[str, Any] = state.get("extracted_slots") or {}
     buy_signal: bool = bool(state.get("buy_signal", False))
     lead_profile: Dict[str, Any] = state.get("lead_profile") or {}
     current_state: str = state.get("current_sales_state") or "greeting"
@@ -22,7 +23,7 @@ def resolve_next_state(state: Dict[str, Any]) -> str:
 
     # Keep the opening greeting only on the actual first user turn.
     if current_state == "greeting" and is_first_turn and not lead_profile.get("purpose"):
-        if intent in ("greeting", "", "other") or not intent:
+        if not extracted_slots and (intent in ("greeting", "", "other") or not intent):
             return "greeting"
 
     # Intent-based transitions

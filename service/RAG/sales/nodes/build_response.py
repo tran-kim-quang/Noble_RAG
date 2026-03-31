@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import unicodedata
 from typing import Any, Dict, List
 
 from sales.graph_state import SalesAgentState
@@ -51,6 +52,7 @@ def _llm_generation_available() -> bool:
     return bool(
         (os.getenv("OPENAI_API_KEY") or "").strip()
         or (os.getenv("LLM_API_KEY") or "").strip()
+        or (os.getenv("LLM_GEMINI_API_KEY") or "").strip()
     )
 
 
@@ -68,14 +70,14 @@ def _sanitize_project_qa_text(text: str) -> str:
 
 
 def _same_project_name(left: str, right: str) -> bool:
-    left_norm = normalize_whitespace(left).lower()
-    right_norm = normalize_whitespace(right).lower()
+    left_norm = _project_key(left)
+    right_norm = _project_key(right)
     return bool(left_norm and right_norm and left_norm == right_norm)
 
 
 def _same_project_family(left: str, right: str) -> bool:
-    left_tokens = normalize_whitespace(left).lower().split()
-    right_tokens = normalize_whitespace(right).lower().split()
+    left_tokens = _project_key(left).split()
+    right_tokens = _project_key(right).split()
     if len(left_tokens) < 2 or len(right_tokens) < 2:
         return False
     return left_tokens[:2] == right_tokens[:2]
@@ -94,6 +96,184 @@ def _clean_display_text(text: str) -> str:
     clean = normalize_whitespace(clean)
     clean = clean.strip(" .,!?:;-'\"")
     return clean
+
+
+def _project_key(text: str) -> str:
+    clean = _clean_display_text(text)
+    clean = unicodedata.normalize("NFD", clean)
+    clean = "".join(ch for ch in clean if unicodedata.category(ch) != "Mn")
+    clean = clean.lower()
+    clean = re.sub(r"[^a-z0-9\s]", " ", clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean
+
+
+def _candidate_names(state: SalesAgentState) -> List[str]:
+    names = [
+        _clean_display_text(str(candidate.get("project_name") or ""))
+        for candidate in state.get("retrieved_candidates") or []
+        if str(candidate.get("project_name") or "").strip()
+    ]
+    deduped: List[str] = []
+    seen = set()
+    for name in names:
+        key = _project_key(name)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(name)
+    return deduped
+
+
+def _match_project_fact(
+    project_facts: List[Dict[str, Any]],
+    requested_names: List[str],
+) -> List[Dict[str, Any]]:
+    if not project_facts:
+        return []
+    if not requested_names:
+        return [item for item in project_facts if str(item.get("project_name") or "").strip()]
+    matched: List[Dict[str, Any]] = []
+    seen = set()
+    for item in project_facts:
+        name = str(item.get("project_name") or "").strip()
+        if not name:
+            continue
+        if any(_same_project_name(name, req) or _same_project_family(name, req) for req in requested_names):
+            key = _project_key(name)
+            if key in seen:
+                continue
+            seen.add(key)
+            matched.append(item)
+    return matched
+
+
+def _facts_summary_lines(item: Dict[str, Any]) -> List[str]:
+    lines: List[str] = []
+    location = _clean_display_text(str(item.get("location") or ""))
+    product_type = _clean_display_text(str(item.get("product_type") or ""))
+    source_summary = normalize_whitespace(str(item.get("source_summary") or "").strip()).rstrip(".")
+    if source_summary:
+        lines.append(source_summary)
+    if location:
+        lines.append(f"Vị trí hiện em thấy trong dữ liệu là {location}.")
+    if product_type:
+        lines.append(f"Loại hình/sản phẩm chính đang thể hiện là {product_type}.")
+    strengths = [
+        normalize_whitespace(str(x)).strip().rstrip(".")
+        for x in item.get("key_strengths") or []
+        if str(x).strip()
+    ][:2]
+    if strengths:
+        lines.append("Điểm nổi bật em đang thấy là " + "; ".join(strengths) + ".")
+    cautions = [
+        normalize_whitespace(str(x)).strip().rstrip(".")
+        for x in item.get("cautions") or []
+        if str(x).strip()
+    ][:1]
+    if cautions:
+        lines.append("Phần dữ liệu còn thiếu hoặc cần giữ an toàn khi tư vấn là " + cautions[0] + ".")
+    return lines
+
+
+def _question_focus(user_text: str) -> str:
+    text = _project_key(user_text)
+    if any(term in text for term in ("phap ly", "so hong", "so do", "giay phep")):
+        return "legal"
+    if any(term in text for term in ("vi tri", "o dau", "ket noi", "khu vuc")):
+        return "location"
+    if any(term in text for term in ("tien ich", "tien ich", "noi khu", "truong hoc", "be boi", "gym", "spa")):
+        return "amenities"
+    if any(term in text for term in ("gia", "bao nhieu tien", "bang gia", "thanh toan", "uu dai")):
+        return "pricing"
+    if any(term in text for term in ("loai hinh", "san pham", "can ho", "shophouse", "dien tich")):
+        return "product"
+    return "generic"
+
+
+def _project_qa_from_fact(item: Dict[str, Any], user_text: str) -> str:
+    name = str(item.get("project_name") or "dự án này").strip()
+    location = _clean_display_text(str(item.get("location") or ""))
+    product_type = _clean_display_text(str(item.get("product_type") or ""))
+    strengths = [
+        normalize_whitespace(str(x)).strip().rstrip(".")
+        for x in item.get("key_strengths") or []
+        if str(x).strip()
+    ][:2]
+    cautions = [
+        normalize_whitespace(str(x)).strip().rstrip(".")
+        for x in item.get("cautions") or []
+        if str(x).strip()
+    ]
+    child_features = [
+        normalize_whitespace(str(x)).strip().rstrip(".")
+        for x in item.get("child_friendly_features") or []
+        if str(x).strip()
+    ][:2]
+    source_summary = normalize_whitespace(str(item.get("source_summary") or "").strip()).rstrip(".")
+    focus = _question_focus(user_text)
+
+    lines: List[str] = []
+
+    if focus == "legal":
+        lines.append(f"Với {name}, hiện em chưa thấy dữ liệu pháp lý cụ thể trong kho thông tin nội bộ nên em chưa dám khẳng định sâu về hồ sơ pháp lý để tránh tư vấn sai.")
+        if location or product_type:
+            detail_bits = []
+            if location:
+                detail_bits.append(f"vị trí em đang thấy là {location}")
+            if product_type:
+                detail_bits.append(f"loại hình chính là {product_type}")
+            lines.append("Phần em có thể xác nhận lúc này là " + ", ".join(detail_bits) + ".")
+        if strengths:
+            lines.append("Điểm nổi bật đang có trong dữ liệu là " + "; ".join(strengths) + ".")
+        return " ".join(lines)
+
+    if focus == "location":
+        lines.append(f"Với {name}, vị trí em đang thấy trong dữ liệu là {location or 'chưa rõ'}." )
+        if strengths:
+            lines.append("Điểm đáng chú ý về dự án là " + "; ".join(strengths) + ".")
+        return " ".join(lines)
+
+    if focus == "amenities":
+        amenity_bits = child_features + strengths
+        amenity_bits = [bit for idx, bit in enumerate(amenity_bits) if bit and bit not in amenity_bits[:idx]][:3]
+        if amenity_bits:
+            lines.append(f"Với {name}, các tiện ích/dữ kiện nổi bật em đang thấy là " + "; ".join(amenity_bits) + ".")
+        else:
+            lines.append(f"Với {name}, hiện em chưa có nhiều dữ liệu tiện ích chi tiết để khẳng định sâu hơn.")
+        return " ".join(lines)
+
+    if focus == "pricing":
+        lines.append(f"Với {name}, hiện em chưa thấy dữ liệu giá/chính sách thanh toán đủ rõ trong kho thông tin nội bộ nên em chưa dám báo cụ thể.")
+        if location or product_type:
+            detail_bits = []
+            if location:
+                detail_bits.append(f"ở {location}")
+            if product_type:
+                detail_bits.append(product_type)
+            lines.append(f"Hiện em mới xác nhận được dự án {', '.join(detail_bits)}.")
+        return " ".join(lines)
+
+    if focus == "product":
+        lines.append(f"Với {name}, loại hình/sản phẩm chính em đang thấy là {product_type or 'chưa rõ'}." )
+        if source_summary:
+            lines.append(source_summary + ".")
+        return " ".join(lines)
+
+    if source_summary:
+        lines.append(f"Với {name}, em đang thấy tổng quan ngắn là: {source_summary}.")
+    if location or product_type:
+        detail_bits = []
+        if location:
+            detail_bits.append(f"ở {location}")
+        if product_type:
+            detail_bits.append(product_type)
+        lines.append("Dữ kiện chính hiện có là " + ", ".join(detail_bits) + ".")
+    if strengths:
+        lines.append("Điểm nổi bật nhất đang thấy là " + "; ".join(strengths) + ".")
+    if cautions:
+        lines.append("Phần còn thiếu để tư vấn chắc hơn là " + cautions[0] + ".")
+    return " ".join(lines)
 
 
 async def _resolve_requested_projects_from_context(
@@ -151,27 +331,23 @@ Tin nhắn hiện tại:
 
 
 async def _project_qa_response_from_context(state: SalesAgentState) -> str:
-    candidate_names = [
-        _clean_display_text(str(candidate.get("project_name") or ""))
-        for candidate in state.get("retrieved_candidates") or []
-        if str(candidate.get("project_name") or "").strip()
-    ]
-    requested_projects = await _resolve_requested_projects_from_context(state, candidate_names, max_items=1)
-    requested = requested_projects[0] if requested_projects else (state.get("resolved_project_name") or "").strip()
+    candidate_names = _candidate_names(state)
+    project_facts = [item for item in state.get("project_facts") or [] if isinstance(item, dict)]
+    requested_projects: List[str] = []
+    if str(state.get("resolved_project_name") or "").strip():
+        requested_projects.append(_clean_display_text(str(state.get("resolved_project_name") or "").strip()))
+    if not requested_projects and candidate_names:
+        requested_projects.append(candidate_names[0])
+    if not requested_projects:
+        requested_projects = await _resolve_requested_projects_from_context(state, candidate_names, max_items=1)
+    requested = requested_projects[0] if requested_projects else ""
+
+    matched_facts = _match_project_fact(project_facts, requested_projects)
+    if matched_facts:
+        top_fact = matched_facts[0]
+        return _project_qa_from_fact(top_fact, str(state.get("user_text") or ""))
 
     if requested:
-        exact_matches = [name for name in candidate_names if _same_project_name(name, requested)]
-        if exact_matches:
-            context_items = state.get("retrieved_context") or []
-            raw_text = "\n".join(
-                str(item.get("content") or item.get("text") or "").strip()
-                for item in context_items
-                if isinstance(item, dict)
-            ).strip()
-            cleaned = _sanitize_project_qa_text(raw_text)
-            if cleaned:
-                return _enforce_short_form(cleaned, max_sentences=4)
-
         related = [name for name in candidate_names if _same_project_family(name, requested)]
         if related:
             return (
@@ -189,12 +365,35 @@ async def _project_qa_response_from_context(state: SalesAgentState) -> str:
 
 
 async def _comparison_response_from_context(state: SalesAgentState) -> str:
-    candidate_names = [
-        _clean_display_text(str(candidate.get("project_name") or ""))
-        for candidate in state.get("retrieved_candidates") or []
-        if str(candidate.get("project_name") or "").strip()
-    ]
+    candidate_names = _candidate_names(state)
+    project_facts = [item for item in state.get("project_facts") or [] if isinstance(item, dict)]
     requested_projects = await _resolve_requested_projects_from_context(state, candidate_names, max_items=2)
+    if not requested_projects:
+        requested_projects = candidate_names[:2]
+
+    matched_facts = _match_project_fact(project_facts, requested_projects)
+    if len(matched_facts) >= 2:
+        left = matched_facts[0]
+        right = matched_facts[1]
+        left_name = str(left.get("project_name") or "").strip()
+        right_name = str(right.get("project_name") or "").strip()
+        lines = [f"Em đối chiếu nhanh theo dữ liệu hiện có thì {left_name} và {right_name} đang khác nhau chủ yếu ở mấy điểm này:"]
+        if left.get("location") or right.get("location"):
+            lines.append(
+                f"- Vị trí: {left_name} ở {left.get('location') or 'chưa rõ'}, còn {right_name} ở {right.get('location') or 'chưa rõ'}."
+            )
+        if left.get("product_type") or right.get("product_type"):
+            lines.append(
+                f"- Loại hình: {left_name} thiên về {left.get('product_type') or 'chưa rõ'}, còn {right_name} thiên về {right.get('product_type') or 'chưa rõ'}."
+            )
+        left_strength = next((normalize_whitespace(str(x)).strip().rstrip(".") for x in left.get("key_strengths") or [] if str(x).strip()), "")
+        right_strength = next((normalize_whitespace(str(x)).strip().rstrip(".") for x in right.get("key_strengths") or [] if str(x).strip()), "")
+        if left_strength or right_strength:
+            lines.append(
+                f"- Điểm nổi bật: {left_name} nổi ở {left_strength or 'chưa rõ'}, còn {right_name} nổi ở {right_strength or 'chưa rõ'}."
+            )
+        lines.append("Nếu Anh/Chị muốn, em sẽ đi tiếp theo đúng góc mình quan tâm nhất như ở thực, pháp lý hay tiềm năng khai thác để chốt phương án sát hơn ạ.")
+        return " ".join(lines)
 
     if requested_projects:
         available: List[str] = []
@@ -273,25 +472,58 @@ def _fallback_without_context(state: SalesAgentState) -> str:
 
 
 def _catalog_overview_response(state: SalesAgentState) -> str:
+    project_facts = [item for item in state.get("project_facts") or [] if isinstance(item, dict)]
     projects = [item for item in state.get("catalog_projects") or [] if isinstance(item, dict)]
-    if not projects:
+    if not projects and not project_facts:
         return (
             "Hiện em chưa đọc được danh sách dự án Noble từ kho thông tin nội bộ để trả lời chắc chắn cho Anh/Chị. "
             "Anh/Chị cho em kiểm tra lại dữ liệu rồi em gửi ngay danh sách ngắn gọn nhé."
         )
 
-    top_projects = projects[:3]
-    lines = ["Dạ, hiện tại em đang thấy một vài hướng dự án nổi bật của Noble để Anh/Chị tham khảo nhanh ạ:"]
-    for idx, item in enumerate(top_projects, start=1):
-        name = str(item.get("project_name") or f"Dự án {idx}").strip()
-        summary = normalize_whitespace(str(item.get("summary") or "").strip())
-        summary = re.sub(r"^[*\-•#\s]+", "", summary).rstrip(".")
-        if summary:
-            lines.append(f"{idx}. {name}: {summary}.")
-        else:
-            lines.append(f"{idx}. {name}.")
+    if project_facts:
+        top_projects = project_facts[:3]
+        lines = [f"Dạ, hiện tại trong kho thông tin em đang thấy {len(project_facts)} dự án Noble nổi bật để mình tham khảo nhanh ạ:"]
+        for idx, item in enumerate(top_projects, start=1):
+            name = str(item.get("project_name") or f"Dự án {idx}").strip()
+            location = _clean_display_text(str(item.get("location") or ""))
+            product_type = _clean_display_text(str(item.get("product_type") or ""))
+            strengths = [
+                normalize_whitespace(str(x)).strip().rstrip(".")
+                for x in item.get("key_strengths") or []
+                if str(x).strip()
+            ]
+            angle_parts: List[str] = []
+            if product_type:
+                angle_parts.append(product_type)
+            if location:
+                angle_parts.append(f"khu vực {location}")
+            if item.get("child_friendly_features"):
+                angle_parts.append("có tiện ích cho gia đình có trẻ nhỏ")
+
+            if angle_parts:
+                lead_in = f"nếu mình đang tìm {', '.join(angle_parts[:2])}"
+                if len(angle_parts) > 2:
+                    lead_in += f", và {angle_parts[2]}"
+                line = f"{idx}. {name}: đáng xem hơn {lead_in}."
+            else:
+                line = f"{idx}. {name}: là một phương án đang có dữ liệu trong hệ thống."
+
+            if strengths:
+                line += f" Điểm nổi bật là {strengths[0]}."
+            lines.append(line)
+    else:
+        top_projects = projects[:3]
+        lines = ["Dạ, hiện tại em đang thấy một vài hướng dự án nổi bật của Noble để Anh/Chị tham khảo nhanh ạ:"]
+        for idx, item in enumerate(top_projects, start=1):
+            name = str(item.get("project_name") or f"Dự án {idx}").strip()
+            summary = normalize_whitespace(str(item.get("summary") or "").strip())
+            summary = re.sub(r"^[*\-•#\s]+", "", summary).rstrip(".")
+            if summary:
+                lines.append(f"{idx}. {name}: {summary}.")
+            else:
+                lines.append(f"{idx}. {name}.")
     lines.append(
-        "Nếu Anh/Chị đang nghiêng về nhu cầu ở thực hay đầu tư, em sẽ lọc ngay giúp mình phương án đáng xem nhất thay vì phải tự so từng dự án ạ."
+        "Nếu Anh/Chị nói rõ thêm mình nghiêng về ở thực hay đầu tư, cùng khu vực đang ưu tiên, em sẽ lọc ngay giúp mình phương án đáng xem nhất thay vì phải tự so từng dự án ạ."
     )
     return "\n".join(lines)
 
@@ -321,6 +553,17 @@ def _default_sales_follow_up(lead: Dict[str, Any]) -> str:
     if lead.get("location_preference"):
         return "Nếu mình đi tiếp, Anh/Chị muốn em bóc tách sâu hơn về điểm mạnh sống thực của dự án này hay loại căn phù hợp nhất với nhu cầu của gia đình mình ạ?"
     return "Nếu mình đi tiếp, Anh/Chị muốn em đi sâu trước về điểm mạnh nổi bật nhất của dự án hay loại căn phù hợp nhất với nhu cầu của mình ạ?"
+
+
+def _family_phrase(lead: Dict[str, Any]) -> str:
+    family_size = int(lead.get("family_member_count") or 0)
+    children_count = int(lead.get("children_count") or 0)
+    parts: List[str] = []
+    if family_size > 0:
+        parts.append(f"gia đình {family_size} người")
+    if children_count > 0:
+        parts.append(f"có {children_count} con nhỏ")
+    return ", ".join(parts)
 
 
 def _pre_score_project_candidate(lead: Dict[str, Any], item: Dict[str, Any]) -> Dict[str, Any]:
@@ -440,12 +683,41 @@ def _render_ranked_product_matching(
     return "\n".join(lines).strip()
 
 
-async def _product_matching_response_with_reasoning(state: SalesAgentState) -> str:
-    lead = state.get("lead_profile") or {}
-    project_facts = [item for item in state.get("project_facts") or [] if isinstance(item, dict)]
-    candidate_blocks = []
-    prescored_facts = [_pre_score_project_candidate(lead, item) for item in project_facts[:5]]
-    prescored_facts.sort(key=lambda item: int(item.get("pre_score") or 0), reverse=True)
+def _compact_candidate_payload(item: Dict[str, Any]) -> Dict[str, Any]:
+    strengths = [
+        normalize_whitespace(str(x)).strip().rstrip(".")
+        for x in item.get("key_strengths") or []
+        if str(x).strip()
+    ][:2]
+    if not strengths and str(item.get("source_summary") or "").strip():
+        strengths = [normalize_whitespace(str(item.get("source_summary") or "").strip()).rstrip(".")]
+    return {
+        "project_name": _clean_display_text(str(item.get("project_name") or "")),
+        "pre_score": int(item.get("pre_score") or 0),
+        "matched_needs": [str(x).strip() for x in item.get("matched_needs") or [] if str(x).strip()][:3],
+        "location": _clean_display_text(str(item.get("location") or "")),
+        "product_type": _clean_display_text(str(item.get("product_type") or "")),
+        "strengths": strengths,
+        "child_friendly_features": [
+            normalize_whitespace(str(x)).strip().rstrip(".")
+            for x in item.get("child_friendly_features") or []
+            if str(x).strip()
+        ][:1],
+        "family_fit": [
+            normalize_whitespace(str(x)).strip().rstrip(".")
+            for x in item.get("family_fit") or []
+            if str(x).strip()
+        ][:1],
+        "cautions": [
+            normalize_whitespace(str(x)).strip().rstrip(".")
+            for x in item.get("cautions") or []
+            if str(x).strip()
+        ][:1],
+    }
+
+
+def _local_recommendations_from_prescore(prescored_facts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    recommendations: List[Dict[str, Any]] = []
     for item in prescored_facts[:3]:
         strengths = [
             normalize_whitespace(str(x)).strip().rstrip(".")
@@ -454,133 +726,75 @@ async def _product_matching_response_with_reasoning(state: SalesAgentState) -> s
         ][:3]
         if not strengths and str(item.get("source_summary") or "").strip():
             strengths = [normalize_whitespace(str(item.get("source_summary") or "").strip()).rstrip(".")]
-        candidate_blocks.append(
+        fit_summary = ""
+        matched_needs = [str(x).strip() for x in item.get("matched_needs") or [] if str(x).strip()]
+        if matched_needs:
+            fit_summary = f"Phù hợp vì {', '.join(matched_needs[:2])}."
+        benefits: List[str] = []
+        if any("khớp khu vực" in need for need in matched_needs):
+            location = _clean_display_text(str(item.get("location") or ""))
+            if location:
+                benefits.append(f"Bám đúng khu vực ưu tiên {location}, thuận hơn cho nhu cầu sinh hoạt hằng ngày")
+            else:
+                benefits.append("Bám đúng khu vực ưu tiên nên mình đỡ mất thời gian lọc lại từ đầu")
+        if any("ở thực" in need for need in matched_needs):
+            product_type = _clean_display_text(str(item.get("product_type") or ""))
+            if product_type:
+                benefits.append(f"Hợp hơn cho nhu cầu ở thực vì loại hình chính đang là {product_type}")
+            else:
+                benefits.append("Hợp hơn cho nhu cầu ở thực và ổn định sinh hoạt lâu dài")
+        if any("trẻ nhỏ" in need for need in matched_needs):
+            child_feature = next((normalize_whitespace(str(x)).strip().rstrip(".") for x in item.get("child_friendly_features") or [] if str(x).strip()), "")
+            if child_feature:
+                benefits.append(f"Có {child_feature}, phù hợp hơn với gia đình có con nhỏ")
+            else:
+                benefits.append("Có thêm tiện ích hỗ trợ gia đình có con nhỏ")
+        if not benefits and strengths:
+            benefits.append(strengths[0])
+        recommendations.append(
             {
                 "project_name": _clean_display_text(str(item.get("project_name") or "")),
-                "location": item.get("location"),
-                "product_type": item.get("product_type"),
-                "family_fit": item.get("family_fit") or [],
-                "child_friendly_features": item.get("child_friendly_features") or [],
-                "lifestyle_fit": item.get("lifestyle_fit") or [],
-                "key_strengths": strengths,
-                "cautions": item.get("cautions") or [],
-                "source_summary": item.get("source_summary"),
-                "pre_score": item.get("pre_score") or 0,
-                "matched_needs": item.get("matched_needs") or [],
+                "fit_score": int(item.get("pre_score") or 0),
+                "fit_summary": fit_summary,
+                "strengths": strengths,
+                "benefits_for_customer": benefits[:2],
+                "tradeoff": "",
             }
         )
+    return recommendations
 
-    if not candidate_blocks:
+
+async def _product_matching_response_with_reasoning(state: SalesAgentState) -> str:
+    lead = state.get("lead_profile") or {}
+    project_facts = [item for item in state.get("project_facts") or [] if isinstance(item, dict)]
+    prescored_facts = [_pre_score_project_candidate(lead, item) for item in project_facts[:5]]
+    prescored_facts.sort(key=lambda item: int(item.get("pre_score") or 0), reverse=True)
+    local_recommendations = _local_recommendations_from_prescore(prescored_facts)
+    if not local_recommendations:
         candidates = _dedupe_candidate_names(state.get("retrieved_candidates") or [])
         if not candidates:
             return render_match_options_from_candidates(state, state.get("retrieved_candidates") or [])
-        for candidate in candidates[:3]:
-            facts = [str(item).strip() for item in candidate.get("fit_reasons") or [] if str(item).strip()]
-            if not facts:
-                facts = split_into_sentences(str(candidate.get("content") or ""))[:3]
-            facts = [normalize_whitespace(str(item)).strip().rstrip(".") for item in facts if str(item).strip()]
-            if not facts:
-                continue
-            candidate_blocks.append(
-                {
-                    "project_name": candidate.get("project_name"),
-                    "key_strengths": facts[:3],
-                    "cautions": [normalize_whitespace(str(item)).strip() for item in candidate.get("risk_notes") or [] if str(item).strip()][:1],
-                    "source_summary": "",
-                }
-            )
-        if not candidate_blocks:
-            return render_match_options_from_candidates(state, state.get("retrieved_candidates") or [])
-
-    reasoning_prompt = f"""Bạn là chuyên gia sales bất động sản của Noble.
-Nhiệm vụ: dựa trên hồ sơ khách và dữ kiện dự án đã retrieve, chốt rất nhanh phương án phù hợp nhất rồi diễn giải bằng lợi ích gắn trực tiếp với nhu cầu khách.
-
-Chỉ trả về JSON hợp lệ duy nhất theo schema:
-{{
-  "recommendations": [
-    {{
-      "project_name": "<tên dự án>",
-      "fit_score": 0,
-      "fit_summary": "<1 câu tóm tắt vì sao dự án này hợp với khách>",
-      "strengths": ["<điểm mạnh 1>", "<điểm mạnh 2>", "<điểm mạnh 3>"],
-      "benefits_for_customer": ["<lợi ích cụ thể cho khách 1>", "<lợi ích cụ thể cho khách 2>"],
-      "tradeoff": "<điểm cần lưu ý hoặc thiếu dữ liệu>"
-    }}
-  ],
-  "why_top_choice": "<1-2 câu giải thích vì sao phương án đứng đầu nổi bật hơn các phương án còn lại>",
-  "next_question": "<1 câu hỏi sales tiếp theo để kéo khách đi sâu hơn>"
-}}
-
-Quy tắc:
-- Chỉ dùng facts đã cho, không bịa thông tin mới.
-- Xếp hạng tất cả phương án có liên quan, nhưng chỉ trả tối đa 5 recommendations.
-- Nếu chỉ có 1 dự án thực sự phù hợp thì chỉ trả 1 recommendation, không tạo 2 phương án giả.
-- strengths phải là điểm mạnh riêng của dự án.
-- benefits_for_customer phải gắn trực tiếp với hồ sơ khách theo logic: nhu cầu hoặc ưu tiên nào của khách -> điểm mạnh nào của dự án -> lợi ích thực tế khách nhận được.
-- Không được chỉ liệt kê facts đẹp của dự án rồi đổi cách diễn đạt.
-- Nếu hồ sơ khách không nhắc tới con nhỏ, người lớn tuổi, đầu tư hoặc ngân sách thì không được tự gượng ép lợi ích theo các chiều đó.
-- fit_summary và why_top_choice phải cho thấy vì sao phương án đứng đầu hợp hơn các phương án còn lại trong đúng bối cảnh khách hiện tại.
-- tradeoff chỉ nêu điểm cần lưu ý thật sự, không viết cho có.
-- next_question phải giúp tiến gần chốt hơn, ví dụ đi sâu về loại căn, ngân sách, ưu tiên ở thực, nhu cầu cho con nhỏ.
-- Ưu tiên bám vào pre_score và matched_needs đã cho để kết luận nhanh, không suy diễn vòng vo lại từ đầu.
-- Viết ngắn, quyết đoán, không dùng văn brochure.
-- Giữ giọng sales tự nhiên, nhưng output vẫn phải là JSON.
-
-Hồ sơ khách:
-{lead}
-
-Dữ kiện dự án đã retrieve:
-{candidate_blocks}
-"""
-
-    try:
-        raw = await llm_model_func(
-            reasoning_prompt,
-            enable_cot=False,
-            response_format={"type": "json_object"},
-            max_tokens=700,
-        )
-        payload = extract_first_json_object(str(raw))
-        if not payload:
-            raise ValueError("No JSON in product matching reasoning response")
-        data = json.loads(payload)
-    except Exception as e:
-        log.warning("product_matching reasoning failed: %s", e)
         return render_match_options_from_candidates(state, state.get("retrieved_candidates") or [])
-
-    recommendations: List[Dict[str, Any]] = []
-    for raw_item in data.get("recommendations") or []:
-        project_name = _clean_display_text(str(raw_item.get("project_name") or "")).strip()
-        if not project_name:
-            continue
-        strengths = [
-            normalize_whitespace(str(item)).strip().rstrip(".")
-            for item in raw_item.get("strengths") or []
-            if str(item).strip()
-        ][:3]
-        benefits = [
-            normalize_whitespace(str(item)).strip().rstrip(".")
-            for item in raw_item.get("benefits_for_customer") or []
-            if str(item).strip()
-        ][:2]
-        recommendations.append(
-            {
-                "project_name": project_name,
-                "fit_score": int(raw_item.get("fit_score") or 0),
-                "fit_summary": normalize_whitespace(str(raw_item.get("fit_summary") or "").strip()),
-                "strengths": strengths,
-                "benefits_for_customer": benefits,
-                "tradeoff": normalize_whitespace(str(raw_item.get("tradeoff") or "").strip()),
-            }
-        )
-
-    recommendations.sort(key=lambda item: item.get("fit_score", 0), reverse=True)
-    why_top_choice = normalize_whitespace(str(data.get("why_top_choice") or "").strip())
-    next_question = normalize_whitespace(str(data.get("next_question") or "").strip())
-
-    if not recommendations:
-        return render_match_options_from_candidates(state, state.get("retrieved_candidates") or [])
-    return _render_ranked_product_matching(lead, recommendations, next_question, why_top_choice)
+    recommendations = sorted(local_recommendations, key=lambda item: item.get("fit_score", 0), reverse=True)
+    top_choice = recommendations[0]
+    family_phrase = _family_phrase(lead)
+    why_bits: List[str] = []
+    if top_choice.get("fit_summary"):
+        why_bits.append(str(top_choice.get("fit_summary") or "").rstrip("."))
+    strengths = top_choice.get("strengths") or []
+    if strengths:
+        why_bits.append(f"Điểm chốt là {strengths[0]}")
+    why_top_choice = ""
+    if family_phrase:
+        why_top_choice = f"Với {family_phrase}, phương án này nổi bật hơn vì " + "; ".join(why_bits[:2]) + "."
+    elif why_bits:
+        why_top_choice = "Phương án này nổi bật hơn vì " + "; ".join(why_bits[:2]) + "."
+    return _render_ranked_product_matching(
+        lead,
+        recommendations,
+        _default_sales_follow_up(lead),
+        why_top_choice,
+    )
 
 
 async def _repair_response(state: SalesAgentState, invalid_response: str) -> str:

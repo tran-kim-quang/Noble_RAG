@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from core.config import get_settings
 from core.dependencies import rag
 from models.api_models import StorageType, UploadDocumentResponse
+from sales.nodes.retrieve_context import refresh_retrieval_caches
 
 router = APIRouter(tags=["documents"])
 settings = get_settings()
@@ -45,6 +46,7 @@ async def upload_document(
         doc_metadata["upload_timestamp"] = time.time()
 
         document_id = await rag.ainsert(text_content, file_paths=file.filename)
+        await refresh_retrieval_caches()
         chunks_count = max(1, len(text_content) // settings.chunk_size)
         elapsed = time.perf_counter() - start
 

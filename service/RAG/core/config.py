@@ -110,7 +110,10 @@ def _apply_alt_env_names(s: Settings) -> Settings:
     """Support alternative env var names used in the existing .env:
     - CHUNK_TOKEN_SIZE  → chunk_size
     - CHUNK_OVERLAP_TOKEN_SIZE → chunk_overlap
+    - LLM_GEMINI_* → generic LLM_* fields when provider=gemini
     """
+    provider = (os.getenv("LLM_PROVIDER") or s.llm_provider or "").lower()
+
     if (val := os.getenv("CHUNK_TOKEN_SIZE")) and s.chunk_size == 1024:
         try:
             s.chunk_size = int(val)
@@ -122,6 +125,14 @@ def _apply_alt_env_names(s: Settings) -> Settings:
             s.chunk_overlap = int(val)
         except ValueError:
             pass
+
+    if provider == "gemini":
+        if (val := os.getenv("LLM_GEMINI_MODEL")) and s.llm_model == "deepseek-chat":
+            s.llm_model = val
+        if (val := os.getenv("LLM_GEMINI_API_KEY")) and not s.llm_api_key:
+            s.llm_api_key = val
+        if (val := os.getenv("LLM_GEMINI_API_URL")) and s.llm_api_url == "https://api.deepseek.com/v1":
+            s.llm_api_url = val
 
     return s
 

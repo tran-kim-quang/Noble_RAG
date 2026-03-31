@@ -37,11 +37,6 @@ _THINKING_ACK_MESSAGES = [
     "Em đã ghi nhận câu hỏi, Anh/Chị đợi em một lát để em đối chiếu thông tin cho chính xác nhé.",
     "Em nhận được rồi ạ, em đang xử lý nhanh để gửi lại câu trả lời ngắn gọn cho Anh/Chị.",
 ]
-_DEEP_THINKING_MESSAGES = [
-    "Em đang rà sâu hơn trong kho dữ liệu để chốt phương án sát nhu cầu của Anh/Chị.",
-    "Em đang đối chiếu thêm các dữ kiện dự án để tránh tư vấn thiếu hoặc lệch thông tin cho mình ạ.",
-    "Em đang kiểm tra kỹ hơn giữa các phương án để ưu tiên đúng dự án hợp với nhu cầu hiện tại của Anh/Chị.",
-]
 
 
 @router.post("/chat", response_model=SalesChatResponse)
@@ -104,22 +99,7 @@ async def sales_chat_stream(request: SalesChatRequest):
 
         try:
             task = asyncio.create_task(sales_graph.ainvoke(initial_state))
-            deep_idx = 0
-            while True:
-                done, _ = await asyncio.wait({task}, timeout=5.0)
-                if task in done:
-                    result = task.result()
-                    break
-                yield json.dumps(
-                    {
-                        "chunk": _DEEP_THINKING_MESSAGES[deep_idx % len(_DEEP_THINKING_MESSAGES)],
-                        "done": False,
-                        "phase": "thinking_deeper",
-                        "session_id": request.session_id,
-                    },
-                    ensure_ascii=False,
-                ) + "\n"
-                deep_idx += 1
+            result = await task
         except Exception as e:
             log.error("sales_graph.ainvoke(stream) error: %s", e)
             fallback = "Xin lỗi, em gặp lỗi khi xử lý yêu cầu. Anh/Chị thử lại giúp em nhé."

@@ -96,8 +96,41 @@ def _init_llm():
             host=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
         )
 
+    if provider == "gemini":
+        from lightrag.llm.gemini import gemini_model_complete
+
+        async def llm_func(prompt, system_prompt=None, history_messages=None, **kwargs):
+            if history_messages is None:
+                history_messages = []
+            force_json = False
+            if kwargs.get("keyword_extraction"):
+                kwargs["keyword_extraction"] = False
+                force_json = True
+            if "response_format" in kwargs:
+                rf = kwargs["response_format"]
+                if not isinstance(rf, dict) or rf.get("type") != "json_object":
+                    force_json = True
+            if force_json:
+                kwargs["response_format"] = {"type": "json_object"}
+                prompt += "\n\nIMPORTANT: Return strictly a valid JSON object. No additional text."
+
+            result = await gemini_model_complete(
+                prompt,
+                system_prompt=system_prompt,
+                history_messages=history_messages,
+                api_key=settings.llm_api_key,
+                model_name=settings.llm_model,
+                **kwargs,
+            )
+            if result is None:
+                log.error("LLM returned None for model=%s", settings.llm_model)
+                return ""
+            return result
+
+        return llm_func
+
     raise ValueError(
-        f"Unsupported LLM provider: {provider}. Use 'deepseek', 'openai', or 'ollama'."
+        f"Unsupported LLM provider: {provider}. Use 'deepseek', 'openai', 'ollama', or 'gemini'."
     )
 
 

@@ -291,75 +291,72 @@ def _infer_turn_from_slots(state: SalesAgentState, slots: Dict[str, Any]) -> Opt
 
 def _recent_history_text(chat_history: list[Dict[str, Any]]) -> str:
     return "\n".join(
-        f"{(item.get('role') or 'unknown')}: {(item.get('content') or '').strip()}"
-        for item in chat_history[-6:]
+        f"{(item.get('role') or 'unknown')}: {((item.get('content') or '').strip())[:160]}"
+        for item in chat_history[-4:]
         if isinstance(item, dict)
     ) or "(chưa có)"
 
 
-async def _understand_turn_with_llm(
+def _working_memory_summary(state: SalesAgentState) -> str:
+    lead = state.get("lead_profile") or {}
+    session_context = state.get("session_context") or {}
+    pieces = [
+        f"state={state.get('current_sales_state') or 'greeting'}",
+        f"step={state.get('current_script_step') or 'S1_opening'}",
+        f"missing={','.join(state.get('missing_slots') or []) or 'none'}",
+        f"family={lead.get('family_member_count') or 'unknown'}",
+        f"children={lead.get('children_count') if lead.get('children_count') is not None else 'unknown'}",
+        f"purpose={lead.get('purpose') or 'unknown'}",
+        f"location={','.join(lead.get('location_preference') or []) or 'unknown'}",
+        f"last_action={session_context.get('last_agent_action') or 'unknown'}",
+        f"last_agent_message={(session_context.get('last_agent_message') or '')[:160] or 'unknown'}",
+    ]
+    return " | ".join(pieces)
+
+
+async def _micro_understand_turn_with_llm(
     text: str,
     state: SalesAgentState,
 ) -> Dict[str, Any]:
-    chat_history = state.get("chat_history") or []
-    history_str = _recent_history_text(chat_history)
     current_state = state.get("current_sales_state") or "greeting"
     current_step = state.get("current_script_step") or "S1_opening"
     missing_slots = ", ".join(state.get("missing_slots") or []) or "không có"
-    last_assistant_message = ""
-    for item in reversed(chat_history):
-        if isinstance(item, dict) and str(item.get("role") or "") == "assistant":
-            last_assistant_message = (item.get("content") or "").strip()
-            break
+    working_memory = _working_memory_summary(state)
+    slot_hints = state.get("_slot_hints") or {}
 
-    prompt = f"""Bạn là bộ hiểu hội thoại sales bất động sản theo ngữ cảnh lịch sử chat.
-Nhiệm vụ:
-1. Hiểu tin nhắn hiện tại là đang trả lời câu hỏi trước đó hay mở ý mới.
-2. Điền slot nếu khách đang trả lời câu hỏi discovery.
-3. Chỉ yêu cầu truy xuất tri thức dự án khi thật sự cần.
+    prompt = f"""Bạn là bộ hiểu nhanh một lượt hội thoại sales bất động sản.
+Mục tiêu: dựa trên working memory rất ngắn, xác định xem khách đang trả lời câu hỏi trước hay mở chủ đề mới, và điền slot nếu thấy rõ.
 
 Chỉ trả về JSON hợp lệ duy nhất theo schema:
 {{
   "turn_role": "answer_previous_question" | "ask_catalog_overview" | "ask_project_info" | "ask_comparison" | "raise_objection" | "show_buy_signal" | "ask_recommendation" | "continue_previous_topic" | "greeting" | "other",
   "intent": "greeting" | "ask_recommendation" | "project_info" | "comparison" | "objection" | "buy_signal" | "follow_up" | "out_of_scope" | "other",
   "confidence": 0.0,
+  "should_escalate": false,
   "should_retrieve": false,
   "retrieval_goal": "none" | "shortlist" | "project_qa" | "comparison" | "objection_support" | "closing_next_step",
-  "buy_signal": false,
-  "objection_type": null,
   "resolved_project_name": null,
   "slot_updates": {{
     "family_member_count": null,
     "children_count": null,
     "purpose": null,
-    "property_type": null,
-    "budget_text": null,
-    "budget_min": null,
-    "budget_max": null,
-    "location_preference": [],
-    "timeline": null,
-    "financing_need": null,
-    "key_concerns": [],
-    "contact_phone": null
+    "location_preference": []
   }}
 }}
 
 Quy tắc:
-- Nếu khách chỉ đang trả lời câu hỏi discovery ngay trước đó, ưu tiên turn_role="answer_previous_question", intent="other" và điền slot_updates.
-- Nếu bot vừa hỏi khu vực và khách trả lời kiểu ngắn như "Long Bien", "Tay Ho", coi đó là location_preference.
-- Câu như "có những dự án Noble nào", "hiện có dự án nào" là turn_role="ask_catalog_overview", intent="ask_recommendation", should_retrieve=true và retrieval_goal="shortlist".
-- Câu như "gợi ý dự án phù hợp", "tư vấn dự án phù hợp" là ask_recommendation, không phải ask_catalog_overview.
-- Chỉ dùng project_info khi khách hỏi thông tin trực tiếp về một dự án/sản phẩm/chính sách cụ thể.
-- Nếu tên dự án không rõ hoặc chỉ là cụm hỏi chung như "noble nào", để resolved_project_name=null.
-- objection_type chỉ nhận: "gia_cao" | "phap_ly" | "vi_tri" | "chua_du_tien" | "suy_nghi_them" | "khac" | null
-- Nếu không chắc, giữ should_retrieve=false và confidence thấp.
+- Ưu tiên dùng slot_hints nếu chúng phù hợp với câu hiện tại.
+- Nếu working memory + user_text chưa đủ để kết luận chắc, đặt should_escalate=true.
+- Chỉ bật retrieval nếu khách đang hỏi danh sách dự án, hỏi thông tin dự án, hoặc hỏi so sánh/phản đối/mua ngay.
+- Không cần đọc toàn bộ lịch sử xa.
 
 Current sales state: {current_state}
 Current script step: {current_step}
 Missing slots: {missing_slots}
-Last assistant message: {last_assistant_message or "(không có)"}
-Lịch sử gần đây:
-{history_str}
+Working memory:
+{working_memory}
+Slot hints:
+{slot_hints}
 
 Tin nhắn khách:
 \"\"\"{text}\"\"\""""
@@ -369,21 +366,21 @@ Tin nhắn khách:
             prompt,
             enable_cot=False,
             response_format={"type": "json_object"},
+            max_tokens=220,
         )
         payload = extract_first_json_object(str(raw))
         if not payload:
-            raise ValueError("No JSON in contextual understanding response")
+            raise ValueError("No JSON in micro understanding response")
         data = json.loads(payload)
     except Exception as e:
-        log.warning("fast_parse contextual understanding failed: %s", e)
+        log.warning("fast_parse micro understanding failed: %s", e)
         return {
             "turn_role": "other",
             "intent": "other",
             "confidence": 0.2,
+            "should_escalate": True,
             "should_retrieve": False,
             "retrieval_goal": "none",
-            "buy_signal": False,
-            "objection_type": None,
             "resolved_project_name": None,
             "slot_updates": {},
         }
@@ -406,14 +403,96 @@ Tin nhắn khách:
     if retrieval_goal not in _RETRIEVAL_GOALS:
         retrieval_goal = "none"
 
-    objection_type = data.get("objection_type")
-    if objection_type not in {"gia_cao", "phap_ly", "vi_tri", "chua_du_tien", "suy_nghi_them", "khac", None}:
-        objection_type = None
-
     resolved_project_name = _normalize_text(str(data.get("resolved_project_name") or "")) or None
     if resolved_project_name and re.search(r"\b(nao|nào|gi|gì|the nao|thế nào|co nhung|có những)\b", resolved_project_name, re.IGNORECASE):
         resolved_project_name = None
 
+    slots = _sanitize_slot_updates(data.get("slot_updates") or {})
+    return {
+        "turn_role": turn_role,
+        "intent": intent,
+        "confidence": confidence,
+        "should_escalate": bool(data.get("should_escalate", confidence < 0.72)),
+        "should_retrieve": bool(data.get("should_retrieve", retrieval_goal != "none")),
+        "retrieval_goal": retrieval_goal,
+        "resolved_project_name": resolved_project_name,
+        "slot_updates": slots,
+    }
+
+
+async def _deep_understand_turn_with_llm(
+    text: str,
+    state: SalesAgentState,
+) -> Dict[str, Any]:
+    chat_history = state.get("chat_history") or []
+    history_str = _recent_history_text(chat_history)
+    working_memory = _working_memory_summary(state)
+
+    prompt = f"""Bạn là bộ hiểu hội thoại sales bất động sản ở mức sâu hơn khi lượt nói còn mơ hồ.
+Chỉ trả về JSON hợp lệ duy nhất:
+{{
+  "turn_role": "answer_previous_question" | "ask_catalog_overview" | "ask_project_info" | "ask_comparison" | "raise_objection" | "show_buy_signal" | "ask_recommendation" | "continue_previous_topic" | "greeting" | "other",
+  "intent": "greeting" | "ask_recommendation" | "project_info" | "comparison" | "objection" | "buy_signal" | "follow_up" | "out_of_scope" | "other",
+  "confidence": 0.0,
+  "should_retrieve": false,
+  "retrieval_goal": "none" | "shortlist" | "project_qa" | "comparison" | "objection_support" | "closing_next_step",
+  "buy_signal": false,
+  "objection_type": null,
+  "resolved_project_name": null,
+  "slot_updates": {{}}
+}}
+
+Working memory:
+{working_memory}
+
+Lịch sử gần đây:
+{history_str}
+
+Tin nhắn khách:
+\"\"\"{text}\"\"\""""
+    try:
+        raw = await llm_model_func(
+            prompt,
+            enable_cot=False,
+            response_format={"type": "json_object"},
+            max_tokens=350,
+        )
+        payload = extract_first_json_object(str(raw))
+        if not payload:
+            raise ValueError("No JSON in deep understanding response")
+        data = json.loads(payload)
+    except Exception as e:
+        log.warning("fast_parse deep understanding failed: %s", e)
+        return {
+            "turn_role": "other",
+            "intent": "other",
+            "confidence": 0.2,
+            "should_retrieve": False,
+            "retrieval_goal": "none",
+            "buy_signal": False,
+            "objection_type": None,
+            "resolved_project_name": None,
+            "slot_updates": {},
+        }
+
+    turn_role = str(data.get("turn_role") or "other")
+    if turn_role not in _TURN_ROLES:
+        turn_role = "other"
+    intent = str(data.get("intent") or "other")
+    if intent not in _INTENT_CLASSES:
+        intent = "other"
+    try:
+        confidence = float(data.get("confidence", 0.4))
+    except Exception:
+        confidence = 0.4
+    confidence = min(1.0, max(0.0, confidence))
+    retrieval_goal = str(data.get("retrieval_goal") or "none")
+    if retrieval_goal not in _RETRIEVAL_GOALS:
+        retrieval_goal = "none"
+    objection_type = data.get("objection_type")
+    if objection_type not in {"gia_cao", "phap_ly", "vi_tri", "chua_du_tien", "suy_nghi_them", "khac", None}:
+        objection_type = None
+    resolved_project_name = _normalize_text(str(data.get("resolved_project_name") or "")) or None
     slots = _sanitize_slot_updates(data.get("slot_updates") or {})
     return {
         "turn_role": turn_role,
@@ -495,8 +574,15 @@ async def fast_parse_user_turn(state: SalesAgentState) -> Dict[str, Any]:
         "resolved_project_name": project_name,
         "slot_updates": slots,
     }
-    contextual = await _understand_turn_with_llm(text=text, state=state)
-    slots.update(contextual.get("slot_updates") or {})
+    state_for_llm = dict(state)
+    state_for_llm["_slot_hints"] = dict(slots)
+    micro = await _micro_understand_turn_with_llm(text=text, state=state_for_llm)
+    slots.update(micro.get("slot_updates") or {})
+    contextual = micro
+    if bool(micro.get("should_escalate")):
+        deep = await _deep_understand_turn_with_llm(text=text, state=state_for_llm)
+        contextual = deep
+        slots.update(deep.get("slot_updates") or {})
 
     intent_result = {
         "intent": contextual.get("intent") or fallback["intent"],
@@ -546,11 +632,12 @@ async def fast_parse_user_turn(state: SalesAgentState) -> Dict[str, Any]:
     retrieval_mode = "lite" if lane == "lane_b" else "full"
 
     log.info(
-        "fast_parse_user_turn: lane=%s intent=%s confidence=%.2f slots=%d",
+        "fast_parse_user_turn: lane=%s intent=%s confidence=%.2f slots=%d escalated=%s",
         lane,
         intent,
         confidence,
         len(slots),
+        bool(micro.get("should_escalate")),
     )
 
     return {

@@ -2,7 +2,9 @@
 
 import json
 import logging
+import os
 import re
+import unicodedata
 from typing import Any, Dict, List
 
 import asyncpg
@@ -66,6 +68,44 @@ def _clean_project_name(text: str) -> str:
         flags=re.IGNORECASE,
     ).strip(" .,!?:;-'\"")
     return clean
+
+
+def _project_lookup_key(text: str) -> str:
+    clean = _clean_project_name(text)
+    clean = unicodedata.normalize("NFD", clean)
+    clean = "".join(ch for ch in clean if unicodedata.category(ch) != "Mn")
+    clean = clean.lower()
+    clean = re.sub(r"[^a-z0-9\s]", " ", clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean
+
+
+def _project_facts_cache_path() -> str:
+    return os.path.join(settings.rag_working_dir, f"project_facts_{settings.rag_workspace}.json")
+
+
+def _load_project_facts_from_disk() -> List[Dict[str, Any]]:
+    path = _project_facts_cache_path()
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+    except Exception as e:
+        log.warning("load project facts cache failed: %s", e)
+    return []
+
+
+def _save_project_facts_to_disk(items: List[Dict[str, Any]]) -> None:
+    path = _project_facts_cache_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(items, fh, ensure_ascii=False)
+    except Exception as e:
+        log.warning("save project facts cache failed: %s", e)
 
 
 def _build_retrieval_query(state: Dict[str, Any]) -> str:
@@ -330,6 +370,10 @@ async def _load_project_facts() -> List[Dict[str, Any]]:
     global _PROJECT_FACTS_CACHE
     if _PROJECT_FACTS_CACHE is not None:
         return list(_PROJECT_FACTS_CACHE)
+    cached = _load_project_facts_from_disk()
+    if cached:
+        _PROJECT_FACTS_CACHE = cached
+        return list(_PROJECT_FACTS_CACHE)
 
     conn = await asyncpg.connect(settings.postgres_url)
     try:
@@ -373,7 +417,29 @@ async def _load_project_facts() -> List[Dict[str, Any]]:
         item["source"] = str(payload.get("file_path") or "")
         facts.append(item)
     _PROJECT_FACTS_CACHE = facts[:5]
+    _save_project_facts_to_disk(_PROJECT_FACTS_CACHE)
     return list(_PROJECT_FACTS_CACHE)
+
+
+async def warm_retrieval_caches() -> None:
+    try:
+        await _load_catalog_projects()
+        await _load_project_facts()
+        log.info("warm_retrieval_caches: ready")
+    except Exception as e:
+        log.warning("warm_retrieval_caches failed: %s", e)
+
+
+async def refresh_retrieval_caches() -> None:
+    global _CATALOG_PROJECTS_CACHE, _PROJECT_FACTS_CACHE
+    _CATALOG_PROJECTS_CACHE = None
+    _PROJECT_FACTS_CACHE = None
+    try:
+        await _load_catalog_projects()
+        await _load_project_facts()
+        log.info("refresh_retrieval_caches: rebuilt")
+    except Exception as e:
+        log.warning("refresh_retrieval_caches failed: %s", e)
 
 
 def _project_fact_to_candidate(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -415,18 +481,143 @@ def _filter_project_facts_for_lead(project_facts: List[Dict[str, Any]], lead: Di
     return ranked[:3]
 
 
+def _same_known_project(left: str, right: str) -> bool:
+    left_key = _project_lookup_key(left)
+    right_key = _project_lookup_key(right)
+    if not left_key or not right_key:
+        return False
+    if left_key == right_key:
+        return True
+    left_tokens = left_key.split()
+    right_tokens = right_key.split()
+    if len(left_tokens) >= 2 and len(right_tokens) >= 2 and left_tokens[:2] == right_tokens[:2]:
+        return True
+    return False
+
+
+def _project_overlap_score(query: str, project_name: str) -> int:
+    query_key = _project_lookup_key(query)
+    project_key = _project_lookup_key(project_name)
+    if not query_key or not project_key:
+        return 0
+    if query_key == project_key:
+        return 100
+    if project_key in query_key:
+        return 95
+    query_tokens = query_key.split()
+    project_tokens = project_key.split()
+    if len(query_tokens) >= 2 and len(project_tokens) >= 2 and query_tokens[:2] == project_tokens[:2]:
+        return 80
+    overlap = len(set(query_tokens) & set(project_tokens))
+    return overlap * 10
+
+
+def _select_known_projects_from_text(
+    text: str,
+    project_facts: List[Dict[str, Any]],
+    max_items: int = 2,
+) -> List[str]:
+    text_lower = (text or "").lower()
+    names: List[str] = []
+    for item in project_facts:
+        name = str(item.get("project_name") or "").strip()
+        if not name:
+            continue
+        if _project_overlap_score(text_lower, name) >= 20 and name.lower() not in {x.lower() for x in names}:
+            names.append(name)
+    return names[:max_items]
+
+
+def _resolve_known_project_names(
+    state: Dict[str, Any],
+    project_facts: List[Dict[str, Any]],
+    max_items: int = 2,
+) -> List[str]:
+    candidates = [str(item.get("project_name") or "").strip() for item in project_facts if str(item.get("project_name") or "").strip()]
+    if not candidates:
+        return []
+
+    evidence_texts = [
+        str(state.get("resolved_project_name") or "").strip(),
+        str(state.get("user_text") or "").strip(),
+    ]
+    history = state.get("chat_history") or []
+    evidence_texts.extend(
+        str(item.get("content") or "").strip()
+        for item in history[-4:]
+        if isinstance(item, dict) and str(item.get("content") or "").strip()
+    )
+
+    scores: Dict[str, int] = {name: 0 for name in candidates}
+    for text in evidence_texts:
+        if not text:
+            continue
+        for name in candidates:
+            score = _project_overlap_score(text, name)
+            if score > scores[name]:
+                scores[name] = score
+
+    ranked = [name for name, score in sorted(scores.items(), key=lambda item: item[1], reverse=True) if score >= 20]
+    deduped: List[str] = []
+    for name in ranked:
+        if any(_same_known_project(name, existing) for existing in deduped):
+            continue
+        deduped.append(name)
+    return deduped[:max_items]
+
+
+async def _load_chunks_for_doc_ids(doc_ids: List[str], max_chunks_per_doc: int = 4) -> List[Dict[str, Any]]:
+    if not doc_ids:
+        return []
+    conn = await asyncpg.connect(settings.postgres_url)
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT full_doc_id, chunk_order_index, content
+            FROM lightrag_doc_chunks
+            WHERE workspace = $1
+              AND full_doc_id = ANY($2::text[])
+            ORDER BY full_doc_id, chunk_order_index
+            """,
+            settings.rag_workspace,
+            doc_ids,
+        )
+    finally:
+        await conn.close()
+
+    grouped: Dict[str, List[str]] = {}
+    counts: Dict[str, int] = {}
+    for row in rows:
+        doc_id = str(row.get("full_doc_id") or "").strip()
+        if not doc_id:
+            continue
+        count = counts.get(doc_id, 0)
+        if count >= max_chunks_per_doc:
+            continue
+        counts[doc_id] = count + 1
+        grouped.setdefault(doc_id, []).append(str(row.get("content") or "").strip())
+
+    items: List[Dict[str, Any]] = []
+    for doc_id in doc_ids:
+        text = "\n".join(grouped.get(doc_id) or []).strip()
+        if text:
+            items.append({"content": text, "source": doc_id})
+    return items
+
+
 async def retrieve_context(state: SalesAgentState) -> Dict[str, Any]:
     if (state.get("response_action") or "") == "catalog_overview":
         projects = await _load_catalog_projects()
+        project_facts = await _load_project_facts()
         return {
             "catalog_projects": projects,
-            "project_facts": [],
+            "project_facts": project_facts,
             "retrieved_candidates": [
                 {"project_name": item.get("project_name"), "content": item.get("summary")}
                 for item in projects
             ],
             "retrieved_context": [],
-            "has_retrieved_context": bool(projects),
+            "has_retrieved_context": bool(projects or project_facts),
             "project_qa_blocked": False,
             "resolved_project_name": None,
             "retrieval_mode": "catalog",
@@ -465,6 +656,38 @@ async def retrieve_context(state: SalesAgentState) -> Dict[str, Any]:
                 "project_qa_blocked": False,
                 "resolved_project_name": state.get("resolved_project_name"),
                 "retrieval_mode": "project_facts",
+            }
+
+    if (state.get("next_sales_state") or "") in {"project_qa", "comparison"}:
+        project_facts = await _load_project_facts()
+        target_names = _resolve_known_project_names(
+            state,
+            project_facts,
+            max_items=1 if (state.get("next_sales_state") or "") == "project_qa" else 2,
+        )
+
+        matched_facts = [
+            item for item in project_facts
+            if any(_same_known_project(str(item.get("project_name") or ""), name) for name in target_names)
+        ]
+        if matched_facts:
+            context_items = await _load_chunks_for_doc_ids(
+                [str(item.get("doc_id") or "") for item in matched_facts if str(item.get("doc_id") or "").strip()]
+            )
+            candidates = [_project_fact_to_candidate(item) for item in matched_facts if item.get("project_name")]
+            log.info(
+                "retrieve_context: mode=project_chunks candidates=%d state=%s",
+                len(matched_facts),
+                state.get("next_sales_state"),
+            )
+            return {
+                "retrieved_candidates": candidates,
+                "retrieved_context": context_items,
+                "project_facts": matched_facts,
+                "has_retrieved_context": bool(context_items or matched_facts),
+                "project_qa_blocked": False,
+                "resolved_project_name": state.get("resolved_project_name"),
+                "retrieval_mode": "project_chunks",
             }
 
     retrieval_mode = (state.get("retrieval_mode") or "full").lower()

@@ -61,9 +61,14 @@ async def persist_turn(state: SalesAgentState) -> Dict[str, Any]:
     session_context["current_state"] = next_state
     session_context["current_script_step"] = next_script_step
     session_context["last_agent_action"] = response_action
+    session_context["last_agent_message"] = final_response[:240]
+    session_context["last_user_text"] = user_text[:240]
+    session_context["last_detected_intent"] = state.get("detected_intent")
     session_context["conversation_turn_count"] = (
         session_context.get("conversation_turn_count", 0) + 1
     )
+    # Persist compact working memory immediately so the next turn sees the latest state.
+    await save_session_context(session_id, session_context)
     task = asyncio.create_task(
         _persist_worker(
             session_id=session_id,
