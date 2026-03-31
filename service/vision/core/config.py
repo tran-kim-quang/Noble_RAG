@@ -27,10 +27,11 @@ class Settings(BaseSettings):
     vision_project_id: str = ""
     vision_max_tokens: int = 8000
     vision_model_name: str = "mvp-image-hash"
-    vision_match_threshold: float = 0.75
+    vision_match_threshold: float = 0.363
     vision_embedding_dim: int = 512
-    vision_min_face_size: int = 112
+    vision_min_face_size: int = 140
     vision_max_faces: int = 1
+    vision_model_cache_dir: str = "/tmp/noble_vision_models"
     vision_purchase_history_path: str = "./data/customer_purchase_history.json"
 
     vision_service_host: str = "0.0.0.0"

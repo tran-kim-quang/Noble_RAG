@@ -1,11 +1,11 @@
 import base64
-import hashlib
 import json
-import math
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
 import httpx
+import cv2
+from common.opencv_face_runtime import OpenCVFaceRuntime, quality_from_face_box
 
 from core.config import get_settings
 
@@ -23,30 +23,32 @@ class FaceBasicAttributes:
 
 
 class FaceService:
-    """Face service using configured vision model for facial feature analysis."""
+    """Face service using YuNet + SFace for detection/embedding and VLM for attributes."""
 
     def __init__(self) -> None:
         self.settings = get_settings()
+        self.runtime = OpenCVFaceRuntime(cache_dir=self.settings.vision_model_cache_dir)
 
     async def detect_single_face(self, image_bytes: bytes) -> FaceDetectionResult:
         if not image_bytes:
             raise ValueError("image is empty")
         if len(image_bytes) < 1024:
             raise ValueError("image quality is too low")
-        quality_score = min(1.0, len(image_bytes) / 200000.0)
-        return FaceDetectionResult(quality_score=quality_score, cropped_bytes=image_bytes)
+        frame = self._decode_image(image_bytes)
+        face = self._select_single_face(frame)
+        if face is None:
+            raise ValueError("no face detected")
+        cropped = self.runtime.crop_face_jpeg(frame, face)
+        quality_score = quality_from_face_box(face, frame.shape)
+        return FaceDetectionResult(quality_score=quality_score, cropped_bytes=cropped)
 
     async def extract_embedding(self, image_bytes: bytes) -> List[float]:
-        analysis = await self._analyze_face_with_vision_model(image_bytes)
-        if not analysis.get("face_detected"):
+        frame = self._decode_image(image_bytes)
+        face = self._select_single_face(frame)
+        if face is None:
             raise ValueError("no face detected")
-        if int(analysis.get("face_count", 1)) > int(self.settings.vision_max_faces):
-            raise ValueError("too many faces in image")
-
-        # Keep identity embedding deterministic for matching while we use vision model
-        # for semantic face attributes (gender/age group).
-        signature = self._fallback_signature(image_bytes, size=64)
-        return self._signature_to_embedding(signature, image_bytes)
+        feature = self.runtime.extract_feature(frame, face)
+        return self.runtime.to_list(feature)
 
     async def extract_basic_attributes(self, image_bytes: bytes) -> FaceBasicAttributes:
         analysis = await self._analyze_face_with_vision_model(image_bytes)
@@ -144,39 +146,29 @@ class FaceService:
             return v
         return "unknown"
 
-    def _signature_to_embedding(self, signature: List[float], image_bytes: bytes) -> List[float]:
-        dim = max(16, int(self.settings.vision_embedding_dim))
-        sig: List[float] = []
-        for value in signature:
-            try:
-                sig.append(float(value))
-            except Exception:
-                sig.append(0.0)
-        if not sig:
-            sig = self._fallback_signature(image_bytes, size=64)
-
-        values: List[float] = []
-        img_seed = hashlib.sha256(image_bytes).digest()
-        for i in range(dim):
-            base = sig[i % len(sig)]
-            noise_digest = hashlib.blake2b(img_seed + i.to_bytes(4, "big"), digest_size=2).digest()
-            noise = (int.from_bytes(noise_digest, "big") / 65535.0) * 0.06 - 0.03
-            values.append(base + noise)
-
-        norm = math.sqrt(sum(v * v for v in values))
-        if norm <= 0.0:
-            return values
-        return [v / norm for v in values]
-
-    def _fallback_signature(self, image_bytes: bytes, size: int) -> List[float]:
-        seed = hashlib.sha256(image_bytes).digest()
-        values: List[float] = []
-        for i in range(size):
-            digest = hashlib.blake2b(seed + i.to_bytes(4, "big"), digest_size=2).digest()
-            raw = int.from_bytes(digest, "big")
-            values.append((raw / 65535.0) * 2.0 - 1.0)
-        return values
-
     def _to_data_uri(self, image_bytes: bytes) -> str:
         encoded = base64.b64encode(image_bytes).decode("ascii")
         return f"data:image/png;base64,{encoded}"
+
+    def _decode_image(self, image_bytes: bytes):
+        import numpy as np
+
+        arr = np.frombuffer(image_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if frame is None or frame.size == 0:
+            raise ValueError("image cannot be decoded")
+        return frame
+
+    def _select_single_face(self, frame) -> Any:
+        min_face_size = float(self.settings.vision_min_face_size)
+        detected_faces = self.runtime.detect_faces(frame)
+        if not detected_faces:
+            raise ValueError("no face detected")
+        faces = [
+            face for face in detected_faces if min(face.width, face.height) >= min_face_size
+        ]
+        if not faces:
+            raise ValueError("face is too small")
+        if len(faces) > int(self.settings.vision_max_faces):
+            raise ValueError("too many faces in image")
+        return faces[0]

@@ -29,6 +29,7 @@ from api.routes_health import router as health_router
 from api.routes_documents import router as documents_router
 from api.routes_query import router as query_router
 from api.routes_sales import router as sales_router
+from api.routes_watcher import router as watcher_router
 from sales.nodes.retrieve_context import warm_retrieval_caches
 
 setup_logging()
@@ -59,6 +60,7 @@ app.include_router(health_router)
 app.include_router(documents_router)
 app.include_router(query_router)
 app.include_router(sales_router)
+app.include_router(watcher_router)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,10 @@ class VisionSessionResponse(BaseModel):
     source: str
     created_at: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    customer_code: Optional[str] = None
+    customer_metadata: Dict[str, Any] = Field(default_factory=dict)
+    customer_context: VisionCustomerContext = Field(default_factory=VisionCustomerContext)
+    known_session_count: int = 0
 
 
 class VisionCustomerResponse(BaseModel):

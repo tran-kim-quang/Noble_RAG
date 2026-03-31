@@ -133,4 +133,17 @@ async def get_customer_by_session(session_id: str):
     data: Optional[dict] = await identity_store.get_customer_by_session(session_id.strip())
     if not data:
         raise HTTPException(status_code=404, detail="session is not bound to any customer")
-    return VisionSessionResponse(**data)
+    customer_id = data["customer_id"]
+    customer = await identity_store.get_customer(customer_id)
+    customer_context = await context_builder.build(
+        customer_id=customer_id,
+        fallback_session_id=session_id.strip(),
+    )
+    known_sessions = await identity_store.list_customer_sessions(customer_id, limit=20)
+    return VisionSessionResponse(
+        **data,
+        customer_code=(customer or {}).get("customer_code"),
+        customer_metadata=(customer or {}).get("metadata") or {},
+        customer_context=customer_context,
+        known_session_count=len(known_sessions),
+    )

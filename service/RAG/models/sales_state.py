@@ -64,7 +64,6 @@ TEMPLATE_ACTIONS = {
     ResponseAction.ASK_PURPOSE,
     ResponseAction.ASK_LOCATION,
     ResponseAction.CHECK_INTEREST,
-    ResponseAction.HANDLE_OBJECTION,
     ResponseAction.SOFT_CLOSE,
     ResponseAction.FOLLOWUP_CLOSEOUT,
     ResponseAction.REDIRECT_OUT_OF_SCOPE,

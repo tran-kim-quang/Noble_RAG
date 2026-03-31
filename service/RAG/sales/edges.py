@@ -12,6 +12,8 @@ def route_after_fast_parse(state: Dict[str, Any]) -> str:
     """Route to fallback reasoning only when fast parse is uncertain."""
     lane = state.get("fast_lane") or "lane_c"
     confidence = float(state.get("fast_path_confidence") or 0.0)
+    if state.get("turn_role") == "answer_previous_question" and (state.get("extracted_slots") or {}):
+        return "update_lead_profile"
     if lane != "lane_c":
         return "update_lead_profile"
     if confidence < 0.55:
@@ -22,6 +24,7 @@ def route_after_fast_parse(state: Dict[str, Any]) -> str:
 def route_after_action_resolution(state: Dict[str, Any]) -> str:
     """Route to template rendering or grounded generation by response action."""
     action_str = state.get("response_action") or ResponseAction.ASK_OPENING.value
+    missing_slots = state.get("missing_slots") or []
     try:
         action = ResponseAction(action_str)
     except ValueError:
@@ -37,6 +40,7 @@ def route_after_action_resolution(state: Dict[str, Any]) -> str:
         }
         and (state.get("detected_intent") or "") in _DISCOVERY_RETRIEVAL_INTENTS
         and bool(state.get("should_retrieve"))
+        and len(missing_slots) <= 1
     ):
         return "retrieve_context"
 

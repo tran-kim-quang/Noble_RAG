@@ -1,12 +1,16 @@
 import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import asyncpg
-from memory.chat_history_store import load_chat_history, save_chat_history
+import httpx
+
 from core.config import get_settings
+from memory.chat_history_store import delete_chat_history, load_chat_history, save_chat_history
 from memory.lead_profile_store import load_lead_profile, save_lead_profile
 from memory.session_store import load_session_context, save_session_context
 
@@ -26,6 +30,11 @@ def _resolve_identify_url() -> str:
     if settings.vision_identify_url:
         return settings.vision_identify_url
     return settings.vision_service_url.rstrip("/") + "/vision/identify"
+
+
+def _resolve_session_lookup_url(session_id: str) -> str:
+    base = get_settings().vision_service_url.rstrip("/")
+    return f"{base}/vision/session/{quote(session_id.strip(), safe='')}"
 
 
 def _postgres_url() -> str:
@@ -49,10 +58,6 @@ async def _list_customer_sessions_by_customer_id(
     current_session_id: str,
     limit: int = 5,
 ) -> List[str]:
-    """Read session list from customer mapping table by customer_id.
-
-    This guarantees hydration uses sessions linked to the exact same customer.
-    """
     conn = await asyncpg.connect(_postgres_url())
     try:
         rows = await conn.fetch(
@@ -87,68 +92,100 @@ def _merge_lead_profile_missing_fields(current: Dict[str, Any], previous: Dict[s
     return merged
 
 
-async def maybe_enrich_identity_from_camera(session_id: str) -> Optional[Dict[str, Any]]:
-    settings = get_settings()
-    if not settings.camera_auto_trigger:
-        return None
+def _fresh_session_context(session_id: str) -> Dict[str, Any]:
+    return {
+        "session_id": session_id,
+        "current_state": "greeting",
+        "current_script_step": "S1_opening",
+        "previous_state": None,
+        "last_agent_action": None,
+        "conversation_turn_count": 0,
+    }
 
-    session_context = await load_session_context(session_id)
-    lead_profile = await load_lead_profile(session_id)
 
-    script_path = _resolve_camera_script_path(settings.camera_action_script_path)
-    identify_url = _resolve_identify_url()
-    cmd = [
-        "python3",
-        script_path,
-        "--session-id",
-        session_id,
-        "--camera-index",
-        str(settings.camera_index),
-        "--identify-url",
-        identify_url,
-    ]
+def _fresh_lead_profile(session_id: str) -> Dict[str, Any]:
+    return {
+        "lead_id": session_id,
+        "current_state": "greeting",
+        "current_script_step": "S1_opening",
+    }
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+
+def _pick_identity_estimate(payload: Dict[str, Any], key: str, fallback: str = "unknown") -> str:
+    value = str(payload.get(key) or "").strip()
+    if value:
+        return value
+    metadata = payload.get("customer_metadata") or {}
+    if isinstance(metadata, dict):
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            return value
+    return fallback
+
+
+async def _apply_identity_payload(session_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    session_context = await load_session_context(session_id) or _fresh_session_context(session_id)
+    lead_profile = await load_lead_profile(session_id) or _fresh_lead_profile(session_id)
+
+    if bool(payload.get("skipped_identify")):
+        session_context["identity_last_verified_at"] = time.time()
+        session_context["camera_decision"] = payload.get("camera_decision", "same_user_skip")
+        session_context["identity_source"] = payload.get("identity_source", "camera")
+        await save_session_context(session_id, session_context)
+        return payload
+
+    previous_customer_id = str(session_context.get("customer_id") or "").strip()
+    new_customer_id = str(payload.get("customer_id") or "").strip()
+    same_customer = bool(previous_customer_id and new_customer_id and previous_customer_id == new_customer_id)
+    if same_customer and bool(session_context.get("identity_customer_hydrated")):
+        session_context["identity_last_verified_at"] = time.time()
+        session_context["camera_decision"] = payload.get(
+            "camera_decision",
+            session_context.get("camera_decision", "identified"),
         )
-        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=settings.camera_trigger_timeout_sec)
-    except asyncio.TimeoutError:
-        log.warning("camera trigger timeout session=%s", session_id)
-        return None
-    except Exception as e:
-        log.warning("camera trigger failed session=%s err=%s", session_id, e)
-        return None
+        session_context["identity_source"] = payload.get(
+            "identity_source",
+            session_context.get("identity_source", "vision"),
+        )
+        await save_session_context(session_id, session_context)
+        return payload
 
-    if proc.returncode != 0:
-        err = (stderr_b or b"").decode("utf-8", errors="ignore").strip()
-        log.warning("camera script returned non-zero session=%s code=%s err=%s", session_id, proc.returncode, err[:300])
-        return None
-
-    raw = (stdout_b or b"").decode("utf-8", errors="ignore").strip()
-    if not raw:
-        return None
-
-    try:
-        payload = json.loads(raw)
-    except Exception:
-        log.warning("camera script output is not valid JSON session=%s", session_id)
-        return None
+    if previous_customer_id and new_customer_id and previous_customer_id != new_customer_id:
+        await delete_chat_history(session_id)
+        session_context = _fresh_session_context(session_id)
+        lead_profile = _fresh_lead_profile(session_id)
+        session_context["identity_customer_switched"] = True
+        session_context["previous_customer_id"] = previous_customer_id
 
     session_context["customer_id"] = payload.get("customer_id") or session_context.get("customer_id")
     session_context["identity_status"] = "matched" if payload.get("is_existing_customer") else "new"
-    session_context["gender_estimate"] = payload.get("gender_estimate", session_context.get("gender_estimate", "unknown"))
-    session_context["age_group_estimate"] = payload.get("age_group_estimate", session_context.get("age_group_estimate", "unknown"))
-    lead_profile = lead_profile or {"lead_id": session_id, "current_state": "greeting"}
+    session_context["identity_last_verified_at"] = time.time()
+    session_context["camera_decision"] = payload.get("camera_decision", "identified")
+    session_context["identity_source"] = payload.get("identity_source", "vision")
+    session_context["gender_estimate"] = _pick_identity_estimate(
+        payload,
+        "gender_estimate",
+        fallback=str(session_context.get("gender_estimate") or "unknown"),
+    )
+    session_context["age_group_estimate"] = _pick_identity_estimate(
+        payload,
+        "age_group_estimate",
+        fallback=str(session_context.get("age_group_estimate") or "unknown"),
+    )
+
     lead_profile["customer_id"] = payload.get("customer_id") or lead_profile.get("customer_id")
     lead_profile["identity_status"] = "matched" if payload.get("is_existing_customer") else "new"
-    lead_profile["gender_estimate"] = payload.get("gender_estimate", lead_profile.get("gender_estimate", "unknown"))
-    lead_profile["age_group_estimate"] = payload.get("age_group_estimate", lead_profile.get("age_group_estimate", "unknown"))
+    lead_profile["gender_estimate"] = _pick_identity_estimate(
+        payload,
+        "gender_estimate",
+        fallback=str(lead_profile.get("gender_estimate") or "unknown"),
+    )
+    lead_profile["age_group_estimate"] = _pick_identity_estimate(
+        payload,
+        "age_group_estimate",
+        fallback=str(lead_profile.get("age_group_estimate") or "unknown"),
+    )
 
-    # Core workflow: customer_id is the durable key that links to previous sessions.
-    # If we detected an existing customer, hydrate old lead/chat data into the current session.
     customer_id = str(payload.get("customer_id") or "").strip()
     if customer_id and bool(payload.get("is_existing_customer")):
         previous_session_id: Optional[str] = None
@@ -163,7 +200,6 @@ async def maybe_enrich_identity_from_camera(session_id: str) -> Optional[Dict[st
             candidate_session_ids = []
 
         for sid in candidate_session_ids:
-            # Guard: if old lead profile has customer_id and mismatches, skip it.
             old_profile = await load_lead_profile(sid) or {}
             old_customer_id = str(old_profile.get("customer_id") or "").strip()
             if old_customer_id and old_customer_id != customer_id:
@@ -188,8 +224,119 @@ async def maybe_enrich_identity_from_camera(session_id: str) -> Optional[Dict[st
     purchase_history = ((payload.get("customer_context") or {}).get("purchase_history") or [])
     if isinstance(purchase_history, list):
         session_context["customer_purchase_history"] = purchase_history
+    session_context["identity_customer_hydrated"] = True
 
     await save_session_context(session_id, session_context)
     await save_lead_profile(session_id, lead_profile)
-
     return payload
+
+
+async def maybe_enrich_identity_from_vision_session(session_id: str) -> Optional[Dict[str, Any]]:
+    settings = get_settings()
+    if not settings.vision_session_sync_enabled:
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=settings.vision_session_lookup_timeout_sec) as client:
+            resp = await client.get(_resolve_session_lookup_url(session_id))
+    except Exception as e:
+        log.debug("vision session lookup failed session=%s err=%s", session_id, e)
+        return None
+
+    if resp.status_code == 404:
+        return None
+    try:
+        resp.raise_for_status()
+    except Exception as e:
+        log.warning("vision session lookup non-200 session=%s err=%s", session_id, e)
+        return None
+
+    try:
+        data = resp.json()
+    except Exception:
+        log.warning("vision session lookup invalid json session=%s", session_id)
+        return None
+
+    customer_id = str(data.get("customer_id") or "").strip()
+    if not customer_id:
+        return None
+
+    customer_metadata = data.get("customer_metadata") or {}
+    payload: Dict[str, Any] = {
+        "session_id": data.get("session_id") or session_id,
+        "customer_id": customer_id,
+        "is_existing_customer": int(data.get("known_session_count") or 0) > 1,
+        "gender_estimate": str(customer_metadata.get("gender_estimate") or "").strip() or "unknown",
+        "age_group_estimate": str(customer_metadata.get("age_group_estimate") or "").strip() or "unknown",
+        "customer_metadata": customer_metadata,
+        "customer_context": data.get("customer_context") or {},
+        "camera_decision": "session_lookup",
+        "identity_source": data.get("source") or "vision_session",
+    }
+    return await _apply_identity_payload(session_id, payload)
+
+
+async def maybe_enrich_identity_from_camera(session_id: str) -> Optional[Dict[str, Any]]:
+    settings = get_settings()
+    if not settings.camera_auto_trigger:
+        return None
+
+    script_path = _resolve_camera_script_path(settings.camera_action_script_path)
+    identify_url = _resolve_identify_url()
+    cmd = [
+        "python3",
+        script_path,
+        "--session-id",
+        session_id,
+        "--camera-index",
+        str(settings.camera_index),
+        "--identify-url",
+        identify_url,
+    ]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_b, stderr_b = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=settings.camera_trigger_timeout_sec,
+        )
+    except asyncio.TimeoutError:
+        log.warning("camera trigger timeout session=%s", session_id)
+        return None
+    except Exception as e:
+        log.warning("camera trigger failed session=%s err=%s", session_id, e)
+        return None
+
+    if proc.returncode != 0:
+        err = (stderr_b or b"").decode("utf-8", errors="ignore").strip()
+        log.warning(
+            "camera script returned non-zero session=%s code=%s err=%s",
+            session_id,
+            proc.returncode,
+            err[:300],
+        )
+        return None
+
+    raw = (stdout_b or b"").decode("utf-8", errors="ignore").strip()
+    if not raw:
+        return None
+
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        log.warning("camera script output is not valid JSON session=%s", session_id)
+        return None
+
+    payload["identity_source"] = "camera"
+    return await _apply_identity_payload(session_id, payload)
+
+
+async def maybe_enrich_identity(session_id: str) -> Optional[Dict[str, Any]]:
+    payload = await maybe_enrich_identity_from_vision_session(session_id)
+    if payload:
+        return payload
+    return await maybe_enrich_identity_from_camera(session_id)

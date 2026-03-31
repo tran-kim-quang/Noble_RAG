@@ -47,6 +47,7 @@ def resolve_script_step_and_action(state: Dict[str, Any]) -> Tuple[str, str]:
     missing_slots: List[str] = state.get("missing_slots") or []
     intent = state.get("detected_intent") or ""
     current_state = state.get("current_sales_state") or "greeting"
+    lead = state.get("lead_profile") or {}
 
     if next_state == "out_of_scope":
         return ScriptStep.OUT_OF_SCOPE.value, ResponseAction.REDIRECT_OUT_OF_SCOPE.value
@@ -55,7 +56,6 @@ def resolve_script_step_and_action(state: Dict[str, Any]) -> Tuple[str, str]:
         return ScriptStep.S1_OPENING.value, ResponseAction.ASK_OPENING.value
 
     if next_state == "need_discovery":
-        lead = state.get("lead_profile") or {}
         if (
             (state.get("turn_role") or "") == "ask_catalog_overview"
             and not any(
@@ -64,6 +64,11 @@ def resolve_script_step_and_action(state: Dict[str, Any]) -> Tuple[str, str]:
             )
         ):
             return ScriptStep.S1_OPENING.value, ResponseAction.CATALOG_OVERVIEW.value
+        if intent in {"ask_recommendation", "follow_up"} and (
+            lead.get("purpose") or lead.get("budget_max") or lead.get("budget_text")
+        ):
+            if "location_preference" in missing_slots:
+                return ScriptStep.S5_ASK_LOCATION.value, ResponseAction.ASK_LOCATION.value
         for slot_name, step, action in _DISCOVERY_SLOT_ORDER:
             if slot_name in missing_slots:
                 return step.value, action.value
@@ -85,6 +90,12 @@ def resolve_script_step_and_action(state: Dict[str, Any]) -> Tuple[str, str]:
         return ScriptStep.M2_EXPLAIN_OPTION_DETAIL.value, ResponseAction.EXPLAIN_OPTION_DETAIL.value
 
     if next_state == "product_matching":
+        if missing_slots:
+            if "location_preference" in missing_slots:
+                return ScriptStep.S5_ASK_LOCATION.value, ResponseAction.ASK_LOCATION.value
+            for slot_name, step, action in _DISCOVERY_SLOT_ORDER:
+                if slot_name in missing_slots:
+                    return step.value, action.value
         if current_step == ScriptStep.M1_MATCH_OPTIONS.value:
             if _wants_option_detail(state, intent):
                 return ScriptStep.M2_EXPLAIN_OPTION_DETAIL.value, ResponseAction.EXPLAIN_OPTION_DETAIL.value

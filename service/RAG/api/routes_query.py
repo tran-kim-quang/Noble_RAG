@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from core.config import get_settings
-from integrations.camera_identity import maybe_enrich_identity_from_camera
+from integrations.camera_identity import maybe_enrich_identity
 from memory.chat_history_store import load_chat_history
 from rag.retriever import route_query, summarize_search_answer
 from sales.edges import (
@@ -117,7 +117,7 @@ async def query_rag_stream(request: QueryRequest):
         try:
             # UX-first: send an immediate acknowledgment before heavier routing/retrieval.
             yield json.dumps({"chunk": _build_thinking_ack(), "done": False, "phase": "thinking_ack"}, ensure_ascii=False) + "\n"
-            await maybe_enrich_identity_from_camera(session_id)
+            await maybe_enrich_identity(session_id)
             history = await load_chat_history(session_id)
             yield json.dumps({"chunk": "", "done": False, "phase": "route"}, ensure_ascii=False) + "\n"
             category, routed_query = await route_query(user_text, history)

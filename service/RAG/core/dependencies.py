@@ -3,6 +3,7 @@ Singletons: LightRAG instance, llm_model_func, embedding_func.
 Initialised once at import time so all modules share the same objects.
 """
 
+import asyncio
 import os
 import time
 from functools import partial
@@ -114,15 +115,34 @@ def _init_llm():
                 kwargs["response_format"] = {"type": "json_object"}
                 prompt += "\n\nIMPORTANT: Return strictly a valid JSON object. No additional text."
 
-            result = await gemini_model_complete(
-                prompt,
-                system_prompt=system_prompt,
-                history_messages=history_messages,
-                api_key=settings.llm_api_key,
-                model_name=settings.llm_model,
-                **kwargs,
-            )
+            result = None
+            last_error = None
+            for attempt in range(3):
+                try:
+                    result = await gemini_model_complete(
+                        prompt,
+                        system_prompt=system_prompt,
+                        history_messages=history_messages,
+                        api_key=settings.llm_api_key,
+                        model_name=settings.llm_model,
+                        **kwargs,
+                    )
+                    break
+                except Exception as e:
+                    last_error = e
+                    if "429" not in str(e) or attempt == 2:
+                        raise
+                    wait_sec = float(attempt + 1)
+                    log.warning(
+                        "Gemini rate limited for model=%s; retrying in %.1fs (attempt %d/3)",
+                        settings.llm_model,
+                        wait_sec,
+                        attempt + 1,
+                    )
+                    await asyncio.sleep(wait_sec)
             if result is None:
+                if last_error is not None:
+                    log.error("LLM failed for model=%s error=%s", settings.llm_model, last_error)
                 log.error("LLM returned None for model=%s", settings.llm_model)
                 return ""
             return result

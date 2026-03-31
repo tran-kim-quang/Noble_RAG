@@ -12,10 +12,6 @@ from utils.json_extract import extract_first_json_object
 log = logging.getLogger("rag-service")
 
 _PROJECT_NAME_PATTERN = re.compile(r"(Noble[^\n,.;:!?()]*)", re.IGNORECASE)
-_LOCATION_PATTERN = re.compile(
-    r"\b(?:quanh|gan|gần|o|ở|tai|tại)\b\s+([A-Za-zÀ-ỹ0-9\-\s]{2,40})",
-    re.IGNORECASE,
-)
 _FAMILY_PATTERN = re.compile(r"\b(\d{1,2})\s*(?:nguoi|người)\b", re.IGNORECASE)
 _CHILDREN_PATTERN = re.compile(r"\b(\d{1,2})\s*(?:con|be|bé)\b", re.IGNORECASE)
 _SHORT_SLOT_MAX_WORDS = 8
@@ -42,6 +38,16 @@ _TURN_ROLES = {
     "greeting",
     "other",
 }
+_SEMANTIC_MOVES = {
+    "answer_slot",
+    "request_shortlist",
+    "request_project_fact",
+    "raise_objection",
+    "advance_purchase",
+    "general_follow_up",
+    "greeting",
+    "other",
+}
 _RETRIEVAL_GOALS = {
     "none",
     "shortlist",
@@ -64,24 +70,6 @@ _SLOT_FIELDS = {
     "key_concerns",
     "contact_phone",
 }
-_INVALID_LOCATION_TOKENS = (
-    "dự án",
-    "du an",
-    "noble",
-    "pháp lý",
-    "phap ly",
-    "so sánh",
-    "so sanh",
-    "giá",
-    "gia",
-    "tiện ích",
-    "tien ich",
-    "chính sách",
-    "chinh sach",
-    "nào",
-    "nao",
-    "?",
-)
 
 
 def _normalize_text(text: str) -> str:
@@ -192,30 +180,26 @@ def _parse_purpose_slot(text_lower: str) -> Dict[str, Any]:
     return {}
 
 
-def _parse_location_slot(text: str) -> Dict[str, Any]:
-    matches = []
-    for raw in _LOCATION_PATTERN.findall(text):
-        clean = re.sub(r"\s+", " ", raw).strip(" .,!?:;")
-        if len(clean) < 2:
-            continue
-        lower = clean.lower()
-        if any(token in lower for token in _INVALID_LOCATION_TOKENS):
-            continue
-        if len(clean.split()) > 4:
-            continue
-        matches.append(clean)
-
-    deduped = []
-    seen = set()
-    for location in matches:
-        key = location.lower()
-        if key not in seen:
-            seen.add(key)
-            deduped.append(location)
-
-    if deduped:
-        return {"location_preference": deduped[:2]}
-    return {}
+def _parse_budget_slot(text: str) -> Dict[str, Any]:
+    text_lower = text.lower()
+    slots: Dict[str, Any] = {}
+    if match := re.search(r"(\d+(?:[.,]\d+)?)\s*(?:-|den|đến)\s*(\d+(?:[.,]\d+)?)\s*t(?:y|ỷ)", text_lower):
+        low = float(match.group(1).replace(",", "."))
+        high = float(match.group(2).replace(",", "."))
+        slots["budget_min"] = min(low, high)
+        slots["budget_max"] = max(low, high)
+        slots["budget_text"] = _normalize_text(match.group(0))
+        return slots
+    if match := re.search(r"(?:duoi|dưới)\s*(\d+(?:[.,]\d+)?)\s*t(?:y|ỷ)", text_lower):
+        high = float(match.group(1).replace(",", "."))
+        slots["budget_max"] = high
+        slots["budget_text"] = _normalize_text(match.group(0))
+        return slots
+    if match := re.search(r"(\d+(?:[.,]\d+)?)\s*t(?:y|ỷ)", text_lower):
+        value = float(match.group(1).replace(",", "."))
+        slots["budget_max"] = value
+        slots["budget_text"] = _normalize_text(match.group(0))
+    return slots
 
 
 def _parse_contextual_slot_reply(text: str, state: SalesAgentState) -> Dict[str, Any]:
@@ -287,8 +271,6 @@ def _infer_turn_from_slots(state: SalesAgentState, slots: Dict[str, Any]) -> Opt
         "buy_signal": False,
         "objection_type": None,
     }
-
-
 def _recent_history_text(chat_history: list[Dict[str, Any]]) -> str:
     return "\n".join(
         f"{(item.get('role') or 'unknown')}: {((item.get('content') or '').strip())[:160]}"
@@ -330,25 +312,45 @@ Mục tiêu: dựa trên working memory rất ngắn, xác định xem khách đ
 Chỉ trả về JSON hợp lệ duy nhất theo schema:
 {{
   "turn_role": "answer_previous_question" | "ask_catalog_overview" | "ask_project_info" | "ask_comparison" | "raise_objection" | "show_buy_signal" | "ask_recommendation" | "continue_previous_topic" | "greeting" | "other",
+  "semantic_move": "answer_slot" | "request_shortlist" | "request_project_fact" | "raise_objection" | "advance_purchase" | "general_follow_up" | "greeting" | "other",
   "intent": "greeting" | "ask_recommendation" | "project_info" | "comparison" | "objection" | "buy_signal" | "follow_up" | "out_of_scope" | "other",
   "confidence": 0.0,
   "should_escalate": false,
   "should_retrieve": false,
   "retrieval_goal": "none" | "shortlist" | "project_qa" | "comparison" | "objection_support" | "closing_next_step",
+  "buy_signal": false,
+  "objection_type": null,
   "resolved_project_name": null,
   "slot_updates": {{
     "family_member_count": null,
     "children_count": null,
     "purpose": null,
-    "location_preference": []
+    "budget_text": null,
+    "budget_min": null,
+    "budget_max": null,
+    "location_preference": [],
+    "key_concerns": []
   }}
 }}
 
 Quy tắc:
-- Ưu tiên dùng slot_hints nếu chúng phù hợp với câu hiện tại.
+- `slot_hints` chỉ là gợi ý mỏng từ parser rule-based, không phải ground truth. Nếu ngữ nghĩa câu hiện tại mâu thuẫn, hãy bỏ qua chúng.
+- Hãy hiểu location/purpose/objection/buy signal theo ngữ nghĩa của câu và working memory, không dựa vào pattern hardcode.
 - Nếu working memory + user_text chưa đủ để kết luận chắc, đặt should_escalate=true.
 - Chỉ bật retrieval nếu khách đang hỏi danh sách dự án, hỏi thông tin dự án, hoặc hỏi so sánh/phản đối/mua ngay.
 - Không cần đọc toàn bộ lịch sử xa.
+- Nếu khách đang bổ sung thêm tiêu chí như ngân sách, khu vực, mục đích, số người, số con để tiếp tục tư vấn, ưu tiên `semantic_move="answer_slot"` và thường `intent="follow_up"`.
+- Nếu khách yêu cầu agent lọc/gợi ý/xem danh sách phương án phù hợp nhất theo nhu cầu đã nói, ưu tiên `semantic_move="request_shortlist"` và `intent="ask_recommendation"`, kể cả khi vẫn còn thiếu vài slot discovery.
+- Nếu khách nghi ngại về giá, khả năng chi trả, hoặc chất vấn xem có phương án rẻ hơn/phù hợp ngân sách hơn không, ưu tiên `semantic_move="raise_objection"` và `intent="objection"`.
+- Chỉ dùng `intent="project_info"` khi khách thật sự đang hỏi facts/thông tin dự án cụ thể cần trả lời trực tiếp.
+
+Ví dụ ngắn:
+- "ngân sách khoảng 4 đến 6 tỷ" sau khi agent đang hỏi thêm nhu cầu
+  => semantic_move=answer_slot, intent=follow_up, slot_updates có budget_min/budget_max
+- "giá vậy có cao quá không, dưới 5 tỷ được không"
+  => semantic_move=raise_objection, intent=objection, objection_type=gia_cao
+- "ok cho tôi xem danh sách căn phù hợp nhất"
+  => semantic_move=request_shortlist, intent=ask_recommendation, retrieval_goal=shortlist
 
 Current sales state: {current_state}
 Current script step: {current_step}
@@ -376,11 +378,14 @@ Tin nhắn khách:
         log.warning("fast_parse micro understanding failed: %s", e)
         return {
             "turn_role": "other",
+            "semantic_move": "other",
             "intent": "other",
             "confidence": 0.2,
             "should_escalate": True,
             "should_retrieve": False,
             "retrieval_goal": "none",
+            "buy_signal": False,
+            "objection_type": None,
             "resolved_project_name": None,
             "slot_updates": {},
         }
@@ -388,6 +393,9 @@ Tin nhắn khách:
     turn_role = str(data.get("turn_role") or "other")
     if turn_role not in _TURN_ROLES:
         turn_role = "other"
+    semantic_move = str(data.get("semantic_move") or "other")
+    if semantic_move not in _SEMANTIC_MOVES:
+        semantic_move = "other"
 
     intent = str(data.get("intent") or "other")
     if intent not in _INTENT_CLASSES:
@@ -402,6 +410,9 @@ Tin nhắn khách:
     retrieval_goal = str(data.get("retrieval_goal") or "none")
     if retrieval_goal not in _RETRIEVAL_GOALS:
         retrieval_goal = "none"
+    objection_type = data.get("objection_type")
+    if objection_type not in {"gia_cao", "phap_ly", "vi_tri", "chua_du_tien", "suy_nghi_them", "khac", None}:
+        objection_type = None
 
     resolved_project_name = _normalize_text(str(data.get("resolved_project_name") or "")) or None
     if resolved_project_name and re.search(r"\b(nao|nào|gi|gì|the nao|thế nào|co nhung|có những)\b", resolved_project_name, re.IGNORECASE):
@@ -410,11 +421,14 @@ Tin nhắn khách:
     slots = _sanitize_slot_updates(data.get("slot_updates") or {})
     return {
         "turn_role": turn_role,
+        "semantic_move": semantic_move,
         "intent": intent,
         "confidence": confidence,
         "should_escalate": bool(data.get("should_escalate", confidence < 0.72)),
         "should_retrieve": bool(data.get("should_retrieve", retrieval_goal != "none")),
         "retrieval_goal": retrieval_goal,
+        "buy_signal": bool(data.get("buy_signal", intent == "buy_signal")),
+        "objection_type": objection_type,
         "resolved_project_name": resolved_project_name,
         "slot_updates": slots,
     }
@@ -432,6 +446,7 @@ async def _deep_understand_turn_with_llm(
 Chỉ trả về JSON hợp lệ duy nhất:
 {{
   "turn_role": "answer_previous_question" | "ask_catalog_overview" | "ask_project_info" | "ask_comparison" | "raise_objection" | "show_buy_signal" | "ask_recommendation" | "continue_previous_topic" | "greeting" | "other",
+  "semantic_move": "answer_slot" | "request_shortlist" | "request_project_fact" | "raise_objection" | "advance_purchase" | "general_follow_up" | "greeting" | "other",
   "intent": "greeting" | "ask_recommendation" | "project_info" | "comparison" | "objection" | "buy_signal" | "follow_up" | "out_of_scope" | "other",
   "confidence": 0.0,
   "should_retrieve": false,
@@ -439,8 +454,29 @@ Chỉ trả về JSON hợp lệ duy nhất:
   "buy_signal": false,
   "objection_type": null,
   "resolved_project_name": null,
-  "slot_updates": {{}}
+  "slot_updates": {{
+    "family_member_count": null,
+    "children_count": null,
+    "purpose": null,
+    "budget_text": null,
+    "budget_min": null,
+    "budget_max": null,
+    "location_preference": [],
+    "key_concerns": []
+  }}
 }}
+
+Quy tắc:
+- Ưu tiên semantic understanding của user_text + lịch sử gần đây.
+- `slot_updates` chỉ điền khi thật sự chắc; nếu không chắc thì để null/[] và dùng confidence thấp hơn.
+- Nếu khách đang tiếp tục discovery bằng cách bổ sung ngân sách, khu vực, mục đích, số người, số con thì ưu tiên turn_role=`answer_previous_question` hoặc `continue_previous_topic`, không đẩy sang `project_info` trừ khi họ thực sự hỏi thông tin dự án cụ thể.
+- Nếu khách chuyển từ hỏi/trao đổi sang yêu cầu agent lọc/gợi ý/xem danh sách phương án phù hợp, ưu tiên `semantic_move="request_shortlist"` và `intent="ask_recommendation"`.
+- Nếu khách thể hiện băn khoăn về giá/tài chính/sự phù hợp và đang muốn phản biện lại đề xuất, ưu tiên `semantic_move="raise_objection"` và `intent="objection"`.
+
+Ví dụ:
+- "giá vậy có cao quá không, dưới 5 tỷ được không" => semantic_move=raise_objection, intent=objection, objection_type=gia_cao
+- "ok cho tôi xem danh sách căn phù hợp nhất" => semantic_move=request_shortlist, intent=ask_recommendation, retrieval_goal=shortlist
+- "quận 7" sau khi agent hỏi vị trí => semantic_move=answer_slot, intent=follow_up, slot_updates có location_preference
 
 Working memory:
 {working_memory}
@@ -465,6 +501,7 @@ Tin nhắn khách:
         log.warning("fast_parse deep understanding failed: %s", e)
         return {
             "turn_role": "other",
+            "semantic_move": "other",
             "intent": "other",
             "confidence": 0.2,
             "should_retrieve": False,
@@ -478,6 +515,9 @@ Tin nhắn khách:
     turn_role = str(data.get("turn_role") or "other")
     if turn_role not in _TURN_ROLES:
         turn_role = "other"
+    semantic_move = str(data.get("semantic_move") or "other")
+    if semantic_move not in _SEMANTIC_MOVES:
+        semantic_move = "other"
     intent = str(data.get("intent") or "other")
     if intent not in _INTENT_CLASSES:
         intent = "other"
@@ -496,6 +536,7 @@ Tin nhắn khách:
     slots = _sanitize_slot_updates(data.get("slot_updates") or {})
     return {
         "turn_role": turn_role,
+        "semantic_move": semantic_move,
         "intent": intent,
         "confidence": confidence,
         "should_retrieve": bool(data.get("should_retrieve", retrieval_goal != "none")),
@@ -559,7 +600,7 @@ async def fast_parse_user_turn(state: SalesAgentState) -> Dict[str, Any]:
     slots: Dict[str, Any] = {}
     slots.update(_parse_family_slots(text.lower()))
     slots.update(_parse_purpose_slot(text.lower()))
-    slots.update(_parse_location_slot(text))
+    slots.update(_parse_budget_slot(text))
     slots.update(_parse_contextual_slot_reply(text, state))
 
     project_name = _extract_project_name(text)
@@ -583,6 +624,7 @@ async def fast_parse_user_turn(state: SalesAgentState) -> Dict[str, Any]:
         deep = await _deep_understand_turn_with_llm(text=text, state=state_for_llm)
         contextual = deep
         slots.update(deep.get("slot_updates") or {})
+    semantic_move = contextual.get("semantic_move") or "other"
 
     intent_result = {
         "intent": contextual.get("intent") or fallback["intent"],
@@ -600,10 +642,12 @@ async def fast_parse_user_turn(state: SalesAgentState) -> Dict[str, Any]:
 
     intent = intent_result["intent"]
     turn_role = contextual.get("turn_role") or fallback["turn_role"]
-    if turn_role == "answer_previous_question" and slots:
-        intent = "other"
     if turn_role == "ask_catalog_overview":
         intent = "ask_recommendation"
+    current_state = state.get("current_sales_state") or "greeting"
+    if current_state == "project_qa" and slots and not (contextual.get("resolved_project_name") or fallback.get("resolved_project_name") or project_name):
+        if intent in {"other", "project_info"}:
+            intent = "follow_up"
     retrieval_goal = contextual.get("retrieval_goal") or fallback["retrieval_goal"]
     should_retrieve = bool(contextual.get("should_retrieve", fallback["should_retrieve"]))
     if retrieval_goal == "shortlist" and intent in {"other", "follow_up"}:
@@ -616,6 +660,25 @@ async def fast_parse_user_turn(state: SalesAgentState) -> Dict[str, Any]:
         intent = "objection"
     if retrieval_goal == "closing_next_step" and intent == "other":
         intent = "buy_signal"
+    if semantic_move == "request_shortlist" and intent in {"other", "follow_up"}:
+        intent = "ask_recommendation"
+        should_retrieve = True
+        if retrieval_goal == "none":
+            retrieval_goal = "shortlist"
+    if semantic_move == "raise_objection" and intent == "other":
+        intent = "objection"
+        if retrieval_goal == "none":
+            retrieval_goal = "objection_support"
+    if semantic_move == "advance_purchase" and intent == "other":
+        intent = "buy_signal"
+        should_retrieve = True
+        if retrieval_goal == "none":
+            retrieval_goal = "closing_next_step"
+    if semantic_move == "answer_slot" and slots and intent in {"other", "project_info"}:
+        intent = "follow_up"
+        if retrieval_goal == "project_qa":
+            retrieval_goal = "none"
+            should_retrieve = False
 
     confidence = _estimate_confidence(
         text=text,
