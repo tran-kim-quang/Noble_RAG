@@ -128,6 +128,7 @@ def build_prompt(state: Dict[str, Any]) -> str:
     response_action: str = state.get("response_action") or ""
     user_text: str = state.get("user_text") or ""
     lead_profile: Dict[str, Any] = state.get("lead_profile") or {}
+    session_context: Dict[str, Any] = state.get("session_context") or {}
     retrieved_context: List[Dict[str, Any]] = state.get("retrieved_context") or []
     missing_slots: List[str] = state.get("missing_slots") or []
 
@@ -154,6 +155,7 @@ def build_prompt(state: Dict[str, Any]) -> str:
     discovery_guidance = _build_discovery_guidance(next_state, lead_profile, missing_slots)
 
     output_rules = _build_output_rules(next_state, has_context)
+    pronoun_rules = _build_pronoun_rules(lead_profile, session_context)
 
     prompt = (
         f"{SYSTEM_PROMPT}\n\n"
@@ -172,10 +174,25 @@ def build_prompt(state: Dict[str, Any]) -> str:
         "- Nếu khách mua để ở mà chưa chốt loại hình, không được tự đẩy sang shophouse.\n"
         "- Không lặp lại cùng một câu hỏi nếu hồ sơ đã có dữ liệu.\n"
         "- Không tự thêm ví dụ địa điểm hoặc dự án nếu các ví dụ đó không có trong hồ sơ khách hoặc ngữ cảnh retrieve.\n"
+        f"{pronoun_rules}\n"
         f"{output_rules}\n\n"
         "Trả lời (theo phong cách sales, tự nhiên, đúng state):"
     )
     return prompt
+
+
+def _build_pronoun_rules(lead_profile: Dict[str, Any], session_context: Dict[str, Any]) -> str:
+    gender = str(
+        lead_profile.get("gender_estimate")
+        or session_context.get("gender_estimate")
+        or "unknown"
+    ).strip().lower()
+
+    if gender == "male":
+        return "- Xưng hô bắt buộc: gọi khách là \"Anh\" và xưng \"em\"."
+    if gender == "female":
+        return "- Xưng hô bắt buộc: gọi khách là \"Chị\" và xưng \"em\"."
+    return "- Xưng hô mặc định: gọi khách là \"Anh/Chị\" và xưng \"em\"."
 
 
 def _build_discovery_guidance(next_state: str, lead_profile: Dict[str, Any], missing_slots: List[str]) -> str:
@@ -236,7 +253,7 @@ def _format_lead_profile(profile: Dict[str, Any]) -> str:
         "family_member_count", "children_count", "purpose", "property_type",
         "budget_text", "budget_min", "budget_max", "location_preference",
         "timeline", "financing_need", "key_concerns",
-        "lead_temperature", "current_state",
+        "lead_temperature", "current_state", "gender_estimate", "age_group_estimate",
     ]
     filtered = {k: v for k, v in profile.items() if k in relevant_keys and v not in (None, [], "khong_ro", "")}
     if not filtered:

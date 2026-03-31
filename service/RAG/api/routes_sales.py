@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from integrations.camera_identity import maybe_enrich_identity_from_camera
 from models.api_models import LeadUpdateRequest, SalesChatRequest, SalesChatResponse
 from memory.chat_history_store import delete_chat_history, load_chat_history
 from memory.lead_profile_store import (
@@ -48,6 +49,7 @@ async def sales_chat(request: SalesChatRequest):
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="message cannot be empty")
     await ensure_sales_schema()
+    await maybe_enrich_identity_from_camera(request.session_id)
 
     initial_state: Dict[str, Any] = {
         "session_id": request.session_id,
@@ -77,6 +79,7 @@ async def sales_chat_stream(request: SalesChatRequest):
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="message cannot be empty")
     await ensure_sales_schema()
+    await maybe_enrich_identity_from_camera(request.session_id)
 
     initial_state: Dict[str, Any] = {
         "session_id": request.session_id,

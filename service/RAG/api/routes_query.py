@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from core.config import get_settings
+from integrations.camera_identity import maybe_enrich_identity_from_camera
 from memory.chat_history_store import load_chat_history
 from rag.retriever import route_query, summarize_search_answer
 from sales.edges import (
@@ -83,7 +84,7 @@ async def _run_sales_flow_streaming(session_id: str, user_text: str):
     if route == "render_response_from_template":
         yield {"chunk": "", "done": False, "phase": "template"}
         state.update(render_response_from_template(state))
-    else:
+    elif route == "retrieve_context":
         yield {"chunk": "", "done": False, "phase": "retrieve"}
         state.update(await retrieve_context(state))
         if route_after_retrieve_context(state) == "fast_ack_response":
@@ -91,6 +92,9 @@ async def _run_sales_flow_streaming(session_id: str, user_text: str):
             ack = (state.get("fast_ack_response") or "").strip()
             if ack:
                 yield {"chunk": ack, "done": False, "phase": "ack"}
+        yield {"chunk": "", "done": False, "phase": "respond"}
+        state.update(await build_response(state))
+    else:
         yield {"chunk": "", "done": False, "phase": "respond"}
         state.update(await build_response(state))
 
@@ -113,6 +117,7 @@ async def query_rag_stream(request: QueryRequest):
         try:
             # UX-first: send an immediate acknowledgment before heavier routing/retrieval.
             yield json.dumps({"chunk": _build_thinking_ack(), "done": False, "phase": "thinking_ack"}, ensure_ascii=False) + "\n"
+            await maybe_enrich_identity_from_camera(session_id)
             history = await load_chat_history(session_id)
             yield json.dumps({"chunk": "", "done": False, "phase": "route"}, ensure_ascii=False) + "\n"
             category, routed_query = await route_query(user_text, history)

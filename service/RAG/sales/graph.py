@@ -66,6 +66,7 @@ builder.add_conditional_edges(
     {
         "render_response_from_template": "render_response_from_template",
         "retrieve_context": "retrieve_context",
+        "build_response": "build_response",
     },
 )
 

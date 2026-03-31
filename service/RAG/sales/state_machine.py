@@ -9,6 +9,8 @@ from typing import Any, Dict, List
 
 def resolve_next_state(state: Dict[str, Any]) -> str:
     intent: str = state.get("detected_intent") or ""
+    turn_role: str = state.get("turn_role") or ""
+    retrieval_goal: str = state.get("retrieval_goal") or "none"
     missing: List[str] = state.get("missing_slots") or []
     extracted_slots: Dict[str, Any] = state.get("extracted_slots") or {}
     buy_signal: bool = bool(state.get("buy_signal", False))
@@ -35,6 +37,16 @@ def resolve_next_state(state: Dict[str, Any]) -> str:
         return "objection_handling"
     if buy_signal or intent == "buy_signal":
         return "closing_next_step"
+    if retrieval_goal == "project_qa":
+        return "project_qa"
+    if retrieval_goal == "comparison":
+        return "comparison"
+    if retrieval_goal == "objection_support":
+        return "objection_handling"
+    if retrieval_goal == "closing_next_step":
+        return "closing_next_step"
+    if retrieval_goal == "shortlist" and not missing:
+        return "product_matching"
     if intent == "follow_up":
         if current_state == "greeting":
             return "need_discovery"
@@ -42,8 +54,11 @@ def resolve_next_state(state: Dict[str, Any]) -> str:
             return "product_matching"
         return current_state
 
-    # Missing required slots → discover
-    if missing:
+    # Missing required slots only force discovery when the user is actually asking for recommendation/discovery.
+    if missing and (
+        intent in {"ask_recommendation", "greeting"}
+        or (current_state == "need_discovery" and turn_role == "answer_previous_question")
+    ):
         return "need_discovery"
 
     if intent == "ask_recommendation":

@@ -36,11 +36,14 @@ def route_after_action_resolution(state: Dict[str, Any]) -> str:
             ResponseAction.ASK_LOCATION,
         }
         and (state.get("detected_intent") or "") in _DISCOVERY_RETRIEVAL_INTENTS
+        and bool(state.get("should_retrieve"))
     ):
         return "retrieve_context"
 
     if action in TEMPLATE_ACTIONS:
         return "render_response_from_template"
+    if not bool(state.get("should_retrieve")):
+        return "build_response"
     return "retrieve_context"
 
 

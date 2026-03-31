@@ -77,6 +77,12 @@ class Settings(BaseSettings):
     rag_service_port: int = 8001
     rag_service_host: str = "0.0.0.0"
     session_export_dir: str = "./exports/sessions"
+    vision_service_url: str = "http://127.0.0.1:8020"
+    vision_identify_url: str = ""
+    camera_auto_trigger: bool = False
+    camera_index: int = 0
+    camera_trigger_timeout_sec: int = 90
+    camera_action_script_path: str = "./action/camera.py"
 
     @model_validator(mode="after")
     def _assemble_derived_fields(self) -> "Settings":
