@@ -25,6 +25,7 @@ from memory.local_snapshot_store import (
     read_local_session_snapshot_text,
 )
 from memory.session_store import delete_session_context, load_session_context
+from rag.retriever import route_query, summarize_search_answer
 from sales.graph import sales_graph
 from sales.session_export import export_session_to_txt
 from utils.text import iter_stream_chunks
@@ -38,6 +39,47 @@ _THINKING_ACK_MESSAGES = [
     "Em đã ghi nhận câu hỏi, Anh/Chị đợi em một lát để em đối chiếu thông tin cho chính xác nhé.",
     "Em nhận được rồi ạ, em đang xử lý nhanh để gửi lại câu trả lời ngắn gọn cho Anh/Chị.",
 ]
+_SEARCH_PERSONA = (
+    "Bạn là trợ lý tư vấn của Noble. "
+    "Với câu hỏi ngoài kho tri thức dự án, hãy trả lời trực tiếp, tự nhiên, ngắn gọn nhưng hữu ích. "
+    "Nếu thông tin phụ thuộc thời gian, hãy ưu tiên dữ liệu vừa tìm được."
+)
+
+
+async def _run_sales_or_search(
+    *,
+    session_id: str,
+    user_text: str,
+    raw_transcript: Optional[str] = None,
+) -> Dict[str, Any]:
+    history = await load_chat_history(session_id)
+    category, routed_query = await route_query(user_text, history)
+
+    if category == "SEARCH":
+        answer = await summarize_search_answer(
+            user_query=user_text,
+            search_query=routed_query or user_text,
+            history=history,
+            system_persona=_SEARCH_PERSONA,
+            max_sentences=4,
+        )
+        return {
+            "route_category": "SEARCH",
+            "final_response": answer,
+            "next_sales_state": None,
+            "lead_profile": await load_lead_profile(session_id),
+            "missing_slots": None,
+        }
+
+    initial_state: Dict[str, Any] = {
+        "session_id": session_id,
+        "user_text": user_text,
+        "raw_transcript": raw_transcript,
+        "errors": [],
+    }
+    result = await sales_graph.ainvoke(initial_state)
+    result["route_category"] = "SALES"
+    return result
 
 
 @router.post("/chat", response_model=SalesChatResponse)
@@ -51,15 +93,12 @@ async def sales_chat(request: SalesChatRequest):
     await ensure_sales_schema()
     await maybe_enrich_identity(request.session_id)
 
-    initial_state: Dict[str, Any] = {
-        "session_id": request.session_id,
-        "user_text": request.message.strip(),
-        "raw_transcript": request.raw_transcript,
-        "errors": [],
-    }
-
     try:
-        result = await sales_graph.ainvoke(initial_state)
+        result = await _run_sales_or_search(
+            session_id=request.session_id,
+            user_text=request.message.strip(),
+            raw_transcript=request.raw_transcript,
+        )
     except Exception as e:
         log.error("sales_graph.ainvoke error: %s", e)
         raise HTTPException(status_code=500, detail=f"Sales agent error: {e}")
@@ -67,6 +106,7 @@ async def sales_chat(request: SalesChatRequest):
     return SalesChatResponse(
         session_id=request.session_id,
         response=result.get("final_response") or "",
+        route_category=result.get("route_category"),
         sales_state=result.get("next_sales_state"),
         lead_profile=result.get("lead_profile"),
         missing_slots=result.get("missing_slots"),
@@ -81,13 +121,6 @@ async def sales_chat_stream(request: SalesChatRequest):
     await ensure_sales_schema()
     await maybe_enrich_identity(request.session_id)
 
-    initial_state: Dict[str, Any] = {
-        "session_id": request.session_id,
-        "user_text": request.message.strip(),
-        "raw_transcript": request.raw_transcript,
-        "errors": [],
-    }
-
     async def generate():
         t_total = time.perf_counter()
         yield json.dumps(
@@ -101,7 +134,13 @@ async def sales_chat_stream(request: SalesChatRequest):
         ) + "\n"
 
         try:
-            task = asyncio.create_task(sales_graph.ainvoke(initial_state))
+            task = asyncio.create_task(
+                _run_sales_or_search(
+                    session_id=request.session_id,
+                    user_text=request.message.strip(),
+                    raw_transcript=request.raw_transcript,
+                )
+            )
             result = await task
         except Exception as e:
             log.error("sales_graph.ainvoke(stream) error: %s", e)
@@ -143,6 +182,7 @@ async def sales_chat_stream(request: SalesChatRequest):
                 "done": True,
                 "phase": "complete",
                 "session_id": request.session_id,
+                "route_category": result.get("route_category"),
                 "sales_state": result.get("next_sales_state"),
                 "missing_slots": result.get("missing_slots"),
                 "lead_profile": result.get("lead_profile"),

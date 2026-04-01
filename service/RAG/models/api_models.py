@@ -60,6 +60,7 @@ class SalesChatRequest(BaseModel):
 class SalesChatResponse(BaseModel):
     session_id: str
     response: str
+    route_category: Optional[str] = None
     sales_state: Optional[str] = None
     lead_profile: Optional[Dict[str, Any]] = None
     missing_slots: Optional[List[str]] = None
