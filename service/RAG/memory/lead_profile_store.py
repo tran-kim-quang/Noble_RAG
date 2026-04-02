@@ -81,6 +81,27 @@ async def ensure_sales_schema() -> None:
                 ON sales.lead_profiles(updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_lead_profiles_data
                 ON sales.lead_profiles USING GIN(profile_data);
+
+            -- Backward-compatible migration:
+            -- Some old deployments created lead_profiles.id without a DEFAULT,
+            -- causing INSERT ... (session_id, profile_data, ...) to fail with
+            -- "null value in column id". Ensure UUID default is always present.
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM pg_proc
+                    WHERE proname = 'uuid_generate_v4'
+                ) THEN
+                    EXECUTE 'ALTER TABLE sales.lead_profiles ALTER COLUMN id SET DEFAULT uuid_generate_v4()';
+                ELSIF EXISTS (
+                    SELECT 1
+                    FROM pg_proc
+                    WHERE proname = 'gen_random_uuid'
+                ) THEN
+                    EXECUTE 'ALTER TABLE sales.lead_profiles ALTER COLUMN id SET DEFAULT gen_random_uuid()';
+                END IF;
+            END $$;
             """
         )
         _schema_ready = True

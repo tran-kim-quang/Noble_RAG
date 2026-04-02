@@ -5,7 +5,7 @@ import json
 import logging
 import random
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -25,7 +25,7 @@ from memory.local_snapshot_store import (
     read_local_session_snapshot_text,
 )
 from memory.session_store import delete_session_context, load_session_context
-from rag.retriever import route_query, summarize_search_answer
+from rag.retriever import decompose_subqueries, route_query, summarize_search_answer
 from sales.graph import sales_graph
 from sales.session_export import export_session_to_txt
 from utils.text import iter_stream_chunks
@@ -46,31 +46,35 @@ _SEARCH_PERSONA = (
 )
 
 
-async def _run_sales_or_search(
+async def _run_search_flow(
+    *,
+    session_id: str,
+    user_text: str,
+    search_query: str,
+    history: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    answer = await summarize_search_answer(
+        user_query=user_text,
+        search_query=search_query or user_text,
+        history=history,
+        system_persona=_SEARCH_PERSONA,
+        max_sentences=4,
+    )
+    return {
+        "route_category": "SEARCH",
+        "final_response": answer,
+        "next_sales_state": None,
+        "lead_profile": await load_lead_profile(session_id),
+        "missing_slots": None,
+    }
+
+
+async def _run_sales_flow(
     *,
     session_id: str,
     user_text: str,
     raw_transcript: Optional[str] = None,
 ) -> Dict[str, Any]:
-    history = await load_chat_history(session_id)
-    category, routed_query = await route_query(user_text, history)
-
-    if category == "SEARCH":
-        answer = await summarize_search_answer(
-            user_query=user_text,
-            search_query=routed_query or user_text,
-            history=history,
-            system_persona=_SEARCH_PERSONA,
-            max_sentences=4,
-        )
-        return {
-            "route_category": "SEARCH",
-            "final_response": answer,
-            "next_sales_state": None,
-            "lead_profile": await load_lead_profile(session_id),
-            "missing_slots": None,
-        }
-
     initial_state: Dict[str, Any] = {
         "session_id": session_id,
         "user_text": user_text,
@@ -80,6 +84,91 @@ async def _run_sales_or_search(
     result = await sales_graph.ainvoke(initial_state)
     result["route_category"] = "SALES"
     return result
+
+
+async def _run_sales_or_search(
+    *,
+    session_id: str,
+    user_text: str,
+    raw_transcript: Optional[str] = None,
+) -> Dict[str, Any]:
+    history = await load_chat_history(session_id)
+    subqueries = await decompose_subqueries(user_text)
+    if len(subqueries) > 1:
+        plans: List[Tuple[int, str, str, Optional[str]]] = []
+        for idx, subquery in enumerate(subqueries, start=1):
+            category, routed_query = await route_query(subquery, history)
+            plans.append((idx, subquery, category, routed_query))
+
+        has_search = any(category == "SEARCH" for _, _, category, _ in plans)
+        has_sales = any(category != "SEARCH" for _, _, category, _ in plans)
+        if has_search and has_sales:
+            log.info("Mixed tool routing: %s", [(idx, category) for idx, _, category, _ in plans])
+            part_answers: Dict[int, str] = {}
+
+            async def _run_search_subquery(
+                idx: int,
+                subquery: str,
+                routed_query: Optional[str],
+            ) -> tuple[int, str]:
+                answer = await summarize_search_answer(
+                    user_query=subquery,
+                    search_query=routed_query or subquery,
+                    history=history,
+                    system_persona=_SEARCH_PERSONA,
+                    max_sentences=3,
+                )
+                return idx, answer
+
+            search_tasks = [
+                asyncio.create_task(_run_search_subquery(idx, subquery, routed_query))
+                for idx, subquery, category, routed_query in plans
+                if category == "SEARCH"
+            ]
+            if search_tasks:
+                for idx, answer in await asyncio.gather(*search_tasks):
+                    part_answers[idx] = (answer or "").strip()
+
+            sales_segments = [subquery for _, subquery, category, _ in plans if category != "SEARCH"]
+            sales_query = " ".join(segment.strip() for segment in sales_segments if segment.strip()).strip()
+            sales_result = await _run_sales_flow(
+                session_id=session_id,
+                user_text=sales_query or user_text,
+                raw_transcript=raw_transcript,
+            )
+            sales_text = (sales_result.get("final_response") or "").strip()
+            if sales_text:
+                first_sales_idx = next(idx for idx, _, category, _ in plans if category != "SEARCH")
+                part_answers[first_sales_idx] = sales_text
+
+            ordered_lines: List[str] = []
+            for idx, _, _, _ in plans:
+                text = (part_answers.get(idx) or "").strip()
+                if text:
+                    ordered_lines.append(f"{idx}) {text}")
+            final_response = "\n\n".join(ordered_lines).strip() or sales_text
+
+            return {
+                "route_category": "MIXED",
+                "final_response": final_response,
+                "next_sales_state": sales_result.get("next_sales_state"),
+                "lead_profile": sales_result.get("lead_profile") or await load_lead_profile(session_id),
+                "missing_slots": sales_result.get("missing_slots"),
+            }
+
+    category, routed_query = await route_query(user_text, history)
+    if category == "SEARCH":
+        return await _run_search_flow(
+            session_id=session_id,
+            user_text=user_text,
+            search_query=routed_query or user_text,
+            history=history,
+        )
+    return await _run_sales_flow(
+        session_id=session_id,
+        user_text=user_text,
+        raw_transcript=raw_transcript,
+    )
 
 
 @router.post("/chat", response_model=SalesChatResponse)

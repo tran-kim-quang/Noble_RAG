@@ -1,11 +1,7 @@
 import logging
-import sys
-from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from api.routes_vision import router as vision_router
 from core.config import get_settings

@@ -70,7 +70,11 @@ Trả về DUY NHẤT JSON:
 {{
   "subqueries": ["...", "..."]
 }}
-Quy tắc: Nếu 1 ý → mảng 1 phần tử. Nếu nhiều ý → tách thành các câu độc lập. Không bỏ sót ý.
+Quy tắc:
+- Nếu 1 ý → mảng 1 phần tử.
+- Nếu nhiều ý → tách thành các câu độc lập, ngắn gọn nhưng đủ nghĩa.
+- Giữ đúng THỨ TỰ ý như câu gốc.
+- Không bỏ sót ý, không thêm ý mới.
 Câu hỏi gốc: "{query}"""
     try:
         response = await llm_model_func(
@@ -81,7 +85,17 @@ Câu hỏi gốc: "{query}"""
             return [query]
         data = json.loads(payload)
         items = data.get("subqueries", [])
-        cleaned = list({str(i).strip() for i in items if str(i).strip()})
+        cleaned: List[str] = []
+        seen: set[str] = set()
+        for item in items:
+            text = str(item).strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(text)
         return cleaned if cleaned else [query]
     except Exception as e:
         log.error("Subquery decomposition failed: %s", e)
@@ -124,7 +138,8 @@ Phân tích câu hỏi và trả về JSON:
   "needs_external_realtime": true|false
 }}
 - RAG: câu hỏi về dự án Noble, sản phẩm, chính sách, pháp lý.
-- SEARCH: thời tiết hiện tại, lãi suất mới nhất, thị trường bên ngoài.
+- SEARCH: thông tin phụ thuộc thời gian hoặc nguồn bên ngoài như:
+  giờ hiện tại, ngày tháng hiện tại, thời tiết hiện tại, lãi suất mới nhất, thị trường bên ngoài.
 - OTHER: chào hỏi xã giao hoặc ngoài phạm vi.
 Câu hỏi: "{query}"
 CHỈ TRẢ VỀ JSON."""
