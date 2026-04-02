@@ -68,17 +68,3 @@ class SalesChatResponse(BaseModel):
 
 class LeadUpdateRequest(BaseModel):
     updates: Dict[str, Any]
-
-
-class WatcherSessionPushRequest(BaseModel):
-    session_id: str
-    enabled: bool = True
-    watcher_url: Optional[str] = None
-
-
-class WatcherSessionPushResponse(BaseModel):
-    ok: bool
-    watcher_url: str
-    session_id: str
-    enabled: bool
-    watcher_response: Dict[str, Any]

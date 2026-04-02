@@ -4,7 +4,7 @@
 
 Bổ sung chức năng **vision-based customer identification** cho hệ thống Noble RAG để:
 
-1. Nhận ảnh khách hàng từ camera ở bước chụp ảnh.
+1. Nhận keyframe ảnh khách hàng từ browser/mobile ở bước chụp ảnh.
 2. Trích xuất face embedding và đối sánh với khách đã tồn tại.
 3. Nếu khách đã tồn tại:
    - lấy `customer_id`
@@ -465,8 +465,8 @@ TTL gợi ý:
 ## Tích hợp với UI / camera flow
 
 ## Luồng frontend đề xuất
-1. UI mở camera
-2. user chụp ảnh
+1. UI browser/mobile mở camera
+2. user chụp một keyframe
 3. gửi ảnh tới `POST /vision/identify`
 4. backend trả về:
    - `customer_id`

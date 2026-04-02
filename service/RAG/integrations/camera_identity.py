@@ -1,8 +1,5 @@
-import asyncio
-import json
 import logging
 import time
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
@@ -15,23 +12,6 @@ from memory.lead_profile_store import load_lead_profile, save_lead_profile
 from memory.session_store import load_session_context, save_session_context
 
 log = logging.getLogger("rag-service")
-
-
-def _resolve_camera_script_path(raw_path: str) -> str:
-    path = Path(raw_path)
-    if path.is_absolute():
-        return str(path)
-    repo_root = Path(__file__).resolve().parents[3]
-    return str((repo_root / raw_path).resolve())
-
-
-def _resolve_identify_url() -> str:
-    settings = get_settings()
-    if settings.vision_identify_url:
-        return settings.vision_identify_url
-    return settings.vision_service_url.rstrip("/") + "/vision/identify"
-
-
 def _resolve_session_lookup_url(session_id: str) -> str:
     base = get_settings().vision_service_url.rstrip("/")
     return f"{base}/vision/session/{quote(session_id.strip(), safe='')}"
@@ -276,67 +256,5 @@ async def maybe_enrich_identity_from_vision_session(session_id: str) -> Optional
     return await _apply_identity_payload(session_id, payload)
 
 
-async def maybe_enrich_identity_from_camera(session_id: str) -> Optional[Dict[str, Any]]:
-    settings = get_settings()
-    if not settings.camera_auto_trigger:
-        return None
-
-    script_path = _resolve_camera_script_path(settings.camera_action_script_path)
-    identify_url = _resolve_identify_url()
-    cmd = [
-        "python3",
-        script_path,
-        "--session-id",
-        session_id,
-        "--camera-index",
-        str(settings.camera_index),
-        "--identify-url",
-        identify_url,
-    ]
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=settings.camera_trigger_timeout_sec,
-        )
-    except asyncio.TimeoutError:
-        log.warning("camera trigger timeout session=%s", session_id)
-        return None
-    except Exception as e:
-        log.warning("camera trigger failed session=%s err=%s", session_id, e)
-        return None
-
-    if proc.returncode != 0:
-        err = (stderr_b or b"").decode("utf-8", errors="ignore").strip()
-        log.warning(
-            "camera script returned non-zero session=%s code=%s err=%s",
-            session_id,
-            proc.returncode,
-            err[:300],
-        )
-        return None
-
-    raw = (stdout_b or b"").decode("utf-8", errors="ignore").strip()
-    if not raw:
-        return None
-
-    try:
-        payload = json.loads(raw)
-    except Exception:
-        log.warning("camera script output is not valid JSON session=%s", session_id)
-        return None
-
-    payload["identity_source"] = "camera"
-    return await _apply_identity_payload(session_id, payload)
-
-
 async def maybe_enrich_identity(session_id: str) -> Optional[Dict[str, Any]]:
-    payload = await maybe_enrich_identity_from_vision_session(session_id)
-    if payload:
-        return payload
-    return await maybe_enrich_identity_from_camera(session_id)
+    return await maybe_enrich_identity_from_vision_session(session_id)

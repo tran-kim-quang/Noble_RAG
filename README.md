@@ -1,5 +1,11 @@
 ## Noble RAG
 
+### Tài liệu nên đọc trước
+
+- [System Usage Guide](./docs/SYSTEM_USAGE_GUIDE.md): hướng dẫn endpoint, payload, URL, và workflow tích hợp toàn hệ thống
+- [Project Overview](./docs/PROJECT_OVERVIEW.md): tổng quan kiến trúc và module
+- [Vision Guide](./service/vision/guide.md): chi tiết luồng vision identity
+
 ### Cài đặt và chạy
 
 ```bash
@@ -25,4 +31,3 @@ Biến môi trường tùy chọn:
 - `RAG_SERVICE_URL` (mặc định: `http://localhost:8000`)
 - `WEB_UI_HOST` (mặc định: `0.0.0.0`)
 - `WEB_UI_PORT` (mặc định: `8501`)
-
