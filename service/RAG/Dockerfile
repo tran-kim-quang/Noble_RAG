@@ -15,7 +15,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy toàn bộ package service/RAG vào /app
 # (tất cả subpackage: api, core, sales, memory, models, utils, rag, tools, llm, storage)
 COPY service/RAG/ /app/
-COPY action/ /app/action/
 COPY common/ /app/common/
 
 # Copy scripts nếu cần (init SQL, utilities)
