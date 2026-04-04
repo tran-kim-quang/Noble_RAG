@@ -1,26 +1,23 @@
-"""
-Singletons: LightRAG instance, llm_model_func, embedding_func.
-Initialised once at import time so all modules share the same objects.
+"""Singleton dependencies for RAG service.
+
+This module now boots a Haystack-based adapter (instead of LightRAG).
 """
 
-import asyncio
+from __future__ import annotations
+
+import logging as _logging
 import os
-import time
-from functools import partial
-from urllib.parse import urlparse
+from typing import Any, List
 
-from lightrag import LightRAG
-from lightrag.llm.openai import (
-    openai_complete_if_cache,
-    openai_embed,
-    wrap_embedding_func_with_attrs,
-)
+import httpx
+import numpy as np
+from openai import AsyncOpenAI
 
 from core.config import get_settings
+from rag.haystack_adapter import HaystackRAGAdapter, HaystackRAGSettings
 
 settings = get_settings()
 
-import logging as _logging
 _logging.basicConfig(
     level=getattr(_logging, settings.log_level.upper(), _logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -28,214 +25,125 @@ _logging.basicConfig(
 log = _logging.getLogger("rag-service")
 
 
-# ── Map compose-style URLs to LightRAG backend env vars ──────────────────
-def _configure_storage_env() -> None:
-    parsed_pg = urlparse(settings.postgres_url)
-    if parsed_pg.scheme.startswith("postgres"):
-        if parsed_pg.hostname and not os.getenv("POSTGRES_HOST"):
-            os.environ["POSTGRES_HOST"] = parsed_pg.hostname
-        if parsed_pg.port and not os.getenv("POSTGRES_PORT"):
-            os.environ["POSTGRES_PORT"] = str(parsed_pg.port)
-        if parsed_pg.username and not os.getenv("POSTGRES_USER"):
-            os.environ["POSTGRES_USER"] = parsed_pg.username
-        if parsed_pg.password and not os.getenv("POSTGRES_PASSWORD"):
-            os.environ["POSTGRES_PASSWORD"] = parsed_pg.password
-        db_name = parsed_pg.path.lstrip("/")
-        if db_name and not os.getenv("POSTGRES_DATABASE"):
-            os.environ["POSTGRES_DATABASE"] = db_name
-
-    if settings.qdrant_url and not os.getenv("QDRANT_URL"):
-        os.environ["QDRANT_URL"] = settings.qdrant_url
-    if settings.redis_url and not os.getenv("REDIS_URI"):
-        os.environ["REDIS_URI"] = settings.redis_url
+def _openai_client(base_url: str | None = None) -> AsyncOpenAI:
+    return AsyncOpenAI(
+        api_key=settings.llm_api_key or os.getenv("OPENAI_API_KEY", ""),
+        base_url=base_url or settings.llm_api_url or None,
+    )
 
 
-# ── LLM factory ──────────────────────────────────────────────────────────
-def _init_llm():
-    provider = settings.llm_provider.lower()
-    log.info("Initialising LLM provider='%s' model='%s'", provider, settings.llm_model)
+async def llm_model_func(
+    prompt: str,
+    system_prompt: str | None = None,
+    history_messages: list[dict[str, Any]] | None = None,
+    **kwargs: Any,
+) -> str:
+    history = history_messages or []
+    response_format = kwargs.pop("response_format", None)
+    kwargs.pop("keyword_extraction", None)
+    kwargs.pop("enable_cot", None)
+    provider = settings.llm_provider.lower().strip()
 
-    if provider in {"openai", "deepseek"}:
-        async def llm_func(prompt, system_prompt=None, history_messages=None, **kwargs):
-            if history_messages is None:
-                history_messages = []
-            force_json = False
-            if kwargs.get("keyword_extraction"):
-                kwargs["keyword_extraction"] = False
-                force_json = True
-            if "response_format" in kwargs:
-                rf = kwargs["response_format"]
-                if not isinstance(rf, dict) or rf.get("type") != "json_object":
-                    force_json = True
-            if force_json:
-                kwargs["response_format"] = {"type": "json_object"}
-                prompt += "\n\nIMPORTANT: Return strictly a valid JSON object. No additional text."
-
-            cot = kwargs.pop("enable_cot", True)
-            result = await openai_complete_if_cache(
-                settings.llm_model,
-                prompt,
-                system_prompt=system_prompt,
-                history_messages=history_messages,
-                api_key=settings.llm_api_key,
-                base_url=settings.llm_api_url or None,
-                enable_cot=cot,
-                **kwargs,
-            )
-            if result is None:
-                log.error("LLM returned None for model=%s", settings.llm_model)
-                return ""
-            return result
-
-        return llm_func
+    messages: List[dict[str, str]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    for item in history[-8:]:
+        role = str(item.get("role") or "user")
+        content = str(item.get("content") or "").strip()
+        if content:
+            if role not in {"system", "user", "assistant"}:
+                role = "user"
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": prompt})
 
     if provider == "ollama":
-        from lightrag.llm.ollama import ollama_model_complete
-        return partial(
-            ollama_model_complete,
-            model=settings.llm_model,
-            host=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
-        )
-
-    if provider == "gemini":
-        from lightrag.llm.gemini import gemini_model_complete
-
-        async def llm_func(prompt, system_prompt=None, history_messages=None, **kwargs):
-            if history_messages is None:
-                history_messages = []
-            force_json = False
-            if kwargs.get("keyword_extraction"):
-                kwargs["keyword_extraction"] = False
-                force_json = True
-            if "response_format" in kwargs:
-                rf = kwargs["response_format"]
-                if not isinstance(rf, dict) or rf.get("type") != "json_object":
-                    force_json = True
-            if force_json:
-                kwargs["response_format"] = {"type": "json_object"}
-                prompt += "\n\nIMPORTANT: Return strictly a valid JSON object. No additional text."
-
-            result = None
-            last_error = None
-            for attempt in range(3):
-                try:
-                    result = await gemini_model_complete(
-                        prompt,
-                        system_prompt=system_prompt,
-                        history_messages=history_messages,
-                        api_key=settings.llm_api_key,
-                        model_name=settings.llm_model,
-                        **kwargs,
-                    )
-                    break
-                except Exception as e:
-                    last_error = e
-                    if "429" not in str(e) or attempt == 2:
-                        raise
-                    wait_sec = float(attempt + 1)
-                    log.warning(
-                        "Gemini rate limited for model=%s; retrying in %.1fs (attempt %d/3)",
-                        settings.llm_model,
-                        wait_sec,
-                        attempt + 1,
-                    )
-                    await asyncio.sleep(wait_sec)
-            if result is None:
-                if last_error is not None:
-                    log.error("LLM failed for model=%s error=%s", settings.llm_model, last_error)
-                log.error("LLM returned None for model=%s", settings.llm_model)
-                return ""
-            return result
-
-        return llm_func
-
-    raise ValueError(
-        f"Unsupported LLM provider: {provider}. Use 'deepseek', 'openai', 'ollama', or 'gemini'."
-    )
-
-
-# ── Embedding factory ─────────────────────────────────────────────────────
-def _init_embedding():
-    embed_provider = (settings.embedding_provider or settings.llm_provider).lower()
-    log.info(
-        "Initialising embedding provider='%s' model='%s'",
-        embed_provider,
-        settings.embedding_model,
-    )
-
-    if embed_provider == "ollama":
-        from lightrag.llm.ollama import ollama_embed
-
-        @wrap_embedding_func_with_attrs(
-            embedding_dim=settings.embedding_dim,
-            max_token_size=settings.max_token_size,
-            model_name=settings.embedding_model,
-        )
-        async def embedding_func(texts: list[str]):
-            import numpy as np
-            batch_size = max(1, settings.embedding_batch_size)
-            if len(texts) <= batch_size:
-                return await ollama_embed.func(
-                    texts,
-                    embed_model=settings.embedding_model,
-                    host=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
-                    api_key=os.getenv("OLLAMA_API_KEY") or None,
+        ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(
+                    f"{ollama_host}/api/chat",
+                    json={
+                        "model": settings.llm_model,
+                        "messages": messages,
+                        "stream": False,
+                    },
                 )
-            vectors = []
-            for start in range(0, len(texts), batch_size):
-                batch = texts[start: start + batch_size]
-                batch_vectors = await ollama_embed.func(
-                    batch,
-                    embed_model=settings.embedding_model,
-                    host=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
-                    api_key=os.getenv("OLLAMA_API_KEY") or None,
-                )
-                vectors.append(batch_vectors)
-            return np.concatenate(vectors, axis=0)
+            resp.raise_for_status()
+            payload = resp.json()
+            return str((payload.get("message") or {}).get("content") or "")
+        except Exception as e:
+            log.error("Ollama LLM request failed: %s", e)
+            return ""
 
-        return embedding_func
+    payload: dict[str, Any] = {
+        "model": settings.llm_model,
+        "messages": messages,
+        "temperature": kwargs.pop("temperature", 0.2),
+    }
+    if isinstance(response_format, dict) and response_format.get("type") == "json_object":
+        payload["response_format"] = {"type": "json_object"}
 
-    if embed_provider == "openai":
-        @wrap_embedding_func_with_attrs(
-            embedding_dim=settings.embedding_dim,
-            max_token_size=settings.max_token_size,
-            model_name=settings.embedding_model,
-        )
-        async def embedding_func(texts: list[str]):
-            return await openai_embed.func(
-                texts,
-                model=settings.embedding_model,
-                api_key=settings.llm_api_key,
-                base_url=settings.llm_api_url or None,
+    client = _openai_client()
+    try:
+        resp = await client.chat.completions.create(**payload)
+    except Exception as e:
+        log.error("LLM request failed: %s", e)
+        return ""
+    if not resp.choices:
+        return ""
+    return str(resp.choices[0].message.content or "")
+
+
+async def _embed_with_openai(texts: List[str]) -> np.ndarray:
+    client = _openai_client()
+    resp = await client.embeddings.create(
+        model=settings.embedding_model,
+        input=texts,
+    )
+    vectors = [item.embedding for item in resp.data]
+    return np.array(vectors, dtype=np.float32)
+
+
+async def _embed_with_ollama(texts: List[str]) -> np.ndarray:
+    host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    model = settings.embedding_model
+    vectors: List[List[float]] = []
+
+    async with httpx.AsyncClient(timeout=max(30.0, float(settings.embedding_timeout))) as client:
+        for text in texts:
+            # `/api/embeddings` works across Ollama versions.
+            response = await client.post(
+                f"{host}/api/embeddings",
+                json={"model": model, "prompt": text},
             )
+            response.raise_for_status()
+            data = response.json()
+            vec = data.get("embedding") or []
+            vectors.append([float(v) for v in vec])
+    return np.array(vectors, dtype=np.float32)
 
-        return embedding_func
 
-    raise ValueError(f"Unsupported embedding provider: {embed_provider}.")
+async def embedding_func(texts: List[str]) -> np.ndarray:
+    provider = (settings.embedding_provider or settings.llm_provider).lower()
+    if provider == "ollama":
+        return await _embed_with_ollama(texts)
+    try:
+        return await _embed_with_openai(texts)
+    except Exception as e:
+        log.warning("OpenAI-compatible embedding failed (%s), fallback to ollama if available", e)
+        return await _embed_with_ollama(texts)
 
 
-# ── Bootstrap ──────────────────────────────────────────────────────────────
-log.info("Bootstrapping RAG service components...")
-_t0 = time.perf_counter()
-
-_configure_storage_env()
-llm_model_func = _init_llm()
-embedding_func = _init_embedding()
-
-rag = LightRAG(
-    working_dir=settings.rag_working_dir,
-    kv_storage=settings.kv_storage,
-    vector_storage=settings.vector_storage,
-    graph_storage=settings.graph_storage,
-    doc_status_storage=settings.doc_status_storage,
-    workspace=settings.rag_workspace,
+rag = HaystackRAGAdapter(
+    settings=HaystackRAGSettings(
+        postgres_url=settings.postgres_url,
+        qdrant_url=settings.qdrant_url,
+        collection_name=settings.knowledge_collection_name,
+        workspace=settings.rag_workspace,
+        embedding_dim=settings.embedding_dim,
+        chunk_size=settings.chunk_size,
+        chunk_overlap=settings.chunk_overlap,
+    ),
     llm_model_func=llm_model_func,
-    llm_model_name=settings.llm_model,
     embedding_func=embedding_func,
-    embedding_func_max_async=settings.embedding_func_max_async,
-    default_embedding_timeout=settings.embedding_timeout,
-    chunk_token_size=settings.chunk_size,
-    chunk_overlap_token_size=settings.chunk_overlap,
 )
-
-log.info("RAG components bootstrapped in %.2fs", time.perf_counter() - _t0)

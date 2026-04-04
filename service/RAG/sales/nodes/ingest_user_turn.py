@@ -7,6 +7,7 @@ from sales.graph_state import SalesAgentState
 from memory.chat_history_store import load_chat_history
 from memory.lead_profile_store import load_lead_profile
 from memory.session_store import load_session_context
+from memory.session_context_service import normalize_customer_profile
 
 log = logging.getLogger("rag-service")
 
@@ -26,6 +27,24 @@ async def ingest_user_turn(state: SalesAgentState) -> Dict[str, Any]:
             "current_script_step": "S1_opening",
             "lead_temperature": "cold",
         }
+        context_json = session_context.get("context_json") or {}
+        profile_from_context = context_json.get("customer_profile") or {}
+        normalized = normalize_customer_profile(profile_from_context)
+        if normalized:
+            lead_profile.update(
+                {
+                    "sales_stage": normalized.get("sales_stage"),
+                    "family_member_count": normalized.get("family_size"),
+                    "children_count": normalized.get("children_count"),
+                    "purpose": normalized.get("purpose"),
+                    "location_preference": normalized.get("location_preference"),
+                    "budget_min": normalized.get("budget_min"),
+                    "budget_max": normalized.get("budget_max"),
+                    "budget_text": normalized.get("budget_text"),
+                    "project_interest": normalized.get("project_interest"),
+                    "interest_summary": normalized.get("interest_summary"),
+                }
+            )
 
     log.info(
         "ingest_user_turn session=%s history_len=%d lead_state=%s",

@@ -1,6 +1,6 @@
 from enum import Enum
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class StorageType(str, Enum):
@@ -21,6 +21,13 @@ class UploadDocumentResponse(BaseModel):
     chunks_count: int
     storage_type: str
     message: str
+
+
+class KnowledgeIngestResponse(BaseModel):
+    document_id: str
+    status: str
+    chunks_created: int
+    collection: str
 
 
 class DocumentRecord(BaseModel):
@@ -68,3 +75,27 @@ class SalesChatResponse(BaseModel):
 
 class LeadUpdateRequest(BaseModel):
     updates: Dict[str, Any]
+
+
+class VisionIdentifyAndContextResponse(BaseModel):
+    matched: bool
+    customer_id: str
+    session_id: str
+    vision_context_saved: bool
+    vision_summary: Dict[str, Any]
+
+
+class SalesChatV1Request(BaseModel):
+    session_id: str
+    customer_id: str
+    message: str
+    channel: Optional[str] = None
+    stream: bool = False
+
+
+class SalesChatV1Response(BaseModel):
+    response: str
+    intent: Optional[str] = None
+    sales_stage: Optional[str] = None
+    missing_slots: List[str] = Field(default_factory=list)
+    context_used: bool = True

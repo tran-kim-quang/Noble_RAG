@@ -14,9 +14,12 @@ class VisionIdentifyResponse(BaseModel):
     session_id: str
     customer_id: str
     is_existing_customer: bool
+    matched: bool = False
+    decision: str = "unknown"
     gender_estimate: str = "unknown"
     age_group_estimate: str = "unknown"
     match_score: Optional[float] = None
+    vision_summary: Dict[str, Any] = Field(default_factory=dict)
     customer_context: VisionCustomerContext
 
 
@@ -39,3 +42,22 @@ class VisionCustomerResponse(BaseModel):
     last_seen_at: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
     customer_context: VisionCustomerContext
+
+
+class VisionEnrollResponse(BaseModel):
+    customer_id: str
+    face_detected: bool
+    face_count: int
+    best_face_saved: bool
+    embedding_saved: bool
+    image_asset_id: str
+    face_embedding_id: str
+
+
+class VisionIdentifyAndContextResponse(BaseModel):
+    matched: bool
+    customer_id: str
+    session_id: str
+    vision_context_saved: bool
+    vision_summary: Dict[str, Any] = Field(default_factory=dict)
+    match_score: Optional[float] = None

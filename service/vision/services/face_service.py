@@ -61,6 +61,59 @@ class FaceService:
             age_group_estimate=self._normalize_age_group(analysis.get("age_group_estimate")),
         )
 
+    async def extract_vision_summary(self, image_bytes: bytes) -> Dict[str, Any]:
+        default_summary = {
+            "age_range": "unknown",
+            "gender_guess": "unknown",
+            "emotion": "unknown",
+            "dress_style": "unknown",
+            "visible_attributes": [],
+            "scene_context": "unknown",
+        }
+        if not self.settings.vision_base_url or not self.settings.vision_api_key:
+            return default_summary
+
+        data_uri = self._to_data_uri(image_bytes)
+        prompt = (
+            "Bạn là service vision understand cho hội thoại sales.\n"
+            "Chỉ trả về JSON hợp lệ với đúng các key:\n"
+            "age_range (string), gender_guess (male|female|unknown), emotion (string),\n"
+            "dress_style (string), visible_attributes (array string), scene_context (string).\n"
+            "Không markdown, không giải thích thêm."
+        )
+        payload = {
+            "model": self.settings.vision_model_name,
+            "max_tokens": self.settings.vision_max_tokens,
+            "temperature": 0,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": data_uri}},
+                    ],
+                }
+            ],
+        }
+        headers = {
+            "Authorization": f"Bearer {self.settings.vision_api_key}",
+            "Content-Type": "application/json",
+        }
+        url = self.settings.vision_base_url.rstrip("/") + "/chat/completions"
+        try:
+            async with httpx.AsyncClient(timeout=40.0) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            content = (
+                resp.json()
+                .get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
+            return self._parse_vision_summary(content, default_summary)
+        except Exception:
+            return default_summary
+
     async def _analyze_face_with_vision_model(self, image_bytes: bytes) -> Dict[str, Any]:
         if not self.settings.vision_base_url or not self.settings.vision_api_key:
             return {
@@ -145,6 +198,30 @@ class FaceService:
         if v in {"young", "middle_aged", "elderly", "unknown"}:
             return v
         return "unknown"
+
+    def _parse_vision_summary(self, content: str, default_summary: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            raw = content.strip()
+            if raw.startswith("```"):
+                raw = raw.strip("`")
+                if "\n" in raw:
+                    raw = raw.split("\n", 1)[1]
+            if "{" in raw and "}" in raw:
+                raw = raw[raw.find("{") : raw.rfind("}") + 1]
+            data = json.loads(raw)
+            attrs = data.get("visible_attributes")
+            if not isinstance(attrs, list):
+                attrs = []
+            return {
+                "age_range": str(data.get("age_range") or default_summary["age_range"]),
+                "gender_guess": self._normalize_gender(data.get("gender_guess")),
+                "emotion": str(data.get("emotion") or default_summary["emotion"]),
+                "dress_style": str(data.get("dress_style") or default_summary["dress_style"]),
+                "visible_attributes": [str(item).strip() for item in attrs if str(item).strip()],
+                "scene_context": str(data.get("scene_context") or default_summary["scene_context"]),
+            }
+        except Exception:
+            return default_summary
 
     def _to_data_uri(self, image_bytes: bytes) -> str:
         encoded = base64.b64encode(image_bytes).decode("ascii")

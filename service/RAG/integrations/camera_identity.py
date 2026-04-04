@@ -9,6 +9,7 @@ import httpx
 from core.config import get_settings
 from memory.chat_history_store import delete_chat_history, load_chat_history, save_chat_history
 from memory.lead_profile_store import load_lead_profile, save_lead_profile
+from memory.session_context_service import normalize_customer_profile
 from memory.session_store import load_session_context, save_session_context
 
 log = logging.getLogger("rag-service")
@@ -205,6 +206,21 @@ async def _apply_identity_payload(session_id: str, payload: Dict[str, Any]) -> D
     if isinstance(purchase_history, list):
         session_context["customer_purchase_history"] = purchase_history
     session_context["identity_customer_hydrated"] = True
+
+    context_json = dict(session_context.get("context_json") or {})
+    customer_profile = dict(context_json.get("customer_profile") or {})
+    customer_profile.update(normalize_customer_profile(lead_profile))
+    if customer_profile:
+        context_json["customer_profile"] = customer_profile
+    vision_context = dict(context_json.get("vision_context") or {})
+    if session_context.get("gender_estimate"):
+        vision_context.setdefault("gender_guess", session_context.get("gender_estimate"))
+    if session_context.get("age_group_estimate"):
+        vision_context.setdefault("age_range", session_context.get("age_group_estimate"))
+    if vision_context:
+        context_json["vision_context"] = vision_context
+        session_context["context_ready"] = True
+    session_context["context_json"] = context_json
 
     await save_session_context(session_id, session_context)
     await save_lead_profile(session_id, lead_profile)

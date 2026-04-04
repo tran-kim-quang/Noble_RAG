@@ -44,11 +44,8 @@ class Settings(BaseSettings):
     redis_password: Optional[str] = None
     redis_session_ttl: int = 86400
 
-    # LightRAG storage backends
-    kv_storage: str = "PGKVStorage"
-    vector_storage: str = "QdrantVectorDBStorage"
-    graph_storage: str = "PGGraphStorage"
-    doc_status_storage: str = "PGDocStatusStorage"
+    # Haystack / retrieval storage
+    knowledge_collection_name: str = "knowledge_chunks"
     rag_workspace: str = "default"
     rag_working_dir: str = "./rag_db"
 

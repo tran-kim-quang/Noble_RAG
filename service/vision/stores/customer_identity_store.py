@@ -147,25 +147,29 @@ class CustomerIdentityStore:
         embedding_model: str,
         quality_score: Optional[float] = None,
         metadata: Optional[Dict[str, Any]] = None,
-    ) -> None:
+        is_primary: bool = False,
+    ) -> str:
         await self.ensure_customer_schema()
+        embedding_id = str(uuid.uuid4())
         conn = await asyncpg.connect(_postgres_url())
         try:
             await conn.execute(
                 """
                 INSERT INTO customer.customer_faces (
                     id, customer_id, embedding, embedding_model, quality_score, is_primary, metadata, updated_at
-                ) VALUES ($1::uuid, $2::uuid, $3::jsonb, $4, $5, true, $6::jsonb, NOW())
+                ) VALUES ($1::uuid, $2::uuid, $3::jsonb, $4, $5, $6, $7::jsonb, NOW())
                 """,
-                str(uuid.uuid4()),
+                embedding_id,
                 customer_id,
                 json.dumps(embedding, ensure_ascii=False),
                 embedding_model,
                 quality_score,
+                bool(is_primary),
                 json.dumps(metadata or {}, ensure_ascii=False),
             )
         finally:
             await conn.close()
+        return embedding_id
 
     async def find_best_match(self, embedding: List[float]) -> Optional[FaceMatch]:
         await self.ensure_customer_schema()

@@ -9,8 +9,6 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
-from lightrag import QueryParam
-
 from core.dependencies import rag, llm_model_func
 from core.config import get_settings
 from utils.json_extract import extract_first_json_object
@@ -47,9 +45,8 @@ async def kb_evidence_probe(
         probe_response = await asyncio.wait_for(
             rag.aquery(
                 probe_query,
-                param=QueryParam(
-                    top_k=2, mode="naive", conversation_history=history[-2:]
-                ),
+                top_k=2,
+                conversation_history=history[-2:],
             ),
             timeout=min(settings.query_timeout_sec, 20),
         )
@@ -231,9 +228,8 @@ async def query_rag(
         response = await asyncio.wait_for(
             rag.aquery(
                 full_query,
-                param=QueryParam(
-                    top_k=top_k, mode="naive", conversation_history=history
-                ),
+                top_k=top_k,
+                conversation_history=history,
             ),
             timeout=settings.query_timeout_sec,
         )

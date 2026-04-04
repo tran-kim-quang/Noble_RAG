@@ -1,7 +1,6 @@
 import json
 import time
 from typing import Optional
-from urllib.parse import urlparse
 
 import asyncpg
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -68,21 +67,13 @@ async def list_documents(limit: int = 50):
     if limit < 1 or limit > 500:
         raise HTTPException(status_code=400, detail="limit must be 1-500")
 
-    parsed = urlparse(settings.postgres_url)
-    db_name = parsed.path.lstrip("/") or "noble_rag"
     try:
-        conn = await asyncpg.connect(
-            host=parsed.hostname,
-            port=parsed.port or 5432,
-            user=parsed.username,
-            password=parsed.password,
-            database=db_name,
-        )
+        conn = await asyncpg.connect(settings.postgres_url)
         rows = await conn.fetch(
             """
             SELECT id, status, file_path, content_length, chunks_count,
                    created_at, updated_at, metadata
-            FROM lightrag_doc_status
+            FROM sales.haystack_documents
             WHERE workspace = $1
             ORDER BY updated_at DESC NULLS LAST
             LIMIT $2
@@ -120,20 +111,12 @@ async def list_documents(limit: int = 50):
 
 @router.get("/documents/track/{track_id}")
 async def get_track_status(track_id: str):
-    parsed = urlparse(settings.postgres_url)
-    db_name = parsed.path.lstrip("/") or "noble_rag"
     try:
-        conn = await asyncpg.connect(
-            host=parsed.hostname,
-            port=parsed.port or 5432,
-            user=parsed.username,
-            password=parsed.password,
-            database=db_name,
-        )
+        conn = await asyncpg.connect(settings.postgres_url)
         rows = await conn.fetch(
             """
             SELECT status, COUNT(*) AS count
-            FROM lightrag_doc_status
+            FROM sales.haystack_documents
             WHERE workspace = $1 AND track_id = $2
             GROUP BY status
             """,

@@ -1,14 +1,15 @@
-"""
-LightRAG LLM Module
-Provides convenient access to LLM provider selection for LightRAG
-"""
+"""LLM helper module for Haystack-based RAG runtime."""
 
 from .choose_llm import (
-    LightRAGLLMSelector,
-    create_lightrag_with_provider
+    HaystackLLMSelector,
+    LightRAGLLMSelector,  # backward-compat alias
+    create_haystack_selector_with_provider,
+    create_lightrag_with_provider,  # legacy symbol
 )
 
 __all__ = [
-    'LightRAGLLMSelector',
-    'create_lightrag_with_provider'
+    "HaystackLLMSelector",
+    "LightRAGLLMSelector",
+    "create_haystack_selector_with_provider",
+    "create_lightrag_with_provider",
 ]

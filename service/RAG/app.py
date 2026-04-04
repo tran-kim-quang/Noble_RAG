@@ -27,8 +27,10 @@ from core.logging import setup_logging, get_logger
 from memory.lead_profile_store import ensure_sales_schema
 from api.routes_health import router as health_router
 from api.routes_documents import router as documents_router
+from api.routes_pipeline_v1 import router as pipeline_v1_router
 from api.routes_query import router as query_router
 from api.routes_sales import router as sales_router
+from memory.pipeline_store import ensure_pipeline_schema
 from sales.nodes.retrieve_context import warm_retrieval_caches
 
 setup_logging()
@@ -37,7 +39,7 @@ settings = get_settings()
 
 app = FastAPI(
     title="Noble RAG + Sales Agent API",
-    description="LightRAG-powered retrieval + LangGraph AI Sales Agent for Noble real estate.",
+    description="Haystack-powered retrieval + LangGraph AI Sales Agent for Noble real estate.",
     version="2.0.0",
 )
 
@@ -46,9 +48,10 @@ app = FastAPI(
 async def startup_event():
     await rag.initialize_storages()
     await ensure_sales_schema()
+    await ensure_pipeline_schema()
     import asyncio
     asyncio.create_task(warm_retrieval_caches())
-    log.info("LightRAG storages initialised.")
+    log.info("Haystack storages initialised.")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -59,6 +62,7 @@ app.include_router(health_router)
 app.include_router(documents_router)
 app.include_router(query_router)
 app.include_router(sales_router)
+app.include_router(pipeline_v1_router)
 
 
 if __name__ == "__main__":

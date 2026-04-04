@@ -9,6 +9,7 @@ from memory.chat_history_store import save_chat_history
 from memory.lead_profile_store import save_lead_profile
 from memory.local_snapshot_store import save_local_session_snapshot
 from memory.session_store import save_session_context
+from memory.session_context_service import merge_runtime_conversation_context, normalize_customer_profile
 
 log = logging.getLogger("rag-service")
 
@@ -67,6 +68,17 @@ async def persist_turn(state: SalesAgentState) -> Dict[str, Any]:
     session_context["conversation_turn_count"] = (
         session_context.get("conversation_turn_count", 0) + 1
     )
+    session_context = merge_runtime_conversation_context(
+        session_context,
+        last_intent=state.get("detected_intent"),
+        missing_slots=state.get("missing_slots") or [],
+        last_question=final_response if (state.get("missing_slots") or []) else None,
+    )
+    context_json = dict(session_context.get("context_json") or {})
+    customer_profile = dict(context_json.get("customer_profile") or {})
+    customer_profile.update(normalize_customer_profile(lead_profile))
+    context_json["customer_profile"] = customer_profile
+    session_context["context_json"] = context_json
     # Persist compact working memory immediately so the next turn sees the latest state.
     await save_session_context(session_id, session_context)
     task = asyncio.create_task(

@@ -1,4 +1,4 @@
-"""Node 6: Retrieve knowledge from LightRAG based on current sales state."""
+"""Node 6: Retrieve knowledge from Haystack-backed RAG based on current sales state."""
 
 import json
 import logging
@@ -300,7 +300,7 @@ async def _load_catalog_projects() -> List[Dict[str, str]]:
         rows = await conn.fetch(
             """
             SELECT full_doc_id, file_path, chunk_order_index, content
-            FROM lightrag_doc_chunks
+            FROM sales.haystack_doc_chunks
             WHERE workspace = $1
               AND content ILIKE '%Noble%'
             ORDER BY full_doc_id, chunk_order_index
@@ -380,7 +380,7 @@ async def _load_project_facts() -> List[Dict[str, Any]]:
         rows = await conn.fetch(
             """
             SELECT full_doc_id, file_path, chunk_order_index, content
-            FROM lightrag_doc_chunks
+            FROM sales.haystack_doc_chunks
             WHERE workspace = $1
               AND content ILIKE '%Noble%'
             ORDER BY full_doc_id, chunk_order_index
@@ -574,7 +574,7 @@ async def _load_chunks_for_doc_ids(doc_ids: List[str], max_chunks_per_doc: int =
         rows = await conn.fetch(
             """
             SELECT full_doc_id, chunk_order_index, content
-            FROM lightrag_doc_chunks
+            FROM sales.haystack_doc_chunks
             WHERE workspace = $1
               AND full_doc_id = ANY($2::text[])
             ORDER BY full_doc_id, chunk_order_index
@@ -713,7 +713,7 @@ async def retrieve_context(state: SalesAgentState) -> Dict[str, Any]:
 
     context_items: List[Dict[str, Any]] = []
     if raw_answer and raw_answer.strip():
-        context_items.append({"content": raw_answer, "source": "lightrag"})
+        context_items.append({"content": raw_answer, "source": "haystack_rag"})
     candidates = _extract_candidates(raw_answer)
     project_facts: List[Dict[str, Any]] = []
     if (state.get("next_sales_state") or "") == "product_matching":
