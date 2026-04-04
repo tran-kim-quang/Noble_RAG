@@ -16,6 +16,7 @@ env/
 
 # Log
 .log
+*.log
 
 # Pycahce
 pycache/
@@ -29,3 +30,13 @@ poetry.lock
 
 # Test
 test/
+
+# Local runtime artifacts (do not commit)
+tmp/
+livetalking/venv/
+livetalking/models/
+livetalking/data/avatars/
+livetalking/.cache/
+livetalking/outputs/
+livetalking/data/videos/
+livetalking/data/*.wav

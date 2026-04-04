@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from integrations.camera_identity import maybe_enrich_identity
 from models.api_models import LeadUpdateRequest, SalesChatRequest, SalesChatResponse
-from memory.chat_history_store import delete_chat_history, load_chat_history
+from memory.chat_history_store import append_turn, delete_chat_history, load_chat_history
 from memory.lead_profile_store import (
     delete_lead_profile_cache,
     ensure_sales_schema,
@@ -25,7 +25,7 @@ from memory.local_snapshot_store import (
     read_local_session_snapshot_text,
 )
 from memory.session_store import delete_session_context, load_session_context
-from rag.retriever import decompose_subqueries, route_query, summarize_search_answer
+from rag.retriever import decompose_subqueries, query_rag, route_query, summarize_search_answer
 from sales.graph import sales_graph
 from sales.session_export import export_session_to_txt
 from utils.text import iter_stream_chunks
@@ -46,6 +46,17 @@ _SEARCH_PERSONA = (
 )
 
 
+async def _persist_chat_turn(session_id: str, user_text: str, assistant_text: str) -> None:
+    user = (user_text or "").strip()
+    assistant = (assistant_text or "").strip()
+    if not user or not assistant:
+        return
+    try:
+        await append_turn(session_id, user, assistant)
+    except Exception as e:
+        log.warning("append_turn failed: session=%s error=%s", session_id, e)
+
+
 async def _run_search_flow(
     *,
     session_id: str,
@@ -60,6 +71,7 @@ async def _run_search_flow(
         system_persona=_SEARCH_PERSONA,
         max_sentences=4,
     )
+    await _persist_chat_turn(session_id, user_text, answer)
     return {
         "route_category": "SEARCH",
         "final_response": answer,
@@ -164,6 +176,22 @@ async def _run_sales_or_search(
             search_query=routed_query or user_text,
             history=history,
         )
+    if category == "RAG":
+        rag_answer = await query_rag(
+            text=routed_query or user_text,
+            top_k=6,
+            history=history,
+        )
+        if rag_answer.strip():
+            await _persist_chat_turn(session_id, user_text, rag_answer)
+            return {
+                "route_category": "RAG",
+                "final_response": rag_answer,
+                "next_sales_state": None,
+                "lead_profile": await load_lead_profile(session_id),
+                "missing_slots": None,
+            }
+
     return await _run_sales_flow(
         session_id=session_id,
         user_text=user_text,

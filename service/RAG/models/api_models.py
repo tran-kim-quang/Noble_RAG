@@ -11,7 +11,7 @@ class StorageType(str, Enum):
 
 # ── Document endpoints ─────────────────────────────────────────────────────
 class UploadDocumentRequest(BaseModel):
-    storage_type: StorageType = StorageType.GRAPH
+    storage_type: StorageType = StorageType.VECTOR
     metadata: Optional[dict] = None
 
 
@@ -99,3 +99,21 @@ class SalesChatV1Response(BaseModel):
     sales_stage: Optional[str] = None
     missing_slots: List[str] = Field(default_factory=list)
     context_used: bool = True
+
+
+class SessionOpenRequest(BaseModel):
+    customer_id: str
+    session_id: Optional[str] = None
+    channel: Optional[str] = None
+    source: Optional[str] = "machine_b"
+    allow_resume: bool = True
+    customer_profile: Dict[str, Any] = Field(default_factory=dict)
+    vision_summary: Optional[Dict[str, Any]] = None
+
+
+class SessionOpenResponse(BaseModel):
+    session_id: str
+    customer_id: str
+    reused_session: bool
+    context_ready: bool
+    context_used: bool

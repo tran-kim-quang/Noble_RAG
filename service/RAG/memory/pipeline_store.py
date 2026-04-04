@@ -137,6 +137,59 @@ async def touch_customer_session_activity(session_id: str) -> None:
         await conn.close()
 
 
+async def get_latest_active_session_by_customer_id(customer_id: str) -> Optional[Dict[str, Any]]:
+    await ensure_pipeline_schema()
+    cid = (customer_id or "").strip()
+    if not cid:
+        return None
+
+    conn = await asyncpg.connect(_postgres_url())
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT session_id, customer_id, channel, source, session_status,
+                   created_from_vision, started_at, last_activity_at
+            FROM sales.customer_sessions
+            WHERE customer_id = $1
+              AND COALESCE(session_status, 'active') = 'active'
+            ORDER BY last_activity_at DESC NULLS LAST, started_at DESC NULLS LAST
+            LIMIT 1
+            """,
+            cid,
+        )
+    finally:
+        await conn.close()
+
+    if not row:
+        return None
+    return dict(row)
+
+
+async def load_session_context_row(session_id: str) -> Optional[Dict[str, Any]]:
+    await ensure_pipeline_schema()
+    sid = (session_id or "").strip()
+    if not sid:
+        return None
+
+    conn = await asyncpg.connect(_postgres_url())
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT session_id, customer_id, context_json, updated_at
+            FROM sales.session_context
+            WHERE session_id = $1
+            LIMIT 1
+            """,
+            sid,
+        )
+    finally:
+        await conn.close()
+
+    if not row:
+        return None
+    return dict(row)
+
+
 async def upsert_document_metadata(
     *,
     document_id: str,

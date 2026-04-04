@@ -131,9 +131,9 @@ class HaystackRAGAdapter:
             return ""
 
         vector = (await self._embed_texts([search_query]))[0]
-        results = self.qdrant.search(
+        query_response = self.qdrant.query_points(
             collection_name=self.settings.collection_name,
-            query_vector=vector,
+            query=vector,
             limit=max(1, top_k),
             with_payload=True,
             query_filter=Filter(
@@ -145,10 +145,11 @@ class HaystackRAGAdapter:
                 ]
             ),
         )
+        results = list(getattr(query_response, "points", []) or [])
 
         context_blocks: List[str] = []
         for point in results:
-            payload = dict(point.payload or {})
+            payload = dict(getattr(point, "payload", None) or {})
             content = str(payload.get("content") or "").strip()
             source = str(payload.get("file_path") or payload.get("document_id") or "unknown")
             if not content:

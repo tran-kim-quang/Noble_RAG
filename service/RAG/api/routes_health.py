@@ -40,11 +40,16 @@ async def get_models():
                 "dimensions": settings.embedding_dim,
             },
             "storage": {
-                "kv_storage": settings.kv_storage,
-                "vector_storage": settings.vector_storage,
-                "graph_storage": settings.graph_storage,
-                "doc_status_storage": settings.doc_status_storage,
+                "pipeline": "vector_only",
+                "vector_backend": "qdrant",
+                "metadata_backend": "postgres",
+                "session_backend": "redis",
+                "workspace": settings.rag_workspace,
+                "collection": settings.knowledge_collection_name,
                 "qdrant": settings.qdrant_url,
+                "postgres": settings.postgres_url.split("@")[-1]
+                if "@" in settings.postgres_url
+                else settings.postgres_url,
                 "redis": settings.redis_url.split("@")[-1]
                 if "@" in settings.redis_url
                 else settings.redis_url,
@@ -64,12 +69,12 @@ async def get_status():
             "llm_model": settings.llm_model,
             "embedding_model": settings.embedding_model,
             "storage": {
-                "type": "hybrid",
-                "graph": settings.graph_storage,
-                "vector": settings.vector_storage,
+                "type": "vector_only",
+                "vector": "Qdrant",
+                "metadata": "PostgreSQL",
                 "session": "Redis",
-                "kv": settings.kv_storage,
-                "doc_status": settings.doc_status_storage,
+                "workspace": settings.rag_workspace,
+                "collection": settings.knowledge_collection_name,
             },
         },
     )

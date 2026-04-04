@@ -19,8 +19,10 @@ from memory.lead_profile_store import ensure_sales_schema, load_lead_profile, sa
 from memory.pipeline_store import (
     create_customer_session,
     ensure_pipeline_schema,
+    get_latest_active_session_by_customer_id,
     insert_chat_message,
     insert_vision_context,
+    load_session_context_row,
     touch_customer_session_activity,
     upsert_document_metadata,
     upsert_session_context_row,
@@ -35,6 +37,8 @@ from models.api_models import (
     KnowledgeIngestResponse,
     SalesChatV1Request,
     SalesChatV1Response,
+    SessionOpenRequest,
+    SessionOpenResponse,
     VisionIdentifyAndContextResponse,
 )
 from sales.nodes.retrieve_context import refresh_retrieval_caches
@@ -120,6 +124,93 @@ async def _call_vision_multipart(
     if not isinstance(payload, dict):
         raise HTTPException(status_code=502, detail="vision service returned non-object payload")
     return payload
+
+
+@router.post("/session/open", response_model=SessionOpenResponse)
+async def session_open_v1(request: SessionOpenRequest):
+    await ensure_sales_schema()
+    await ensure_pipeline_schema()
+
+    customer_id = (request.customer_id or "").strip()
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="customer_id is required")
+
+    requested_session_id = (request.session_id or "").strip()
+    session_id = requested_session_id
+    reused_session = False
+
+    if not session_id and request.allow_resume:
+        latest = await get_latest_active_session_by_customer_id(customer_id)
+        if latest and str(latest.get("session_id") or "").strip():
+            session_id = str(latest.get("session_id")).strip()
+            reused_session = True
+
+    if not session_id:
+        session_id = f"ses_{uuid.uuid4().hex[:12]}"
+
+    await create_customer_session(
+        session_id=session_id,
+        customer_id=customer_id,
+        channel=request.channel,
+        source=(request.source or "session_open").strip() or "session_open",
+        created_from_vision=False,
+    )
+
+    context = await get_existing_session_context(session_id)
+    if not context:
+        row = await load_session_context_row(session_id)
+        if row and isinstance(row.get("context_json"), dict):
+            row_payload = {
+                "session_id": session_id,
+                "customer_id": row.get("customer_id") or customer_id,
+                "context_ready": True,
+                "context_json": row.get("context_json") or {},
+            }
+            await save_session_context(session_id, row_payload)
+            context = await get_existing_session_context(session_id)
+
+    lead_profile = await load_lead_profile(session_id) or {
+        "lead_id": session_id,
+        "customer_id": customer_id,
+        "sales_stage": "new",
+        "current_state": "greeting",
+        "current_script_step": "S1_opening",
+    }
+    if request.customer_profile:
+        lead_profile.update(request.customer_profile)
+    lead_profile["customer_id"] = customer_id
+    await save_lead_profile(session_id, lead_profile)
+
+    should_seed_context = (
+        not is_session_context_ready(context, customer_id)
+        or bool(request.customer_profile)
+        or isinstance(request.vision_summary, dict)
+    )
+    if should_seed_context:
+        context = await build_and_save_session_context(
+            session_id=session_id,
+            customer_id=customer_id,
+            customer_profile=lead_profile,
+            vision_summary=request.vision_summary,
+            existing_context=context,
+        )
+        await upsert_session_context_row(
+            session_id=session_id,
+            customer_id=customer_id,
+            context_json=context.get("context_json") or {},
+        )
+    else:
+        context = context or await load_session_context(session_id)
+
+    await touch_customer_session_activity(session_id)
+
+    return SessionOpenResponse(
+        session_id=session_id,
+        customer_id=customer_id,
+        reused_session=reused_session and not requested_session_id,
+        context_ready=bool(context.get("context_ready")),
+        context_used=True,
+    )
 
 
 @router.post("/knowledge/ingest", response_model=KnowledgeIngestResponse)

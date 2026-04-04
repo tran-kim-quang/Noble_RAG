@@ -108,14 +108,45 @@ async def _embed_with_ollama(texts: List[str]) -> np.ndarray:
     host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
     model = settings.embedding_model
     vectors: List[List[float]] = []
+    max_words = max(64, int(os.getenv("EMBEDDING_MAX_WORDS", "320")))
+
+    def _truncate_text(value: str, limit_words: int) -> str:
+        words = (value or "").split()
+        if len(words) <= limit_words:
+            return value
+        return " ".join(words[:limit_words])
 
     async with httpx.AsyncClient(timeout=max(30.0, float(settings.embedding_timeout))) as client:
         for text in texts:
+            candidate = _truncate_text(text, max_words)
+            dynamic_limit = max_words
+            response = None
+
             # `/api/embeddings` works across Ollama versions.
-            response = await client.post(
-                f"{host}/api/embeddings",
-                json={"model": model, "prompt": text},
-            )
+            for _ in range(3):
+                response = await client.post(
+                    f"{host}/api/embeddings",
+                    json={"model": model, "prompt": candidate},
+                )
+                if response.status_code < 400:
+                    break
+
+                body = (response.text or "").lower()
+                if (
+                    response.status_code >= 500
+                    and "input length exceeds the context length" in body
+                    and dynamic_limit > 64
+                ):
+                    dynamic_limit = max(64, dynamic_limit // 2)
+                    candidate = _truncate_text(candidate, dynamic_limit)
+                    log.warning(
+                        "Embedding input too long for Ollama; retrying with %s words",
+                        dynamic_limit,
+                    )
+                    continue
+                response.raise_for_status()
+
+            assert response is not None
             response.raise_for_status()
             data = response.json()
             vec = data.get("embedding") or []

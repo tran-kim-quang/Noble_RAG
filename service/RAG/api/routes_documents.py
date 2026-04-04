@@ -18,7 +18,7 @@ settings = get_settings()
 @router.post("/upload-document", response_model=UploadDocumentResponse)
 async def upload_document(
     file: UploadFile = File(...),
-    storage_type: StorageType = Form(StorageType.GRAPH),
+    storage_type: StorageType = Form(StorageType.VECTOR),
     metadata: Optional[str] = Form(None),
 ):
     start = time.perf_counter()
