@@ -15,10 +15,10 @@ class Settings(BaseSettings):
     )
 
     # LLM
-    llm_provider: str = "deepseek"
-    llm_model: str = "deepseek-chat"
+    llm_provider: str = "gemini"
+    llm_model: str = "gemini-2.5-flash"
     llm_api_key: str = ""
-    llm_api_url: str = "https://api.deepseek.com/v1"
+    llm_api_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
 
     # Embedding
     embedding_provider: str = ""
@@ -127,11 +127,11 @@ def _apply_alt_env_names(s: Settings) -> Settings:
             pass
 
     if provider == "gemini":
-        if (val := os.getenv("LLM_GEMINI_MODEL")) and s.llm_model == "deepseek-chat":
+        if (val := os.getenv("LLM_GEMINI_MODEL")) and s.llm_model == "gemini-2.5-flash":
             s.llm_model = val
         if (val := os.getenv("LLM_GEMINI_API_KEY")) and not s.llm_api_key:
             s.llm_api_key = val
-        if (val := os.getenv("LLM_GEMINI_API_URL")) and s.llm_api_url == "https://api.deepseek.com/v1":
+        if (val := os.getenv("LLM_GEMINI_API_URL")) and s.llm_api_url == "https://generativelanguage.googleapis.com/v1beta/openai":
             s.llm_api_url = val
 
     return s
