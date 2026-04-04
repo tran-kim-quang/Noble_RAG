@@ -101,6 +101,18 @@ class SalesChatV1Response(BaseModel):
     context_used: bool = True
 
 
+class SalesChatWithCameraV1Response(BaseModel):
+    session_id: str
+    customer_id: str
+    reused_session: bool
+    response: str
+    intent: Optional[str] = None
+    sales_stage: Optional[str] = None
+    missing_slots: List[str] = Field(default_factory=list)
+    context_used: bool = True
+    face_payload: Dict[str, Any] = Field(default_factory=dict)
+
+
 class SessionOpenRequest(BaseModel):
     customer_id: str
     session_id: Optional[str] = None

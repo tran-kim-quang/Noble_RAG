@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -35,6 +36,7 @@ from memory.session_context_service import (
 from memory.session_store import get_existing_session_context, load_session_context, save_session_context
 from models.api_models import (
     KnowledgeIngestResponse,
+    SalesChatWithCameraV1Response,
     SalesChatV1Request,
     SalesChatV1Response,
     SessionOpenRequest,
@@ -126,33 +128,100 @@ async def _call_vision_multipart(
     return payload
 
 
-@router.post("/session/open", response_model=SessionOpenResponse)
-async def session_open_v1(request: SessionOpenRequest):
-    await ensure_sales_schema()
-    await ensure_pipeline_schema()
+def _parse_json_object(raw: Optional[str], field_name: str) -> Dict[str, Any]:
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be a valid JSON object") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail=f"{field_name} must be a JSON object")
+    return payload
 
-    customer_id = (request.customer_id or "").strip()
-    if not customer_id:
+
+def _machine_b_headers() -> Dict[str, str]:
+    headers: Dict[str, str] = {}
+    key = (settings.machine_b_api_key or "").strip()
+    if key:
+        headers["X-API-Key"] = key
+    return headers
+
+
+def _machine_b_base() -> str:
+    base = (settings.machine_b_base_url or "").strip().rstrip("/")
+    if not base:
+        raise HTTPException(status_code=400, detail="MACHINE_B_BASE_URL is not configured")
+    return base
+
+
+async def _register_face_to_machine_b(
+    *,
+    customer_id: str,
+    image_bytes: bytes,
+    filename: str,
+    content_type: str,
+) -> Dict[str, Any]:
+    files = {
+        "file": (
+            filename or "capture.jpg",
+            image_bytes,
+            content_type or "application/octet-stream",
+        )
+    }
+    form = {"customer_id": customer_id}
+    try:
+        async with httpx.AsyncClient(timeout=max(20.0, settings.machine_b_timeout_sec)) as client:
+            resp = await client.post(
+                f"{_machine_b_base()}/v1/face/register",
+                data=form,
+                files=files,
+                headers=_machine_b_headers(),
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"cannot reach machine B: {exc!s}") from exc
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=_extract_detail(resp))
+    try:
+        payload = resp.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"machine B returned invalid JSON: {exc!s}") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="machine B returned non-object payload")
+    return payload
+
+
+async def _open_or_resume_session(
+    *,
+    customer_id: str,
+    requested_session_id: Optional[str],
+    allow_resume: bool,
+    channel: Optional[str],
+    source: Optional[str],
+    customer_profile: Optional[Dict[str, Any]],
+    vision_summary: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    cid = (customer_id or "").strip()
+    if not cid:
         raise HTTPException(status_code=400, detail="customer_id is required")
 
-    requested_session_id = (request.session_id or "").strip()
-    session_id = requested_session_id
+    incoming_session_id = (requested_session_id or "").strip()
+    session_id = incoming_session_id
     reused_session = False
-
-    if not session_id and request.allow_resume:
-        latest = await get_latest_active_session_by_customer_id(customer_id)
+    if not session_id and allow_resume:
+        latest = await get_latest_active_session_by_customer_id(cid)
         if latest and str(latest.get("session_id") or "").strip():
             session_id = str(latest.get("session_id")).strip()
             reused_session = True
-
     if not session_id:
         session_id = f"ses_{uuid.uuid4().hex[:12]}"
 
     await create_customer_session(
         session_id=session_id,
-        customer_id=customer_id,
-        channel=request.channel,
-        source=(request.source or "session_open").strip() or "session_open",
+        customer_id=cid,
+        channel=channel,
+        source=(source or "session_open").strip() or "session_open",
         created_from_vision=False,
     )
 
@@ -162,7 +231,7 @@ async def session_open_v1(request: SessionOpenRequest):
         if row and isinstance(row.get("context_json"), dict):
             row_payload = {
                 "session_id": session_id,
-                "customer_id": row.get("customer_id") or customer_id,
+                "customer_id": row.get("customer_id") or cid,
                 "context_ready": True,
                 "context_json": row.get("context_json") or {},
             }
@@ -171,43 +240,65 @@ async def session_open_v1(request: SessionOpenRequest):
 
     lead_profile = await load_lead_profile(session_id) or {
         "lead_id": session_id,
-        "customer_id": customer_id,
+        "customer_id": cid,
         "sales_stage": "new",
         "current_state": "greeting",
         "current_script_step": "S1_opening",
     }
-    if request.customer_profile:
-        lead_profile.update(request.customer_profile)
-    lead_profile["customer_id"] = customer_id
+    if customer_profile:
+        lead_profile.update(customer_profile)
+    lead_profile["customer_id"] = cid
     await save_lead_profile(session_id, lead_profile)
 
     should_seed_context = (
-        not is_session_context_ready(context, customer_id)
-        or bool(request.customer_profile)
-        or isinstance(request.vision_summary, dict)
+        not is_session_context_ready(context, cid)
+        or bool(customer_profile)
+        or isinstance(vision_summary, dict)
     )
     if should_seed_context:
         context = await build_and_save_session_context(
             session_id=session_id,
-            customer_id=customer_id,
+            customer_id=cid,
             customer_profile=lead_profile,
-            vision_summary=request.vision_summary,
+            vision_summary=vision_summary,
             existing_context=context,
         )
         await upsert_session_context_row(
             session_id=session_id,
-            customer_id=customer_id,
+            customer_id=cid,
             context_json=context.get("context_json") or {},
         )
     else:
         context = context or await load_session_context(session_id)
 
     await touch_customer_session_activity(session_id)
+    return {
+        "session_id": session_id,
+        "customer_id": cid,
+        "reused_session": bool(reused_session and not incoming_session_id),
+        "context": context,
+    }
+
+
+@router.post("/session/open", response_model=SessionOpenResponse)
+async def session_open_v1(request: SessionOpenRequest):
+    await ensure_sales_schema()
+    await ensure_pipeline_schema()
+    result = await _open_or_resume_session(
+        customer_id=request.customer_id,
+        requested_session_id=request.session_id,
+        allow_resume=bool(request.allow_resume),
+        channel=request.channel,
+        source=request.source or "session_open",
+        customer_profile=request.customer_profile or {},
+        vision_summary=request.vision_summary if isinstance(request.vision_summary, dict) else None,
+    )
+    context = result["context"]
 
     return SessionOpenResponse(
-        session_id=session_id,
-        customer_id=customer_id,
-        reused_session=reused_session and not requested_session_id,
+        session_id=result["session_id"],
+        customer_id=result["customer_id"],
+        reused_session=bool(result["reused_session"]),
         context_ready=bool(context.get("context_ready")),
         context_used=True,
     )
@@ -504,4 +595,140 @@ async def sales_chat_v1(request: SalesChatV1Request):
         sales_stage=sales_stage,
         missing_slots=list(missing_slots),
         context_used=True,
+    )
+
+
+@router.post("/sales/chat-with-camera", response_model=SalesChatWithCameraV1Response)
+async def sales_chat_with_camera_v1(
+    file: UploadFile = File(...),
+    message: str = Form(...),
+    channel: str = Form("kiosk"),
+    source: str = Form("machine_b_auto"),
+    session_id: Optional[str] = Form(None),
+    customer_id_hint: Optional[str] = Form(None),
+    allow_resume: bool = Form(True),
+    customer_profile_json: Optional[str] = Form(None),
+    vision_summary_json: Optional[str] = Form(None),
+):
+    await ensure_sales_schema()
+    await ensure_pipeline_schema()
+
+    user_text = (message or "").strip()
+    if not user_text:
+        raise HTTPException(status_code=400, detail="message cannot be empty")
+
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="image file is empty")
+
+    requested_session_id = (session_id or "").strip() or None
+    profile = _parse_json_object(customer_profile_json, "customer_profile_json")
+    raw_vision_summary = _parse_json_object(vision_summary_json, "vision_summary_json")
+
+    resolved_hint = (customer_id_hint or "").strip()
+    if not resolved_hint and requested_session_id:
+        existing_context = await load_session_context(requested_session_id)
+        resolved_hint = str(existing_context.get("customer_id") or "").strip()
+    if not resolved_hint:
+        resolved_hint = f"cam_{uuid.uuid4().hex[:12]}"
+
+    face_payload = await _register_face_to_machine_b(
+        customer_id=resolved_hint,
+        image_bytes=image_bytes,
+        filename=file.filename or f"{resolved_hint}.jpg",
+        content_type=file.content_type or "application/octet-stream",
+    )
+
+    customer_id = str(face_payload.get("customer_id") or resolved_hint).strip()
+    if not customer_id:
+        raise HTTPException(status_code=502, detail="machine B did not return customer_id")
+
+    vision_summary = raw_vision_summary or _default_vision_summary(face_payload)
+    open_result = await _open_or_resume_session(
+        customer_id=customer_id,
+        requested_session_id=requested_session_id,
+        allow_resume=bool(allow_resume),
+        channel=(channel or "").strip() or None,
+        source=(source or "").strip() or "machine_b_auto",
+        customer_profile=profile,
+        vision_summary=vision_summary,
+    )
+    active_session_id = str(open_result["session_id"]).strip()
+    active_customer_id = str(open_result["customer_id"]).strip()
+
+    result = await _run_sales_or_search(
+        session_id=active_session_id,
+        user_text=user_text,
+        raw_transcript=None,
+    )
+
+    updated_context = await load_session_context(active_session_id)
+    if not is_session_context_ready(updated_context, active_customer_id):
+        updated_context = await build_and_save_session_context(
+            session_id=active_session_id,
+            customer_id=active_customer_id,
+            customer_profile=await load_lead_profile(active_session_id),
+            vision_summary=(updated_context.get("context_json") or {}).get("vision_context"),
+            existing_context=updated_context,
+        )
+
+    await touch_customer_session_activity(active_session_id)
+
+    response_text = str(result.get("final_response") or "").strip()
+    if not response_text:
+        response_text = "Xin loi, em chua co du du lieu de tra loi ngay luc nay."
+
+    context_json = updated_context.get("context_json") or {}
+    conversation_context = context_json.get("conversation_context") or {}
+    intent = str(result.get("detected_intent") or conversation_context.get("last_intent") or "").strip() or None
+    missing_slots = result.get("missing_slots")
+    if not isinstance(missing_slots, list):
+        missing_slots = conversation_context.get("missing_slots") or []
+
+    sales_stage = str(
+        result.get("next_sales_state")
+        or (context_json.get("customer_profile") or {}).get("sales_stage")
+        or "discovery"
+    )
+
+    updated_context = merge_runtime_conversation_context(
+        updated_context,
+        last_intent=intent,
+        missing_slots=list(missing_slots),
+        last_question=response_text if missing_slots else None,
+    )
+    await save_session_context(active_session_id, updated_context)
+    await upsert_session_context_row(
+        session_id=active_session_id,
+        customer_id=active_customer_id,
+        context_json=updated_context.get("context_json") or {},
+    )
+
+    await insert_chat_message(
+        session_id=active_session_id,
+        customer_id=active_customer_id,
+        role="user",
+        content=user_text,
+        intent=intent,
+        sales_stage=sales_stage,
+    )
+    await insert_chat_message(
+        session_id=active_session_id,
+        customer_id=active_customer_id,
+        role="assistant",
+        content=response_text,
+        intent=intent,
+        sales_stage=sales_stage,
+    )
+
+    return SalesChatWithCameraV1Response(
+        session_id=active_session_id,
+        customer_id=active_customer_id,
+        reused_session=bool(open_result["reused_session"]),
+        response=response_text,
+        intent=intent,
+        sales_stage=sales_stage,
+        missing_slots=list(missing_slots),
+        context_used=True,
+        face_payload=face_payload,
     )

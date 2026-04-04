@@ -25,7 +25,13 @@ from memory.local_snapshot_store import (
     read_local_session_snapshot_text,
 )
 from memory.session_store import delete_session_context, load_session_context
-from rag.retriever import decompose_subqueries, query_rag, route_query, summarize_search_answer
+from rag.retriever import (
+    decompose_subqueries,
+    query_rag,
+    query_rag_stream,
+    route_query,
+    summarize_search_answer,
+)
 from sales.graph import sales_graph
 from sales.session_export import export_session_to_txt
 from utils.text import iter_stream_chunks
@@ -232,7 +238,7 @@ async def sales_chat(request: SalesChatRequest):
 
 @router.post("/chat/stream")
 async def sales_chat_stream(request: SalesChatRequest):
-    """Streaming sales chat with immediate thinking_ack for better UX."""
+    """Streaming sales chat with true token streaming when route is RAG."""
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="message cannot be empty")
     await ensure_sales_schema()
@@ -240,6 +246,13 @@ async def sales_chat_stream(request: SalesChatRequest):
 
     async def generate():
         t_total = time.perf_counter()
+        user_text = request.message.strip()
+        final_meta: Dict[str, Any] = {
+            "route_category": None,
+            "sales_state": None,
+            "missing_slots": None,
+            "lead_profile": None,
+        }
         yield json.dumps(
             {
                 "chunk": random.choice(_THINKING_ACK_MESSAGES),
@@ -251,14 +264,151 @@ async def sales_chat_stream(request: SalesChatRequest):
         ) + "\n"
 
         try:
-            task = asyncio.create_task(
-                _run_sales_or_search(
+            history = await load_chat_history(request.session_id)
+            subqueries = await decompose_subqueries(user_text)
+
+            if len(subqueries) > 1:
+                # Preserve mixed behavior (search + sales) for multi-intent input.
+                result = await _run_sales_or_search(
                     session_id=request.session_id,
-                    user_text=request.message.strip(),
+                    user_text=user_text,
                     raw_transcript=request.raw_transcript,
                 )
-            )
-            result = await task
+                full_answer = (result.get("final_response") or "").strip()
+                for chunk in iter_stream_chunks(full_answer):
+                    yield json.dumps(
+                        {
+                            "chunk": chunk,
+                            "done": False,
+                            "phase": "response",
+                            "session_id": request.session_id,
+                        },
+                        ensure_ascii=False,
+                    ) + "\n"
+                    await asyncio.sleep(0)
+                final_meta.update(
+                    {
+                        "route_category": result.get("route_category"),
+                        "sales_state": result.get("next_sales_state"),
+                        "missing_slots": result.get("missing_slots"),
+                        "lead_profile": result.get("lead_profile"),
+                    }
+                )
+            else:
+                category, routed_query = await route_query(user_text, history)
+                if category == "RAG":
+                    final_meta["route_category"] = "RAG"
+                    parts: List[str] = []
+                    async for delta in query_rag_stream(
+                        text=routed_query or user_text,
+                        top_k=6,
+                        history=history,
+                    ):
+                        chunk = str(delta or "")
+                        if not chunk:
+                            continue
+                        parts.append(chunk)
+                        yield json.dumps(
+                            {
+                                "chunk": chunk,
+                                "done": False,
+                                "phase": "response",
+                                "session_id": request.session_id,
+                            },
+                            ensure_ascii=False,
+                        ) + "\n"
+                        await asyncio.sleep(0)
+
+                    full_answer = "".join(parts).strip()
+                    if full_answer:
+                        await _persist_chat_turn(request.session_id, user_text, full_answer)
+                        final_meta["lead_profile"] = await load_lead_profile(request.session_id)
+                    else:
+                        # Retrieval returned empty: fallback to full sales flow.
+                        result = await _run_sales_flow(
+                            session_id=request.session_id,
+                            user_text=user_text,
+                            raw_transcript=request.raw_transcript,
+                        )
+                        fallback_text = (result.get("final_response") or "").strip()
+                        for chunk in iter_stream_chunks(fallback_text):
+                            yield json.dumps(
+                                {
+                                    "chunk": chunk,
+                                    "done": False,
+                                    "phase": "response",
+                                    "session_id": request.session_id,
+                                },
+                                ensure_ascii=False,
+                            ) + "\n"
+                            await asyncio.sleep(0)
+                        final_meta.update(
+                            {
+                                "route_category": result.get("route_category"),
+                                "sales_state": result.get("next_sales_state"),
+                                "missing_slots": result.get("missing_slots"),
+                                "lead_profile": result.get("lead_profile"),
+                            }
+                        )
+                elif category == "SEARCH":
+                    result = await _run_search_flow(
+                        session_id=request.session_id,
+                        user_text=user_text,
+                        search_query=routed_query or user_text,
+                        history=history,
+                    )
+                    full_answer = (result.get("final_response") or "").strip()
+                    for chunk in iter_stream_chunks(full_answer):
+                        yield json.dumps(
+                            {
+                                "chunk": chunk,
+                                "done": False,
+                                "phase": "response",
+                                "session_id": request.session_id,
+                            },
+                            ensure_ascii=False,
+                        ) + "\n"
+                        await asyncio.sleep(0)
+                    final_meta.update(
+                        {
+                            "route_category": result.get("route_category"),
+                            "sales_state": result.get("next_sales_state"),
+                            "missing_slots": result.get("missing_slots"),
+                            "lead_profile": result.get("lead_profile"),
+                        }
+                    )
+                else:
+                    result = await _run_sales_flow(
+                        session_id=request.session_id,
+                        user_text=user_text,
+                        raw_transcript=request.raw_transcript,
+                    )
+                    full_answer = (result.get("final_response") or "").strip()
+                    for chunk in iter_stream_chunks(full_answer):
+                        yield json.dumps(
+                            {
+                                "chunk": chunk,
+                                "done": False,
+                                "phase": "response",
+                                "session_id": request.session_id,
+                            },
+                            ensure_ascii=False,
+                        ) + "\n"
+                        await asyncio.sleep(0)
+                    final_meta.update(
+                        {
+                            "route_category": result.get("route_category"),
+                            "sales_state": result.get("next_sales_state"),
+                            "missing_slots": result.get("missing_slots"),
+                            "lead_profile": result.get("lead_profile"),
+                        }
+                    )
+
+            if not final_meta.get("route_category"):
+                final_meta["route_category"] = "SALES"
+            if final_meta.get("lead_profile") is None:
+                final_meta["lead_profile"] = await load_lead_profile(request.session_id)
+
         except Exception as e:
             log.error("sales_graph.ainvoke(stream) error: %s", e)
             fallback = "Xin lỗi, em gặp lỗi khi xử lý yêu cầu. Anh/Chị thử lại giúp em nhé."
@@ -277,32 +427,16 @@ async def sales_chat_stream(request: SalesChatRequest):
             ) + "\n"
             return
 
-        full_answer = (result.get("final_response") or "").strip()
-        if not full_answer:
-            full_answer = "Xin lỗi, em chưa có đủ dữ liệu để tư vấn. Anh/Chị chia sẻ thêm giúp em nhé."
-
-        for chunk in iter_stream_chunks(full_answer):
-            yield json.dumps(
-                {
-                    "chunk": chunk,
-                    "done": False,
-                    "phase": "response",
-                    "session_id": request.session_id,
-                },
-                ensure_ascii=False,
-            ) + "\n"
-            await asyncio.sleep(0)
-
         yield json.dumps(
             {
                 "chunk": "",
                 "done": True,
                 "phase": "complete",
                 "session_id": request.session_id,
-                "route_category": result.get("route_category"),
-                "sales_state": result.get("next_sales_state"),
-                "missing_slots": result.get("missing_slots"),
-                "lead_profile": result.get("lead_profile"),
+                "route_category": final_meta.get("route_category"),
+                "sales_state": final_meta.get("sales_state"),
+                "missing_slots": final_meta.get("missing_slots"),
+                "lead_profile": final_meta.get("lead_profile"),
                 "latency_sec": round(time.perf_counter() - t_total, 3),
             },
             ensure_ascii=False,
@@ -476,3 +610,4 @@ async def get_chat_history(session_id: str):
             "history": formatted_history
         }
     )
+

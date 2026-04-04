@@ -77,6 +77,10 @@ class Settings(BaseSettings):
     vision_service_url: str = "http://127.0.0.1:8020"
     vision_session_sync_enabled: bool = True
     vision_session_lookup_timeout_sec: float = 2.0
+    cors_origins: str = "*"
+    machine_b_base_url: str = ""
+    machine_b_timeout_sec: float = 8.0
+    machine_b_api_key: str = ""
 
     @model_validator(mode="after")
     def _assemble_derived_fields(self) -> "Settings":

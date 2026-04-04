@@ -1,0 +1,972 @@
+﻿<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LiveTalking - Trợ lý hội thoại</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+    <style>
+        :root {
+            --primary-color: #4361ee;
+            --secondary-color: #3f37c9;
+            --accent-color: #4895ef;
+            --background-color: #f8f9fa;
+            --card-bg: #ffffff;
+            --text-color: #212529;
+            --border-radius: 10px;
+            --box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--background-color);
+            color: var(--text-color);
+            min-height: 100vh;
+            padding-top: 20px;
+        }
+
+        .dashboard-container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .card {
+            background-color: var(--card-bg);
+            border-radius: var(--border-radius);
+            box-shadow: var(--box-shadow);
+            border: none;
+            margin-bottom: 20px;
+            overflow: hidden;
+        }
+
+        .card-header {
+            background-color: var(--primary-color);
+            color: white;
+            font-weight: 600;
+            padding: 15px 20px;
+            border-bottom: none;
+        }
+
+        .video-container {
+            position: relative;
+            width: 100%;
+            background-color: #000;
+            border-radius: var(--border-radius);
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        video {
+            max-width: 100%;
+            max-height: 100%;
+            display: block;
+            border-radius: var(--border-radius);
+        }
+
+        .controls-container {
+            padding: 20px;
+        }
+
+        .btn-primary {
+            background-color: var(--primary-color);
+            border-color: var(--primary-color);
+        }
+
+        .btn-primary:hover {
+            background-color: var(--secondary-color);
+            border-color: var(--secondary-color);
+        }
+
+        .btn-outline-primary {
+            color: var(--primary-color);
+            border-color: var(--primary-color);
+        }
+
+        .btn-outline-primary:hover {
+            background-color: var(--primary-color);
+            color: white;
+        }
+
+        .form-control {
+            border-radius: var(--border-radius);
+            padding: 10px 15px;
+            border: 1px solid #ced4da;
+        }
+
+        .form-control:focus {
+            border-color: var(--accent-color);
+            box-shadow: 0 0 0 0.25rem rgba(67, 97, 238, 0.25);
+        }
+
+        .status-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 5px;
+        }
+
+        .status-connected {
+            background-color: #28a745;
+        }
+
+        .status-disconnected {
+            background-color: #dc3545;
+        }
+
+        .status-connecting {
+            background-color: #ffc107;
+        }
+
+        .asr-container {
+            height: 300px;
+            overflow-y: auto;
+            padding: 15px;
+            background-color: #f8f9fa;
+            border-radius: var(--border-radius);
+            border: 1px solid #ced4da;
+        }
+
+        .asr-text {
+            margin-bottom: 10px;
+            padding: 10px;
+            background-color: white;
+            border-radius: var(--border-radius);
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+        }
+
+        .user-message {
+            background-color: #e3f2fd;
+            border-left: 4px solid var(--primary-color);
+        }
+
+        .system-message {
+            background-color: #f1f8e9;
+            border-left: 4px solid #8bc34a;
+        }
+
+        .recording-indicator {
+            position: absolute;
+            top: 15px;
+            right: 15px;
+            background-color: rgba(220, 53, 69, 0.8);
+            color: white;
+            padding: 5px 10px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            display: none;
+        }
+
+        .recording-indicator.active {
+            display: flex;
+            align-items: center;
+        }
+
+        .recording-indicator .blink {
+            width: 10px;
+            height: 10px;
+            background-color: #fff;
+            border-radius: 50%;
+            margin-right: 5px;
+            animation: blink 1s infinite;
+        }
+
+        @keyframes blink {
+            0% { opacity: 1; }
+            50% { opacity: 0.3; }
+            100% { opacity: 1; }
+        }
+
+        .mode-switch {
+            margin-bottom: 20px;
+        }
+
+        .nav-tabs .nav-link {
+            color: var(--text-color);
+            border: none;
+            padding: 10px 20px;
+            border-radius: var(--border-radius) var(--border-radius) 0 0;
+        }
+
+        .nav-tabs .nav-link.active {
+            color: var(--primary-color);
+            background-color: var(--card-bg);
+            border-bottom: 3px solid var(--primary-color);
+            font-weight: 600;
+        }
+
+        .tab-content {
+            padding: 20px;
+            background-color: var(--card-bg);
+            border-radius: 0 0 var(--border-radius) var(--border-radius);
+        }
+
+        .settings-panel {
+            padding: 15px;
+            background-color: #f8f9fa;
+            border-radius: var(--border-radius);
+            margin-top: 15px;
+        }
+
+        .footer {
+            text-align: center;
+            margin-top: 30px;
+            padding: 20px 0;
+            color: #6c757d;
+            font-size: 0.9rem;
+        }
+        
+        .voice-record-btn {
+            width: 60px;
+            height: 60px;
+            border-radius: 50%;
+            background-color: var(--primary-color);
+            color: white;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+            margin: 0 auto;
+        }
+        
+        .voice-record-btn:hover {
+            background-color: var(--secondary-color);
+            transform: scale(1.05);
+        }
+        
+        .voice-record-btn:active {
+            background-color: #dc3545;
+            transform: scale(0.95);
+        }
+        
+        .voice-record-btn i {
+            font-size: 24px;
+        }
+        
+        .voice-record-label {
+            text-align: center;
+            margin-top: 10px;
+            font-size: 14px;
+            color: #6c757d;
+        }
+        
+        .video-size-control {
+            margin-top: 15px;
+        }
+        
+        .recording-pulse {
+            animation: pulse 1.5s infinite;
+        }
+        
+        @keyframes pulse {
+            0% {
+                box-shadow: 0 0 0 0 rgba(220, 53, 69, 0.7);
+            }
+            70% {
+                box-shadow: 0 0 0 15px rgba(220, 53, 69, 0);
+            }
+            100% {
+                box-shadow: 0 0 0 0 rgba(220, 53, 69, 0);
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="dashboard-container">
+        <div class="row">
+            <div class="col-12">
+                <h1 class="text-center mb-4">LiveTalking - Trợ lý hội thoại</h1>
+            </div>
+        </div>
+
+        <div class="row">
+            <!-- ÃƒÂ¨Ã‚Â§Ã¢â‚¬Â ÃƒÂ©Ã‚Â¢Ã¢â‚¬ËœÃƒÂ¥Ã…â€™Ã‚ÂºÃƒÂ¥Ã…Â¸Ã…Â¸ -->
+            <div class="col-lg-8">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <div>
+                            <span class="status-indicator status-disconnected" id="connection-status"></span>
+                            <span id="status-text">Chưa kết nối</span>
+                        </div>
+                    </div>
+                    <div class="card-body p-0">
+                        <div class="video-container">
+                            <video id="video" autoplay playsinline></video>
+                            <div class="recording-indicator" id="recording-indicator">
+                                <div class="blink"></div>
+                                <span>Đang ghi âm</span>
+                            </div>
+                        </div>
+                        
+                        <div class="controls-container">
+                            <div class="row">
+                                <div class="col-md-6 mb-3">
+                                    <button class="btn btn-primary w-100" id="start">
+                                        <i class="bi bi-play-fill"></i> Bắt đầu kết nối
+                                    </button>
+                                    <button class="btn btn-danger w-100" id="stop" style="display: none;">
+                                        <i class="bi bi-stop-fill"></i> Dừng kết nối
+                                    </button>
+                                </div>
+                                <div class="col-md-6 mb-3">
+                                    <div class="d-flex">
+                                        <button class="btn btn-outline-primary flex-grow-1 me-2" id="btn_start_record">
+                                            <i class="bi bi-record-fill"></i> Bắt đầu ghi
+                                        </button>
+                                        <button class="btn btn-outline-danger flex-grow-1" id="btn_stop_record" disabled>
+                                            <i class="bi bi-stop-fill"></i> Dừng ghi
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="row">
+                                <div class="col-12">
+                                    <div class="video-size-control">
+                                        <label for="video-size-slider" class="form-label">Kích thước video: <span id="video-size-value">100%</span></label>
+                                        <input type="range" class="form-range" id="video-size-slider" min="50" max="150" value="100">
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div class="settings-panel mt-3">
+                                <div class="row">
+                                    <div class="col-md-12">
+                                        <div class="form-check form-switch mb-3">
+                                            <input class="form-check-input" type="checkbox" id="use-stun">
+                                            <label class="form-check-label" for="use-stun">Sử dụng STUN</label>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- ÃƒÂ¥Ã‚ÂÃ‚Â³ÃƒÂ¤Ã‚Â¾Ã‚Â§ÃƒÂ¤Ã‚ÂºÃ‚Â¤ÃƒÂ¤Ã‚ÂºÃ¢â‚¬â„¢ -->
+            <div class="col-lg-4">
+                <div class="card">
+                    <div class="card-header">
+                        <ul class="nav nav-tabs card-header-tabs" id="interaction-tabs" role="tablist">
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link active" id="chat-tab" data-bs-toggle="tab" data-bs-target="#chat" type="button" role="tab" aria-controls="chat" aria-selected="true">Chat</button>
+                            </li>
+                            <li class="nav-item" role="presentation">
+                                <button class="nav-link" id="tts-tab" data-bs-toggle="tab" data-bs-target="#tts" type="button" role="tab" aria-controls="tts" aria-selected="false">TTS</button>
+                            </li>
+                        </ul>
+                    </div>
+                    <div class="card-body">
+                        <div class="tab-content" id="interaction-tabs-content">
+                            <!-- ÃƒÂ¥Ã‚Â¯Ã‚Â¹ÃƒÂ¨Ã‚Â¯Ã‚ÂÃƒÂ¦Ã‚Â¨Ã‚Â¡ÃƒÂ¥Ã‚Â¼Ã‚Â -->
+                            <div class="tab-pane fade show active" id="chat" role="tabpanel" aria-labelledby="chat-tab">
+                                <div class="asr-container mb-3" id="chat-messages">
+                                    <div class="asr-text system-message">Hệ thống: Chọn "Bắt đầu kết nối", sau đó bạn có thể chat hoặc giữ nút mic để nói.</div>
+                                </div>
+                                
+                                <form id="chat-form">
+                                    <div class="input-group mb-3">
+                                        <textarea class="form-control" id="chat-message" rows="3" placeholder="Nhập nội dung bạn muốn hỏi..."></textarea>
+                                        <button class="btn btn-primary" type="submit">
+                                            <i class="bi bi-send"></i> Gửi
+                                        </button>
+                                    </div>
+                                </form>
+                                
+                                <!-- ÃƒÂ¦Ã…â€™Ã¢â‚¬Â°ÃƒÂ¤Ã‚Â½Ã‚ÂÃƒÂ¨Ã‚Â¯Ã‚Â´ÃƒÂ¨Ã‚Â¯Ã‚ÂÃƒÂ¦Ã…â€™Ã¢â‚¬Â°ÃƒÂ©Ã¢â‚¬â„¢Ã‚Â® -->
+                                <div class="voice-record-btn" id="voice-record-btn">
+                                    <i class="bi bi-mic-fill"></i>
+                                </div>
+                                <div class="voice-record-label">Giữ để nói, thả để gửi</div>
+                            </div>
+                            
+                            <!-- ÃƒÂ¦Ã…â€œÃ¢â‚¬â€ÃƒÂ¨Ã‚Â¯Ã‚Â»ÃƒÂ¦Ã‚Â¨Ã‚Â¡ÃƒÂ¥Ã‚Â¼Ã‚Â -->
+                            <div class="tab-pane fade" id="tts" role="tabpanel" aria-labelledby="tts-tab">
+                                <form id="echo-form">
+                                    <div class="mb-3">
+                                        <label for="message" class="form-label">Nhập nội dung muốn đọc</label>
+                                        <textarea class="form-control" id="message" rows="6" placeholder="Nhập nội dung để avatar đọc..."></textarea>
+                                    </div>
+                                    <button type="submit" class="btn btn-primary w-100">
+                                        <i class="bi bi-volume-up"></i> Phát TTS
+                                    </button>
+                                </form>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card mt-3">
+                    <div class="card-header">
+                        Noble RAG Workflow
+                    </div>
+                    <div class="card-body">
+                        <div class="mb-3">
+                            <label class="form-label">RAG Session ID</label>
+                            <div class="small text-break text-muted" id="rag-session-label">Đang khởi tạo...</div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label">Vision Capture</label>
+                            <video id="vision-preview" class="w-100 rounded border" autoplay playsinline muted style="display: none;"></video>
+                            <div id="vision-placeholder" class="border rounded p-3 text-muted small">Khuyến nghị: bật camera, gửi 1 keyframe sang Vision trước khi bắt đầu trò chuyện.</div>
+                            <div class="d-flex gap-2 mt-2">
+                                <button class="btn btn-outline-primary flex-grow-1" id="btn_start_camera" type="button">Bật camera</button>
+                                <button class="btn btn-primary flex-grow-1" id="btn_capture_vision" type="button" disabled>Gửi keyframe</button>
+                                <button class="btn btn-outline-secondary flex-grow-1" id="btn_stop_camera" type="button" disabled>Tắt camera</button>
+                            </div>
+                        </div>
+
+                        <div id="vision-status" class="small text-muted">Chưa gửi keyframe sang Vision.</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="footer">
+            <p>LiveTalking UI for Noble RAG</p>
+        </div>
+    </div>
+
+    <!-- ÃƒÂ©Ã…Â¡Ã‚ÂÃƒÂ¨Ã¢â‚¬â€Ã‚ÂÃƒÂ§Ã…Â¡Ã¢â‚¬Å¾ÃƒÂ¤Ã‚Â¼Ã…Â¡ÃƒÂ¨Ã‚Â¯Ã‚ÂID -->
+    <input type="hidden" id="sessionid" value="0">
+    <input type="hidden" id="rag-session-id" value="">
+    <canvas id="vision-canvas" width="640" height="480" style="display: none;"></canvas>
+
+
+    <script src="client.js"></script>
+    <script src="srs.sdk.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script>
+        $(document).ready(function() {
+            let nobleConfig = null;
+            let ragSessionId = '';
+            let visionStream = null;
+
+            function localizeUiText() {
+                document.title = 'LiveTalking - Trợ lý hội thoại';
+                $('.dashboard-container h1').text('LiveTalking - Trợ lý hội thoại');
+                $('#status-text').text('Chưa kết nối');
+                $('#recording-indicator span').text('Đang ghi âm');
+                $('#start').html('<i class="bi bi-play-fill"></i> Bắt đầu kết nối');
+                $('#stop').html('<i class="bi bi-stop-fill"></i> Dừng kết nối');
+                $('#btn_start_record').html('<i class="bi bi-record-fill"></i> Bắt đầu ghi');
+                $('#btn_stop_record').html('<i class="bi bi-stop-fill"></i> Dừng ghi');
+                $('label[for=\"video-size-slider\"]').html('Kích thước video: <span id=\"video-size-value\">100%</span>');
+                $('label[for=\"use-stun\"]').text('Sử dụng STUN');
+                $('#chat-tab').text('Chat');
+                $('#tts-tab').text('TTS');
+                $('#chat-messages .system-message').first().text('Hệ thống: Chọn "Bắt đầu kết nối", sau đó bạn có thể chat hoặc giữ nút mic để nói.');
+                $('#chat-message').attr('placeholder', 'Nhập nội dung bạn muốn hỏi...');
+                $('#chat-form button[type=\"submit\"]').html('<i class=\"bi bi-send\"></i> Gửi');
+                $('.voice-record-label').text('Giữ để nói, thả để gửi');
+                $('label[for=\"message\"]').text('Nhập nội dung muốn đọc');
+                $('#message').attr('placeholder', 'Nhập nội dung để avatar đọc...');
+                $('#echo-form button[type=\"submit\"]').html('<i class=\"bi bi-volume-up\"></i> Phát TTS');
+                $('.card-header:contains(\"Noble RAG Workflow\")').text('Noble RAG Workflow');
+                $('#rag-session-label').text('Đang khởi tạo...');
+                $('label.form-label:contains(\"Vision Capture\")').text('Vision Capture');
+                $('#vision-placeholder').text('Khuyến nghị: bật camera, gửi 1 keyframe sang Vision trước khi bắt đầu trò chuyện.');
+                $('#btn_start_camera').text('Bật camera');
+                $('#btn_capture_vision').text('Gửi keyframe');
+                $('#btn_stop_camera').text('Tắt camera');
+                $('#vision-status').text('Chưa gửi keyframe sang Vision.');
+            }
+
+            localizeUiText();
+
+            $('#video-size-slider').on('input', function() {
+                const value = $(this).val();
+                $('#video-size-value').text(value + '%');
+                $('#video').css('width', value + '%');
+            });
+
+            function setVisionStatus(message, isError = false) {
+                const status = $('#vision-status');
+                status.text(message);
+                status.toggleClass('text-danger', isError);
+                status.toggleClass('text-muted', !isError);
+            }
+
+            function renderRagSessionId() {
+                $('#rag-session-label').text(ragSessionId || 'Chưa tạo session');
+                $('#rag-session-id').val(ragSessionId);
+            }
+
+            async function initializeNobleSession() {
+                const configResponse = await fetch('/noble/config');
+                if (!configResponse.ok) {
+                    throw new Error('Không đọc được cấu hình Noble RAG.');
+                }
+                nobleConfig = await configResponse.json();
+
+                const sessionResponse = await fetch('/noble/session', { method: 'POST' });
+                if (!sessionResponse.ok) {
+                    throw new Error('Không tạo được session_id cho Noble RAG.');
+                }
+
+                const sessionData = await sessionResponse.json();
+                ragSessionId = sessionData.session_id || '';
+                renderRagSessionId();
+                setVisionStatus('Đã sẵn sàng. Hãy gửi 1 keyframe tới Vision trước khi chat.');
+            }
+
+            function ensureRagSessionId() {
+                if (ragSessionId) {
+                    return ragSessionId;
+                }
+
+                ragSessionId = `livetalking_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+                renderRagSessionId();
+                return ragSessionId;
+            }
+
+            async function sendChatMessage(message, rawTranscript) {
+                const liveSessionId = parseInt(document.getElementById('sessionid').value, 10);
+                if (!liveSessionId) {
+                    throw new Error('Hãy bấm "Bắt đầu kết nối" trước khi chat với Noble RAG.');
+                }
+
+                const response = await fetch('/human', {
+                    body: JSON.stringify({
+                        text: message,
+                        raw_transcript: rawTranscript || message,
+                        type: 'chat',
+                        interrupt: true,
+                        sessionid: liveSessionId,
+                        rag_session_id: ensureRagSessionId(),
+                    }),
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    method: 'POST'
+                });
+
+                if (!response.ok) {
+                    throw new Error('Gửi câu hỏi sang Noble RAG thất bại.');
+                }
+
+                const data = await response.json();
+                if (data.rag_session_id) {
+                    ragSessionId = data.rag_session_id;
+                    renderRagSessionId();
+                }
+                return data;
+            }
+
+            async function startVisionCamera() {
+                if (visionStream) {
+                    return;
+                }
+
+                visionStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+                const preview = document.getElementById('vision-preview');
+                preview.srcObject = visionStream;
+                preview.style.display = 'block';
+                $('#vision-placeholder').hide();
+                $('#btn_capture_vision').prop('disabled', false);
+                $('#btn_stop_camera').prop('disabled', false);
+                setVisionStatus('Camera đã bật, bạn có thể gửi keyframe tới Vision.');
+            }
+
+            function stopVisionCamera() {
+                if (visionStream) {
+                    visionStream.getTracks().forEach(track => track.stop());
+                    visionStream = null;
+                }
+
+                const preview = document.getElementById('vision-preview');
+                preview.srcObject = null;
+                preview.style.display = 'none';
+                $('#vision-placeholder').show();
+                $('#btn_capture_vision').prop('disabled', true);
+                $('#btn_stop_camera').prop('disabled', true);
+            }
+
+            window.addEventListener('beforeunload', function() {
+                stopVisionCamera();
+            });
+
+            async function captureVisionKeyframe() {
+                if (!visionStream) {
+                    throw new Error('Camera chưa được bật.');
+                }
+
+                const preview = document.getElementById('vision-preview');
+                const canvas = document.getElementById('vision-canvas');
+                const width = preview.videoWidth || 640;
+                const height = preview.videoHeight || 480;
+                canvas.width = width;
+                canvas.height = height;
+
+                const context = canvas.getContext('2d');
+                context.drawImage(preview, 0, 0, width, height);
+
+                const imageBlob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.92));
+                if (!imageBlob) {
+                    throw new Error('Không tạo được ảnh keyframe.');
+                }
+
+                const formData = new FormData();
+                formData.append('session_id', ensureRagSessionId());
+                formData.append('source', (nobleConfig && nobleConfig.vision_source) || 'browser');
+                formData.append('image', imageBlob, 'vision-keyframe.jpg');
+
+                const response = await fetch('/noble/vision/identify', {
+                    method: 'POST',
+                    body: formData,
+                });
+                const result = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(result.detail || 'Vision identify thất bại.');
+                }
+
+                const customerId = result.customer_id || 'unknown';
+                const customerType = result.is_existing_customer ? 'khách cũ' : 'khách mới';
+                const matchScore = result.match_score == null ? 'n/a' : result.match_score;
+                setVisionStatus(`Vision đã nhận diện ${customerType}. customer_id=${customerId}, match_score=${matchScore}`);
+                return result;
+            }
+
+            initializeNobleSession().catch(function(error) {
+                console.error(error);
+                setVisionStatus(error.message || 'Không khởi tạo được Noble RAG session.', true);
+            });
+
+            function updateConnectionStatus(status) {
+                const statusIndicator = $('#connection-status');
+                const statusText = $('#status-text');
+                
+                statusIndicator.removeClass('status-connected status-disconnected status-connecting');
+                
+                switch(status) {
+                    case 'connected':
+                        statusIndicator.addClass('status-connected');
+                        statusText.text('Đã kết nối');
+                        break;
+                    case 'connecting':
+                        statusIndicator.addClass('status-connecting');
+                        statusText.text('Đang kết nối...');
+                        break;
+                    case 'disconnected':
+                    default:
+                        statusIndicator.addClass('status-disconnected');
+                        statusText.text('Chưa kết nối');
+                        break;
+                }
+            }
+
+            // ÃƒÂ¦Ã‚Â·Ã‚Â»ÃƒÂ¥Ã…Â Ã‚Â ÃƒÂ¨Ã‚ÂÃ…Â ÃƒÂ¥Ã‚Â¤Ã‚Â©ÃƒÂ¦Ã‚Â¶Ã‹â€ ÃƒÂ¦Ã‚ÂÃ‚Â¯
+            function addChatMessage(message, type = 'user') {
+                const messagesContainer = $('#chat-messages');
+                const messageClass = type === 'user' ? 'user-message' : 'system-message';
+                const sender = type === 'user' ? 'Bạn' : 'Sunny';
+                
+                const messageElement = $(`
+                    <div class="asr-text ${messageClass}">
+                        ${sender}: ${message}
+                    </div>
+                `);
+                
+                messagesContainer.append(messageElement);
+                messagesContainer.scrollTop(messagesContainer[0].scrollHeight);
+            }
+
+            // ÃƒÂ¥Ã‚Â¼Ã¢â€šÂ¬ÃƒÂ¥Ã‚Â§Ã¢â‚¬Â¹/ÃƒÂ¥Ã‚ÂÃ…â€œÃƒÂ¦Ã‚Â­Ã‚Â¢ÃƒÂ¦Ã…â€™Ã¢â‚¬Â°ÃƒÂ©Ã¢â‚¬â„¢Ã‚Â®
+            $('#start').click(function() {
+                updateConnectionStatus('connecting');
+                start();
+                $(this).hide();
+                $('#stop').show();
+                
+                // ÃƒÂ¦Ã‚Â·Ã‚Â»ÃƒÂ¥Ã…Â Ã‚Â ÃƒÂ¥Ã‚Â®Ã…Â¡ÃƒÂ¦Ã¢â‚¬â€Ã‚Â¶ÃƒÂ¥Ã¢â€žÂ¢Ã‚Â¨ÃƒÂ¦Ã‚Â£Ã¢â€šÂ¬ÃƒÂ¦Ã…Â¸Ã‚Â¥ÃƒÂ¨Ã‚Â§Ã¢â‚¬Â ÃƒÂ©Ã‚Â¢Ã¢â‚¬ËœÃƒÂ¦Ã‚ÂµÃ‚ÂÃƒÂ¦Ã‹Å“Ã‚Â¯ÃƒÂ¥Ã‚ÂÃ‚Â¦ÃƒÂ¥Ã‚Â·Ã‚Â²ÃƒÂ¥Ã…Â Ã‚Â ÃƒÂ¨Ã‚Â½Ã‚Â½
+                let connectionCheckTimer = setInterval(function() {
+                    const video = document.getElementById('video');
+                    // ÃƒÂ¦Ã‚Â£Ã¢â€šÂ¬ÃƒÂ¦Ã…Â¸Ã‚Â¥ÃƒÂ¨Ã‚Â§Ã¢â‚¬Â ÃƒÂ©Ã‚Â¢Ã¢â‚¬ËœÃƒÂ¦Ã‹Å“Ã‚Â¯ÃƒÂ¥Ã‚ÂÃ‚Â¦ÃƒÂ¦Ã…â€œÃ¢â‚¬Â°ÃƒÂ¦Ã¢â‚¬Â¢Ã‚Â°ÃƒÂ¦Ã‚ÂÃ‚Â®
+                    if (video.readyState >= 3 && video.videoWidth > 0) {
+                        updateConnectionStatus('connected');
+                        clearInterval(connectionCheckTimer);
+                    }
+                }, 2000); // ÃƒÂ¦Ã‚Â¯Ã‚Â2ÃƒÂ§Ã‚Â§Ã¢â‚¬â„¢ÃƒÂ¦Ã‚Â£Ã¢â€šÂ¬ÃƒÂ¦Ã…Â¸Ã‚Â¥ÃƒÂ¤Ã‚Â¸Ã¢â€šÂ¬ÃƒÂ¦Ã‚Â¬Ã‚Â¡
+                
+                // 60ÃƒÂ§Ã‚Â§Ã¢â‚¬â„¢ÃƒÂ¥Ã‚ÂÃ…Â½ÃƒÂ¥Ã‚Â¦Ã¢â‚¬Å¡ÃƒÂ¦Ã…Â¾Ã…â€œÃƒÂ¨Ã‚Â¿Ã‹Å“ÃƒÂ¦Ã‹Å“Ã‚Â¯ÃƒÂ¨Ã‚Â¿Ã…Â¾ÃƒÂ¦Ã…Â½Ã‚Â¥ÃƒÂ¤Ã‚Â¸Ã‚Â­ÃƒÂ§Ã…Â Ã‚Â¶ÃƒÂ¦Ã¢â€šÂ¬Ã‚ÂÃƒÂ¯Ã‚Â¼Ã…â€™ÃƒÂ¥Ã‚Â°Ã‚Â±ÃƒÂ¥Ã‚ÂÃ…â€œÃƒÂ¦Ã‚Â­Ã‚Â¢ÃƒÂ¦Ã‚Â£Ã¢â€šÂ¬ÃƒÂ¦Ã…Â¸Ã‚Â¥
+                setTimeout(function() {
+                    if (connectionCheckTimer) {
+                        clearInterval(connectionCheckTimer);
+                    }
+                }, 60000);
+            });
+
+            $('#stop').click(function() {
+                stop();
+                $(this).hide();
+                $('#start').show();
+                updateConnectionStatus('disconnected');
+            });
+
+            $('#btn_start_camera').click(function() {
+                startVisionCamera().catch(function(error) {
+                    console.error('Không truy cập được camera:', error);
+                    setVisionStatus(error.message || 'Không mở được camera browser.', true);
+                });
+            });
+
+            $('#btn_stop_camera').click(function() {
+                stopVisionCamera();
+                setVisionStatus('Đã tắt camera browser.');
+            });
+
+            $('#btn_capture_vision').click(function() {
+                captureVisionKeyframe().catch(function(error) {
+                    console.error('Gửi Vision keyframe thất bại:', error);
+                    setVisionStatus(error.message || 'Gửi keyframe tới Vision thất bại.', true);
+                });
+            });
+
+            // ÃƒÂ¥Ã‚Â½Ã¢â‚¬Â¢ÃƒÂ¥Ã‹â€ Ã‚Â¶ÃƒÂ¥Ã…Â Ã…Â¸ÃƒÂ¨Ã†â€™Ã‚Â½
+            $('#btn_start_record').click(function() {
+                console.log('Starting recording...');
+                fetch('/record', {
+                    body: JSON.stringify({
+                        type: 'start_record',
+                        sessionid: parseInt(document.getElementById('sessionid').value),
+                    }),
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    method: 'POST'
+                }).then(function(response) {
+                    if (response.ok) {
+                        console.log('Recording started.');
+                        $('#btn_start_record').prop('disabled', true);
+                        $('#btn_stop_record').prop('disabled', false);
+                        $('#recording-indicator').addClass('active');
+                    } else {
+                        console.error('Failed to start recording.');
+                    }
+                }).catch(function(error) {
+                    console.error('Error:', error);
+                });
+            });
+
+            $('#btn_stop_record').click(function() {
+                console.log('Stopping recording...');
+                fetch('/record', {
+                    body: JSON.stringify({
+                        type: 'end_record',
+                        sessionid: parseInt(document.getElementById('sessionid').value),
+                    }),
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    method: 'POST'
+                }).then(function(response) {
+                    if (response.ok) {
+                        console.log('Recording stopped.');
+                        $('#btn_start_record').prop('disabled', false);
+                        $('#btn_stop_record').prop('disabled', true);
+                        $('#recording-indicator').removeClass('active');
+                    } else {
+                        console.error('Failed to stop recording.');
+                    }
+                }).catch(function(error) {
+                    console.error('Error:', error);
+                });
+            });
+
+            $('#echo-form').on('submit', function(e) {
+                e.preventDefault();
+                var message = $('#message').val();
+                if (!message.trim()) return;
+                
+                console.log('Sending echo message:', message);
+                
+                fetch('/human', {
+                    body: JSON.stringify({
+                        text: message,
+                        type: 'echo',
+                        interrupt: true,
+                        sessionid: parseInt(document.getElementById('sessionid').value),
+                    }),
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    method: 'POST'
+                });
+                
+                $('#message').val('');
+                addChatMessage(`Đã gửi yêu cầu TTS: "${message}"`, 'system');
+            });
+
+            // ÃƒÂ¨Ã‚ÂÃ…Â ÃƒÂ¥Ã‚Â¤Ã‚Â©ÃƒÂ¦Ã‚Â¨Ã‚Â¡ÃƒÂ¥Ã‚Â¼Ã‚ÂÃƒÂ¨Ã‚Â¡Ã‚Â¨ÃƒÂ¥Ã‚ÂÃ¢â‚¬Â¢ÃƒÂ¦Ã‚ÂÃ‚ÂÃƒÂ¤Ã‚ÂºÃ‚Â¤
+            $('#chat-form').on('submit', function(e) {
+                e.preventDefault();
+                var message = $('#chat-message').val();
+                if (!message.trim()) return;
+                
+                console.log('Sending chat message:', message);
+                sendChatMessage(message, message).catch(function(error) {
+                    console.error(error);
+                    addChatMessage('Không gửi được câu hỏi sang Noble RAG.', 'system');
+                });
+                
+                addChatMessage(message, 'user');
+                $('#chat-message').val('');
+            });
+
+            // ÃƒÂ¦Ã…â€™Ã¢â‚¬Â°ÃƒÂ¤Ã‚Â½Ã‚ÂÃƒÂ¨Ã‚Â¯Ã‚Â´ÃƒÂ¨Ã‚Â¯Ã‚ÂÃƒÂ¥Ã…Â Ã…Â¸ÃƒÂ¨Ã†â€™Ã‚Â½
+            let mediaRecorder;
+            let audioChunks = [];
+            let isRecording = false;
+
+            async function transcribeWithWhisperService(audioBlob) {
+                const formData = new FormData();
+                formData.append('audio', audioBlob, 'mic-input.webm');
+                formData.append('language', 'vi');
+
+                const response = await fetch('/noble/whisper/transcribe', {
+                    method: 'POST',
+                    body: formData,
+                });
+                const payload = await response.json();
+                if (!response.ok) {
+                    throw new Error(payload.detail || 'Whisper service transcribe failed');
+                }
+                return (payload.text || '').trim();
+            }
+
+            $('#voice-record-btn').on('mousedown touchstart', function(e) {
+                e.preventDefault();
+                startRecording();
+            }).on('mouseup mouseleave touchend', function() {
+                if (isRecording) {
+                    stopRecording();
+                }
+            });
+
+            function startRecording() {
+                if (isRecording) return;
+
+                navigator.mediaDevices.getUserMedia({ audio: true })
+                    .then(function(stream) {
+                        audioChunks = [];
+                        mediaRecorder = new MediaRecorder(stream);
+
+                        mediaRecorder.ondataavailable = function(e) {
+                            if (e.data.size > 0) {
+                                audioChunks.push(e.data);
+                            }
+                        };
+
+                        mediaRecorder.onstop = async function() {
+                            try {
+                                if (!audioChunks.length) {
+                                    return;
+                                }
+                                const audioBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+                                const recognizedText = await transcribeWithWhisperService(audioBlob);
+                                if (!recognizedText) {
+                                    addChatMessage('Whisper service không nhận được nội dung, bạn nói chậm và rõ hơn giúp mình nhé.', 'system');
+                                    return;
+                                }
+
+                                $('#chat-message').val(recognizedText);
+                                sendChatMessage(recognizedText, recognizedText).catch(function(error) {
+                                    console.error(error);
+                                    addChatMessage('Không gửi được transcript sang Noble RAG.', 'system');
+                                });
+                                addChatMessage(recognizedText, 'user');
+                                $('#chat-message').val('');
+                            } catch (error) {
+                                console.error('Whisper service transcribe error:', error);
+                                addChatMessage('Không nhận diện được giọng nói bằng Whisper service.', 'system');
+                            }
+                        };
+
+                        mediaRecorder.start();
+                        isRecording = true;
+
+                        $('#voice-record-btn').addClass('recording-pulse');
+                        $('#voice-record-btn').css('background-color', '#dc3545');
+                    })
+                    .catch(function(error) {
+                        console.error('Unable to access microphone:', error);
+                        alert('Không thể truy cập microphone. Vui lòng kiểm tra quyền trình duyệt.');
+                    });
+            }
+
+            function stopRecording() {
+                if (!isRecording) return;
+
+                mediaRecorder.stop();
+                isRecording = false;
+
+                mediaRecorder.stream.getTracks().forEach(track => track.stop());
+
+                $('#voice-record-btn').removeClass('recording-pulse');
+                $('#voice-record-btn').css('background-color', '');
+            }
+            // WebRTC ÃƒÂ§Ã¢â‚¬ÂºÃ‚Â¸ÃƒÂ¥Ã¢â‚¬Â¦Ã‚Â³ÃƒÂ¥Ã…Â Ã…Â¸ÃƒÂ¨Ã†â€™Ã‚Â½
+            if (typeof window.onWebRTCConnected === 'function') {
+                const originalOnConnected = window.onWebRTCConnected;
+                window.onWebRTCConnected = function() {
+                    updateConnectionStatus('connected');
+                    if (originalOnConnected) originalOnConnected();
+                };
+            } else {
+                window.onWebRTCConnected = function() {
+                    updateConnectionStatus('connected');
+                };
+            }
+
+            // ÃƒÂ¥Ã‚Â½Ã¢â‚¬Å“ÃƒÂ¨Ã‚Â¿Ã…Â¾ÃƒÂ¦Ã…Â½Ã‚Â¥ÃƒÂ¦Ã¢â‚¬â€œÃ‚Â­ÃƒÂ¥Ã‚Â¼Ã¢â€šÂ¬ÃƒÂ¦Ã¢â‚¬â€Ã‚Â¶ÃƒÂ¦Ã¢â‚¬ÂºÃ‚Â´ÃƒÂ¦Ã¢â‚¬â€œÃ‚Â°ÃƒÂ§Ã…Â Ã‚Â¶ÃƒÂ¦Ã¢â€šÂ¬Ã‚Â
+            if (typeof window.onWebRTCDisconnected === 'function') {
+                const originalOnDisconnected = window.onWebRTCDisconnected;
+                window.onWebRTCDisconnected = function() {
+                    updateConnectionStatus('disconnected');
+                    if (originalOnDisconnected) originalOnDisconnected();
+                };
+            } else {
+                window.onWebRTCDisconnected = function() {
+                    updateConnectionStatus('disconnected');
+                };
+            }
+
+            // SRS WebRTCÃƒÂ¦Ã¢â‚¬â„¢Ã‚Â­ÃƒÂ¦Ã¢â‚¬ÂÃ‚Â¾ÃƒÂ¥Ã…Â Ã…Â¸ÃƒÂ¨Ã†â€™Ã‚Â½
+            var sdk = null; // ÃƒÂ¥Ã¢â‚¬Â¦Ã‚Â¨ÃƒÂ¥Ã‚Â±Ã¢â€šÂ¬ÃƒÂ¥Ã‚Â¤Ã¢â‚¬Å¾ÃƒÂ§Ã‚ÂÃ¢â‚¬Â ÃƒÂ¥Ã¢â€žÂ¢Ã‚Â¨ÃƒÂ¯Ã‚Â¼Ã…â€™ÃƒÂ§Ã¢â‚¬ÂÃ‚Â¨ÃƒÂ¤Ã‚ÂºÃ…Â½ÃƒÂ¥Ã…â€œÃ‚Â¨ÃƒÂ©Ã¢â‚¬Â¡Ã‚ÂÃƒÂ¦Ã¢â‚¬â€œÃ‚Â°ÃƒÂ¥Ã‚ÂÃ¢â‚¬ËœÃƒÂ¥Ã‚Â¸Ã†â€™ÃƒÂ¦Ã¢â‚¬â€Ã‚Â¶ÃƒÂ¨Ã‚Â¿Ã¢â‚¬ÂºÃƒÂ¨Ã‚Â¡Ã…â€™ÃƒÂ¦Ã‚Â¸Ã¢â‚¬Â¦ÃƒÂ§Ã‚ÂÃ¢â‚¬Â 
+
+            function startPlay() {
+                // ÃƒÂ¥Ã¢â‚¬Â¦Ã‚Â³ÃƒÂ©Ã¢â‚¬â€Ã‚Â­ÃƒÂ¤Ã‚Â¹Ã¢â‚¬Â¹ÃƒÂ¥Ã¢â‚¬Â°Ã‚ÂÃƒÂ§Ã…Â¡Ã¢â‚¬Å¾ÃƒÂ¨Ã‚Â¿Ã…Â¾ÃƒÂ¦Ã…Â½Ã‚Â¥
+                if (sdk) {
+                    sdk.close();
+                }
+                
+                sdk = new SrsRtcWhipWhepAsync();
+                $('#video').prop('srcObject', sdk.stream);
+                
+                var host = window.location.hostname;
+                var url = "http://" + host + ":1985/rtc/v1/whep/?app=live&stream=livestream";
+                
+                sdk.play(url).then(function(session) {
+                    console.log('WebRTCÃƒÂ¦Ã¢â‚¬â„¢Ã‚Â­ÃƒÂ¦Ã¢â‚¬ÂÃ‚Â¾ÃƒÂ¥Ã‚Â·Ã‚Â²ÃƒÂ¥Ã‚ÂÃ‚Â¯ÃƒÂ¥Ã…Â Ã‚Â¨ÃƒÂ¯Ã‚Â¼Ã…â€™ÃƒÂ¤Ã‚Â¼Ã…Â¡ÃƒÂ¨Ã‚Â¯Ã‚ÂID:', session.sessionid);
+                }).catch(function(reason) {
+                    sdk.close();
+                    console.error('WebRTCÃƒÂ¦Ã¢â‚¬â„¢Ã‚Â­ÃƒÂ¦Ã¢â‚¬ÂÃ‚Â¾ÃƒÂ¥Ã‚Â¤Ã‚Â±ÃƒÂ¨Ã‚Â´Ã‚Â¥:', reason);
+                });
+            }
+        });
+    </script>
+</body>
+</html>
+
+
+

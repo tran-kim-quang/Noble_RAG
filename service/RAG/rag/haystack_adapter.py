@@ -12,7 +12,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
 import asyncpg
 from qdrant_client import QdrantClient
@@ -44,10 +44,12 @@ class HaystackRAGAdapter:
         *,
         settings: HaystackRAGSettings,
         llm_model_func: Callable[..., Awaitable[str]],
+        llm_stream_model_func: Optional[Callable[..., AsyncIterator[str]]] = None,
         embedding_func: Callable[[List[str]], Awaitable[Any]],
     ) -> None:
         self.settings = settings
         self.llm_model_func = llm_model_func
+        self.llm_stream_model_func = llm_stream_model_func
         self.embedding_func = embedding_func
         self._qdrant: Optional[QdrantClient] = None
         self._schema_ready = False
@@ -159,13 +161,10 @@ class HaystackRAGAdapter:
         if not context_blocks:
             return ""
 
-        prompt = (
-            "Bạn là trợ lý tư vấn bất động sản của Noble. "
-            "Dựa trên ngữ cảnh truy xuất dưới đây để trả lời ngắn gọn, đúng trọng tâm. "
-            "Nếu thiếu dữ liệu thì nói rõ là chưa đủ thông tin.\n\n"
-            f"Question:\n{search_query}\n\n"
-            "Retrieved Context:\n"
-            + "\n\n---\n\n".join(context_blocks[:top_k])
+        prompt = self._build_rag_prompt(
+            search_query=search_query,
+            context_blocks=context_blocks,
+            top_k=top_k,
         )
         history = conversation_history or []
         response = await self.llm_model_func(
@@ -174,6 +173,71 @@ class HaystackRAGAdapter:
             enable_cot=False,
         )
         return str(response or "")
+
+    async def aquery_stream(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+    ) -> AsyncIterator[str]:
+        await self.initialize_storages()
+        if self.llm_stream_model_func is None:
+            text = await self.aquery(
+                query,
+                top_k=top_k,
+                conversation_history=conversation_history,
+            )
+            if text:
+                yield text
+            return
+
+        search_query = (query or "").strip()
+        if not search_query:
+            return
+
+        vector = (await self._embed_texts([search_query]))[0]
+        query_response = self.qdrant.query_points(
+            collection_name=self.settings.collection_name,
+            query=vector,
+            limit=max(1, top_k),
+            with_payload=True,
+            query_filter=Filter(
+                must=[
+                    FieldCondition(
+                        key="workspace",
+                        match=MatchValue(value=self.settings.workspace),
+                    )
+                ]
+            ),
+        )
+        results = list(getattr(query_response, "points", []) or [])
+
+        context_blocks: List[str] = []
+        for point in results:
+            payload = dict(getattr(point, "payload", None) or {})
+            content = str(payload.get("content") or "").strip()
+            source = str(payload.get("file_path") or payload.get("document_id") or "unknown")
+            if not content:
+                continue
+            context_blocks.append(f"[source={source}]\n{content}")
+
+        if not context_blocks:
+            return
+
+        prompt = self._build_rag_prompt(
+            search_query=search_query,
+            context_blocks=context_blocks,
+            top_k=top_k,
+        )
+        history = conversation_history or []
+        async for delta in self.llm_stream_model_func(
+            prompt,
+            history_messages=history[-6:],
+            enable_cot=False,
+        ):
+            if delta:
+                yield str(delta)
 
     async def adelete_by_doc_id(self, doc_id: str) -> None:
         await self.initialize_storages()
@@ -205,6 +269,17 @@ class HaystackRAGAdapter:
             )
         finally:
             await conn.close()
+
+    @staticmethod
+    def _build_rag_prompt(*, search_query: str, context_blocks: List[str], top_k: int) -> str:
+        return (
+            "Bạn là trợ lý tư vấn bất động sản của Noble. "
+            "Dựa trên ngữ cảnh truy xuất dưới đây để trả lời ngắn gọn, đúng trọng tâm. "
+            "Nếu thiếu dữ liệu thì nói rõ là chưa đủ thông tin.\n\n"
+            f"Question:\n{search_query}\n\n"
+            "Retrieved Context:\n"
+            + "\n\n---\n\n".join(context_blocks[:top_k])
+        )
 
     def _ensure_qdrant_collection(self) -> None:
         collections = self.qdrant.get_collections().collections

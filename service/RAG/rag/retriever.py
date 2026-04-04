@@ -1,39 +1,31 @@
-"""RAG retrieval logic — routing, KB probe, decomposition, querying.
-
-All functions here use the singletons from core.dependencies.
-"""
+"""RAG retrieval logic - routing, decomposition, and querying."""
 
 import asyncio
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
-from core.dependencies import rag, llm_model_func
 from core.config import get_settings
-from utils.time import now_vietnam_str
+from core.dependencies import llm_model_func, rag
 from tools.tavily_tool import tavily_search
+from utils.time import now_vietnam_str
 
 settings = get_settings()
 log = logging.getLogger("rag-service")
 
-
-# ── Helpers ──────────────────────────────────────────────────────────────
 
 def _normalize_search_query(original: str, refined: Optional[str]) -> str:
     candidate = (refined or original or "").strip()
     if not candidate:
         return "Việt Nam"
     lowered = candidate.lower()
-    if "việt nam" in lowered or "vietnam" in lowered:
+    if "việt nam" in lowered or "viet nam" in lowered or "vietnam" in lowered:
         return candidate
     return f"{candidate} tại Việt Nam"
 
 
-# ── KB evidence probe ─────────────────────────────────────────────────────
-
-async def kb_evidence_probe(
-    query: str, history: List[Dict[str, Any]]
-) -> bool:
+async def kb_evidence_probe(query: str, history: List[Dict[str, Any]]) -> bool:
+    """Probe whether KB can answer; returns True/False."""
     try:
         probe_query = (
             "Bạn là bộ kiểm tra bằng chứng nội bộ. "
@@ -57,17 +49,13 @@ async def kb_evidence_probe(
         return False
 
 
-# ── Subquery decomposition ────────────────────────────────────────────────
-
 async def decompose_subqueries(query: str) -> List[str]:
     text = re.sub(r"\s+", " ", (query or "")).strip()
     if not text:
         return []
-    # Vector-only fast path: avoid extra LLM call for decomposition.
+    # Vector-only fast path: avoid extra LLM call.
     return [text]
 
-
-# ── Intent router ─────────────────────────────────────────────────────────
 
 async def route_query(
     query: str,
@@ -113,7 +101,9 @@ async def route_query(
     }
     greeting_patterns = (
         "xin chào",
+        "xin chao",
         "chào",
+        "chao",
         "hello",
         "hi",
     )
@@ -133,8 +123,6 @@ async def route_query(
     log.info("Router: RAG (rule default)")
     return "RAG", text
 
-
-# ── Summarize search answer ───────────────────────────────────────────────
 
 async def summarize_search_answer(
     user_query: str,
@@ -157,8 +145,6 @@ Trả lời:"""
     raw = await llm_model_func(summary_prompt, history_messages=history)
     return str(raw)
 
-
-# ── Direct RAG query (used by sales agent) ───────────────────────────────
 
 async def query_rag(
     text: str,
@@ -188,3 +174,25 @@ async def query_rag(
     except Exception as e:
         log.error("RAG query error: %s", e)
         return ""
+
+
+async def query_rag_stream(
+    text: str,
+    top_k: int = 5,
+    history: Optional[List[Dict[str, Any]]] = None,
+    system_context: str = "",
+) -> AsyncIterator[str]:
+    """Stream RAG answer deltas as they are generated."""
+    if history is None:
+        history = []
+    full_query = f"{system_context}\n\n{text}".strip() if system_context else text
+    try:
+        async for delta in rag.aquery_stream(
+            full_query,
+            top_k=top_k,
+            conversation_history=history,
+        ):
+            if delta:
+                yield delta if isinstance(delta, str) else str(delta)
+    except Exception as e:
+        log.error("RAG stream query error: %s", e)

@@ -20,6 +20,7 @@ Endpoints:
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from core.config import get_settings
 from core.dependencies import rag
@@ -27,6 +28,7 @@ from core.logging import setup_logging, get_logger
 from memory.lead_profile_store import ensure_sales_schema
 from api.routes_health import router as health_router
 from api.routes_documents import router as documents_router
+from api.routes_lan_bridge import router as lan_bridge_router
 from api.routes_pipeline_v1 import router as pipeline_v1_router
 from api.routes_query import router as query_router
 from api.routes_sales import router as sales_router
@@ -41,6 +43,21 @@ app = FastAPI(
     title="Noble RAG + Sales Agent API",
     description="Haystack-powered retrieval + LangGraph AI Sales Agent for Noble real estate.",
     version="2.0.0",
+)
+
+_cors_origins_raw = (settings.cors_origins or "*").strip()
+if _cors_origins_raw == "*" or not _cors_origins_raw:
+    _cors_origins = ["*"]
+else:
+    _cors_origins = [item.strip() for item in _cors_origins_raw.split(",") if item.strip()]
+_allow_credentials = _cors_origins != ["*"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=_allow_credentials,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -63,6 +80,7 @@ app.include_router(documents_router)
 app.include_router(query_router)
 app.include_router(sales_router)
 app.include_router(pipeline_v1_router)
+app.include_router(lan_bridge_router)
 
 
 if __name__ == "__main__":

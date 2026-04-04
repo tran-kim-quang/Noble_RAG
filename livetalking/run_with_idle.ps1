@@ -1,0 +1,108 @@
+$ErrorActionPreference = "Stop"
+
+$projectRoot = $PSScriptRoot
+Set-Location $projectRoot
+
+if (-not $env:PYTHONUTF8) { $env:PYTHONUTF8 = "1" }
+if (-not $env:PYTHONIOENCODING) { $env:PYTHONIOENCODING = "utf-8" }
+
+$pythonCandidates = @(
+  (Join-Path $projectRoot "venv\Scripts\python.exe"),
+  (Join-Path $projectRoot ".venv\Scripts\python.exe"),
+  "python"
+)
+$pythonExe = $pythonCandidates | Where-Object { $_ -eq "python" -or (Test-Path $_) } | Select-Object -First 1
+if (-not $pythonExe) {
+  Write-Host "Cannot find Python executable. Expected venv\.venv python or python in PATH."
+  exit 1
+}
+
+$envFile = Join-Path $projectRoot ".env"
+if (Test-Path $envFile) {
+  Get-Content $envFile | ForEach-Object {
+    if ($_ -match "^\s*#") { return }
+    if ($_ -match "^\s*$") { return }
+    $pair = $_ -split "=", 2
+    if ($pair.Length -eq 2) {
+      $k = $pair[0].Trim()
+      $v = $pair[1].Trim()
+      if ($k -and $v -and -not (Get-Item "Env:$k" -ErrorAction SilentlyContinue)) {
+        [System.Environment]::SetEnvironmentVariable($k, $v, "Process")
+      }
+    }
+  }
+}
+
+$avatarId = "half_avatar"
+$requestedTts = "elevenlabs"
+$enableTransition = $false
+$transitionDuration = 0.06
+$transport = if ($env:LIVETALKING_TRANSPORT) { $env:LIVETALKING_TRANSPORT } else { "webrtc" }
+$pushUrl = if ($env:LIVETALKING_PUSH_URL) { $env:LIVETALKING_PUSH_URL } else { "http://localhost:1985/rtc/v1/whip/?app=live&stream=livestream" }
+$listenPort = if ($env:LIVETALKING_PORT) { $env:LIVETALKING_PORT } else { "18010" }
+
+# Noble RAG runtime configuration used by livetalking/rag_chat_client.py
+if (-not $env:NOBLE_RAG_API_URL) { $env:NOBLE_RAG_API_URL = "http://127.0.0.1:8010" }
+if (-not $env:NOBLE_VISION_API_URL) { $env:NOBLE_VISION_API_URL = "http://127.0.0.1:8020" }
+if (-not $env:NOBLE_WHISPER_API_URL) { $env:NOBLE_WHISPER_API_URL = "http://127.0.0.1:8001" }
+if (-not $env:NOBLE_VISION_SOURCE) { $env:NOBLE_VISION_SOURCE = "browser" }
+if (-not $env:RAG_CHAT_MODE) { $env:RAG_CHAT_MODE = "stream" }
+if (-not $env:RAG_CHAT_ENDPOINT) { $env:RAG_CHAT_ENDPOINT = "/query/stream" }
+if (-not $env:RAG_STREAM_METHOD) { $env:RAG_STREAM_METHOD = "POST" }
+if (-not $env:LIGHTRAG_URL) { $env:LIGHTRAG_URL = $env:NOBLE_RAG_API_URL }
+if (-not $env:RAG_STREAM_ENDPOINT) { $env:RAG_STREAM_ENDPOINT = "/query/stream" }
+
+Write-Host "Project root: $projectRoot"
+Write-Host "Python: $pythonExe"
+Write-Host "Avatar: $avatarId"
+Write-Host "Hold video: disabled"
+Write-Host "TTS requested: $requestedTts"
+Write-Host "Transport: $transport"
+Write-Host "Listen port: $listenPort"
+Write-Host "Whisper API: $env:NOBLE_WHISPER_API_URL"
+if ($transport -eq "rtcpush") {
+  Write-Host "RTCPush URL: $pushUrl"
+}
+
+$vaeConfigCandidates = @(
+  (Join-Path $projectRoot "models\sd-vae-ft-mse\config.json"),
+  (Join-Path $projectRoot "models\sd-vae\config.json")
+)
+$vaeConfigFound = $vaeConfigCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+$requiredModelPaths = @(
+  (Join-Path $projectRoot "models\musetalkV15\unet.pth"),
+  (Join-Path $projectRoot "models\musetalkV15\musetalk.json"),
+  (Join-Path $projectRoot "models\whisper\config.json")
+)
+
+$missingModelPaths = @()
+if (-not $vaeConfigFound) {
+  $missingModelPaths += $vaeConfigCandidates[0]
+}
+$missingModelPaths += @($requiredModelPaths | Where-Object { -not (Test-Path $_) })
+if ($missingModelPaths.Count -gt 0) {
+  Write-Host "Missing required MuseTalk model files:"
+  $missingModelPaths | ForEach-Object { Write-Host " - $_" }
+  Write-Host "Place the downloaded MuseTalk model bundle under $projectRoot\models and try again."
+  exit 1
+}
+
+$arguments = @(
+  "app.py",
+  "--avatar_id", $avatarId,
+  "--tts", $requestedTts,
+  "--transport", $transport,
+  "--listenport", "$listenPort",
+  "--transition_duration", "$transitionDuration"
+)
+
+if ($transport -eq "rtcpush") {
+  $arguments += @("--push_url", $pushUrl)
+}
+
+if ($enableTransition) {
+  $arguments += "--enable_transition"
+}
+
+& $pythonExe @arguments

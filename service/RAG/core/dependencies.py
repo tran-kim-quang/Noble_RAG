@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import logging as _logging
 import os
-from typing import Any, List
+import json
+from typing import Any, AsyncIterator, List
 
 import httpx
 import numpy as np
@@ -32,29 +33,44 @@ def _openai_client(base_url: str | None = None) -> AsyncOpenAI:
     )
 
 
-async def llm_model_func(
+def _build_chat_messages(
+    *,
     prompt: str,
     system_prompt: str | None = None,
     history_messages: list[dict[str, Any]] | None = None,
-    **kwargs: Any,
-) -> str:
+) -> List[dict[str, str]]:
     history = history_messages or []
-    response_format = kwargs.pop("response_format", None)
-    kwargs.pop("keyword_extraction", None)
-    kwargs.pop("enable_cot", None)
-    provider = settings.llm_provider.lower().strip()
-
     messages: List[dict[str, str]] = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     for item in history[-8:]:
         role = str(item.get("role") or "user")
         content = str(item.get("content") or "").strip()
-        if content:
-            if role not in {"system", "user", "assistant"}:
-                role = "user"
-            messages.append({"role": role, "content": content})
+        if not content:
+            continue
+        if role not in {"system", "user", "assistant"}:
+            role = "user"
+        messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": prompt})
+    return messages
+
+
+async def llm_model_func(
+    prompt: str,
+    system_prompt: str | None = None,
+    history_messages: list[dict[str, Any]] | None = None,
+    **kwargs: Any,
+) -> str:
+    response_format = kwargs.pop("response_format", None)
+    kwargs.pop("keyword_extraction", None)
+    kwargs.pop("enable_cot", None)
+    provider = settings.llm_provider.lower().strip()
+
+    messages = _build_chat_messages(
+        prompt=prompt,
+        system_prompt=system_prompt,
+        history_messages=history_messages,
+    )
 
     if provider == "ollama":
         ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
@@ -92,6 +108,61 @@ async def llm_model_func(
     if not resp.choices:
         return ""
     return str(resp.choices[0].message.content or "")
+
+
+async def llm_model_stream_func(
+    prompt: str,
+    system_prompt: str | None = None,
+    history_messages: list[dict[str, Any]] | None = None,
+    **kwargs: Any,
+) -> AsyncIterator[str]:
+    kwargs.pop("response_format", None)
+    kwargs.pop("keyword_extraction", None)
+    kwargs.pop("enable_cot", None)
+    provider = settings.llm_provider.lower().strip()
+    messages = _build_chat_messages(
+        prompt=prompt,
+        system_prompt=system_prompt,
+        history_messages=history_messages,
+    )
+
+    if provider == "ollama":
+        ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+        payload = {
+            "model": settings.llm_model,
+            "messages": messages,
+            "stream": True,
+        }
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream("POST", f"{ollama_host}/api/chat", json=payload) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    raw = (line or "").strip()
+                    if not raw:
+                        continue
+                    try:
+                        data = json.loads(raw)
+                    except Exception:
+                        continue
+                    delta = str((data.get("message") or {}).get("content") or "")
+                    if delta:
+                        yield delta
+        return
+
+    payload: dict[str, Any] = {
+        "model": settings.llm_model,
+        "messages": messages,
+        "temperature": kwargs.pop("temperature", 0.2),
+        "stream": True,
+    }
+    client = _openai_client()
+    stream = await client.chat.completions.create(**payload)
+    async for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = str(chunk.choices[0].delta.content or "")
+        if delta:
+            yield delta
 
 
 async def _embed_with_openai(texts: List[str]) -> np.ndarray:
@@ -176,5 +247,6 @@ rag = HaystackRAGAdapter(
         chunk_overlap=settings.chunk_overlap,
     ),
     llm_model_func=llm_model_func,
+    llm_stream_model_func=llm_model_stream_func,
     embedding_func=embedding_func,
 )
