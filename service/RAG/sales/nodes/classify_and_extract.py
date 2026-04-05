@@ -43,8 +43,8 @@ Trả về DUY NHẤT một JSON với cấu trúc chính xác sau:
 }}
 
 Định nghĩa intent:
-- greeting: chào hỏi, giới thiệu bản thân
-- ask_recommendation: hỏi về dự án, muốn tư vấn, muốn giới thiệu sản phẩm
+- greeting: chào hỏi, giới thiệu bản thân; hoặc chỉ xin được tư vấn / cần hỗ trợ chung mà chưa hỏi chi tiết (giá, vị trí, pháp lý, loại hình sản phẩm, tiện ích cụ thể).
+- ask_recommendation: muốn xem gợi ý sản phẩm phù hợp, shortlist, hoặc đã nêu tiêu chí cụ thể để tư vấn
 - project_info: hỏi thông tin cụ thể về dự án/sản phẩm/chính sách/pháp lý/tiện ích/vị trí mà cần trả lời trực tiếp theo dữ liệu có sẵn, không phải xin agent tư vấn shortlist
 - comparison: muốn so sánh 2+ lựa chọn
 - objection: phản đối, băn khoăn về giá/pháp lý/vị trí/tài chính

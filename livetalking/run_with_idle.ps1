@@ -33,7 +33,7 @@ if (Test-Path $envFile) {
   }
 }
 
-$avatarId = "half_avatar"
+$avatarId = "half-avatar"
 $requestedTts = "elevenlabs"
 $enableTransition = $false
 $transitionDuration = 0.06
@@ -51,6 +51,14 @@ if (-not $env:RAG_CHAT_ENDPOINT) { $env:RAG_CHAT_ENDPOINT = "/query/stream" }
 if (-not $env:RAG_STREAM_METHOD) { $env:RAG_STREAM_METHOD = "POST" }
 if (-not $env:LIGHTRAG_URL) { $env:LIGHTRAG_URL = $env:NOBLE_RAG_API_URL }
 if (-not $env:RAG_STREAM_ENDPOINT) { $env:RAG_STREAM_ENDPOINT = "/query/stream" }
+if (-not $env:NOBLE_USE_CAMERA_CHAT_ENDPOINT) { $env:NOBLE_USE_CAMERA_CHAT_ENDPOINT = "true" }
+if (-not $env:RAG_CAMERA_CHAT_ENDPOINT) { $env:RAG_CAMERA_CHAT_ENDPOINT = "/api/v1/sales/chat-with-camera" }
+if (-not $env:NOBLE_CAMERA_SESSION_BY_CUSTOMER_ID) { $env:NOBLE_CAMERA_SESSION_BY_CUSTOMER_ID = "true" }
+if (-not $env:NOBLE_CAMERA_CHAT_STRICT) { $env:NOBLE_CAMERA_CHAT_STRICT = "true" }
+if (-not $env:NOBLE_CAMERA_BACKENDS) { $env:NOBLE_CAMERA_BACKENDS = "CAP_MSMF,CAP_DSHOW,CAP_ANY" }
+if (-not $env:NOBLE_CAMERA_INDEXES) { $env:NOBLE_CAMERA_INDEXES = "0,1,2" }
+if (-not $env:NOBLE_WHISPER_EOF_RETRY) { $env:NOBLE_WHISPER_EOF_RETRY = "1" }
+# Optional: VISION_STARTUP_SMOKE=1 — chỉ hợp lệ khi NOBLE_VISION_SOURCE=camera hoặc VISION_STARTUP_SMOKE_FORCE=1 (OpenCV có webcam)
 
 Write-Host "Project root: $projectRoot"
 Write-Host "Python: $pythonExe"

@@ -10,7 +10,17 @@ from utils.text import split_into_sentences
 
 log = logging.getLogger("rag-service")
 
-_GREETING_MARKERS = ("xin chào", "chào anh/chị", "chào anh chị", "em là tư vấn viên")
+_GREETING_MARKERS = (
+    "xin chào",
+    "chào anh/chị",
+    "chào anh chị",
+    "chào anh,",
+    "chào anh ",
+    "chào chị,",
+    "chào chị ",
+    "em là tư vấn viên",
+    "em là sunny",
+)
 
 
 def _contains_greeting(text: str) -> bool:

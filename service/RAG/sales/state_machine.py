@@ -26,7 +26,9 @@ def resolve_next_state(state: Dict[str, Any]) -> str:
 
     # Keep the opening greeting only on the actual first user turn.
     if current_state == "greeting" and is_first_turn and not lead_profile.get("purpose"):
-        if not extracted_slots and (intent in ("greeting", "", "other") or not intent):
+        if not extracted_slots and (
+            intent in ("greeting", "", "other", "ask_recommendation") or not intent
+        ):
             return "greeting"
 
     if extracted_slots and missing and current_state in {"greeting", "need_discovery", "product_matching", "qualification"}:

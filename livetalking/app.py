@@ -47,7 +47,7 @@ import shutil
 import asyncio
 import os
 from contextlib import suppress
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from uuid import uuid4
 from logger import logger
 import gc
@@ -60,6 +60,7 @@ chat_tasks:Dict[int, asyncio.Task] = {}
 rag_session_ids:Dict[int, str] = {}
 rag_session_confirmed:Dict[int, bool] = {}
 camera_customer_hints:Dict[int, str] = {}
+camera_frame_cache:Dict[int, Tuple[bytes, str]] = {}
 opt = None
 model = None
 avatar = None
@@ -114,38 +115,98 @@ def _capture_camera_frame_sync() -> bytes:
     import cv2
 
     camera_index = int((os.getenv("NOBLE_CAMERA_INDEX") or "0").strip() or "0")
+    camera_indexes_raw = (os.getenv("NOBLE_CAMERA_INDEXES") or "").strip()
+    camera_indexes = []
+    if camera_indexes_raw:
+        for token in camera_indexes_raw.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                camera_indexes.append(int(token))
+            except ValueError:
+                continue
+    if camera_index not in camera_indexes:
+        camera_indexes.insert(0, camera_index)
+    if not camera_indexes:
+        camera_indexes = [0]
+
     warmup_frames = max(1, int((os.getenv("NOBLE_CAMERA_WARMUP_FRAMES") or "4").strip() or "4"))
     jpeg_quality = max(30, min(100, int((os.getenv("NOBLE_CAMERA_JPEG_QUALITY") or "90").strip() or "90")))
     width = int((os.getenv("NOBLE_CAMERA_WIDTH") or "0").strip() or "0")
     height = int((os.getenv("NOBLE_CAMERA_HEIGHT") or "0").strip() or "0")
 
-    backend = cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY
-    cap = cv2.VideoCapture(camera_index, backend)
-    if not cap.isOpened():
-        raise RuntimeError(f"cannot open camera index={camera_index}")
+    backend_names = (os.getenv("NOBLE_CAMERA_BACKENDS") or "").strip()
+    if backend_names:
+        backend_order = [name.strip().upper() for name in backend_names.split(",") if name.strip()]
+    elif os.name == "nt":
+        backend_order = ["CAP_MSMF", "CAP_DSHOW", "CAP_ANY"]
+    else:
+        backend_order = ["CAP_ANY"]
+
+    backend_values = []
+    for name in backend_order:
+        value = getattr(cv2, name, None)
+        if value is None:
+            continue
+        backend_values.append((name, value))
+    if not backend_values:
+        backend_values = [("CAP_ANY", cv2.CAP_ANY)]
+
+    open_errors = []
+    read_errors = []
+    for idx in camera_indexes:
+        for backend_name, backend in backend_values:
+            cap = cv2.VideoCapture(idx, backend)
+            if not cap.isOpened():
+                open_errors.append(f"index={idx}/{backend_name}")
+                cap.release()
+                continue
+            try:
+                if width > 0:
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                if height > 0:
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+                ok = False
+                frame = None
+                for _ in range(warmup_frames):
+                    ok, frame = cap.read()
+                if not ok or frame is None:
+                    read_errors.append(f"index={idx}/{backend_name}: camera read failed")
+                    continue
+
+                encoded_ok, encoded = cv2.imencode(
+                    ".jpg",
+                    frame,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality],
+                )
+                if not encoded_ok:
+                    read_errors.append(f"index={idx}/{backend_name}: jpeg encode failed")
+                    continue
+                return bytes(encoded.tobytes())
+            finally:
+                cap.release()
+
+    detail = "; ".join((open_errors + read_errors)[:6]) or "unknown camera open/read failure"
+    raise RuntimeError(f"cannot capture camera frame ({detail})")
+
+
+def _capture_for_vision_smoke_sync() -> bytes:
+    """Giảm spam WARN từ OpenCV khi quét MSMF/DSHOW cho smoke test."""
     try:
-        if width > 0:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        if height > 0:
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        import cv2
 
-        ok = False
-        frame = None
-        for _ in range(warmup_frames):
-            ok, frame = cap.read()
-        if not ok or frame is None:
-            raise RuntimeError("camera read failed")
-
-        encoded_ok, encoded = cv2.imencode(
-            ".jpg",
-            frame,
-            [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality],
-        )
-        if not encoded_ok:
-            raise RuntimeError("camera frame JPEG encode failed")
-        return bytes(encoded.tobytes())
-    finally:
-        cap.release()
+        logging_mod = getattr(getattr(cv2, "utils", None), "logging", None)
+        if logging_mod is not None and hasattr(logging_mod, "setLogLevel"):
+            level = getattr(logging_mod, "LOG_LEVEL_SILENT", None)
+            if level is None:
+                level = getattr(logging_mod, "LOG_LEVEL_ERROR", None)
+            if level is not None:
+                logging_mod.setLogLevel(level)
+    except Exception:
+        pass
+    return _capture_camera_frame_sync()
 
 
 async def maybe_capture_camera_frame() -> Optional[bytes]:
@@ -155,6 +216,26 @@ async def maybe_capture_camera_frame() -> Optional[bytes]:
     loop = asyncio.get_event_loop()
     async with lock:
         return await loop.run_in_executor(None, _capture_camera_frame_sync)
+
+
+def _decode_image_data_url(raw_value: str) -> Tuple[bytes, str]:
+    text = (raw_value or "").strip()
+    if not text:
+        raise ValueError("image_base64 is empty")
+
+    content_type = "image/jpeg"
+    payload = text
+    if text.startswith("data:"):
+        match = re.match(r"^data:([^;]+);base64,(.+)$", text, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            raise ValueError("invalid image data URL")
+        content_type = (match.group(1) or "image/jpeg").strip() or "image/jpeg"
+        payload = match.group(2)
+
+    try:
+        return base64.b64decode(payload, validate=True), content_type
+    except Exception as exc:
+        raise ValueError("invalid image_base64 payload") from exc
 
 
 async def build_nerfreal_async(sessionid: int) -> BaseReal:
@@ -183,32 +264,65 @@ async def cancel_chat_task(sessionid: int) -> None:
         await task
 
 
-async def run_rag_chat(sessionid: int, rag_session_id: str, message: str, raw_transcript: str = None):
+async def run_rag_chat(
+    sessionid: int,
+    rag_session_id: str,
+    message: str,
+    raw_transcript: str = None,
+    image_bytes: Optional[bytes] = None,
+    image_content_type: str = "image/jpeg",
+):
     try:
         nerfreal = nerfreals[sessionid]
         use_camera_route = _env_flag("NOBLE_USE_CAMERA_CHAT_ENDPOINT", True)
+        strict_camera_route = _env_flag("NOBLE_CAMERA_CHAT_STRICT", False)
         if use_camera_route:
-            try:
-                image_bytes = await maybe_capture_camera_frame()
-            except Exception as capture_exc:
-                logger.warning("auto camera capture failed, fallback to standard chat: %s", capture_exc)
-                image_bytes = None
+            if image_bytes is None:
+                cached = camera_frame_cache.get(sessionid)
+                if cached and cached[0]:
+                    image_bytes, image_content_type = cached
+                    logger.info(
+                        "Using cached browser frame for session=%s bytes=%s",
+                        sessionid,
+                        len(image_bytes or b""),
+                    )
+            if image_bytes is None and not strict_camera_route:
+                try:
+                    image_bytes = await maybe_capture_camera_frame()
+                    logger.info(
+                        "Using local OpenCV capture for session=%s bytes=%s",
+                        sessionid,
+                        len(image_bytes or b""),
+                    )
+                except Exception as capture_exc:
+                    logger.warning("auto camera capture failed, fallback to standard chat: %s", capture_exc)
+                    image_bytes = None
 
             if image_bytes:
                 source = (os.getenv("NOBLE_CAMERA_CHAT_SOURCE") or "livetalking_auto_camera").strip()
                 channel = (os.getenv("NOBLE_CAMERA_CHAT_CHANNEL") or "kiosk").strip()
                 current_hint = camera_customer_hints.get(sessionid)
-                session_id_for_camera = rag_session_id if rag_session_confirmed.get(sessionid) else None
+                # By default, let backend bind/open session by customer_id from vision.
+                prefer_customer_session = _env_flag("NOBLE_CAMERA_SESSION_BY_CUSTOMER_ID", True)
+                session_id_for_camera = None
+                if not prefer_customer_session and rag_session_confirmed.get(sessionid):
+                    session_id_for_camera = rag_session_id
                 result = await relay_rag_chat_with_camera_to_avatar(
                     message=message,
                     nerfreal=nerfreal,
                     image_bytes=image_bytes,
                     image_filename=f"livetalking_session_{sessionid}.jpg",
-                    image_content_type="image/jpeg",
+                    image_content_type=image_content_type or "image/jpeg",
                     rag_session_id=session_id_for_camera,
                     channel=channel or "kiosk",
                     source=source or "livetalking_auto_camera",
                     customer_id_hint=current_hint,
+                )
+                logger.info(
+                    "Camera route delivered for session=%s session_id=%s customer_id=%s",
+                    sessionid,
+                    str(result.get("session_id") or ""),
+                    str(result.get("customer_id") or ""),
                 )
                 resolved_session_id = str(result.get("session_id") or "").strip()
                 if resolved_session_id:
@@ -217,6 +331,12 @@ async def run_rag_chat(sessionid: int, rag_session_id: str, message: str, raw_tr
                 resolved_customer_id = str(result.get("customer_id") or "").strip()
                 if resolved_customer_id:
                     camera_customer_hints[sessionid] = resolved_customer_id
+                return
+            if strict_camera_route:
+                logger.warning("camera route strict mode: no image available for session=%s", sessionid)
+                nerfreal.put_msg_txt(
+                    "Em chưa chụp được ảnh camera cho lượt này. Anh/Chị bật camera browser rồi thử lại giúp em nhé."
+                )
                 return
 
         await relay_rag_chat_to_avatar(
@@ -240,71 +360,83 @@ async def run_rag_chat(sessionid: int, rag_session_id: str, message: str, raw_tr
 
 #@app.route('/offer', methods=['POST'])
 async def offer(request):
-    params = await request.json()
-    offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+    try:
+        params = await request.json()
+        offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
-    # if len(nerfreals) >= opt.max_session:
-    #     logger.info('reach max session')
-    #     return web.Response(
-    #         content_type="application/json",
-    #         text=json.dumps(
-    #             {"code": -1, "msg": "reach max session"}
-    #         ),
-    #     )
-    sessionid = randN(6) #len(nerfreals)
-    nerfreals[sessionid] = None
-    logger.info('sessionid=%d, session num=%d',sessionid,len(nerfreals))
-    nerfreal = await build_nerfreal_async(sessionid)
-    nerfreals[sessionid] = nerfreal
-    
-    #ice_server = RTCIceServer(urls='stun:stun.l.google.com:19302')
-    ice_server = RTCIceServer(urls='stun:stun.freeswitch.org:3478')
-    pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=[ice_server]))
-    pcs.add(pc)
+        # if len(nerfreals) >= opt.max_session:
+        #     logger.info('reach max session')
+        #     return web.Response(
+        #         content_type="application/json",
+        #         text=json.dumps(
+        #             {"code": -1, "msg": "reach max session"}
+        #         ),
+        #     )
+        sessionid = randN(6) #len(nerfreals)
+        nerfreals[sessionid] = None
+        logger.info('sessionid=%d, session num=%d',sessionid,len(nerfreals))
+        nerfreal = await build_nerfreal_async(sessionid)
+        nerfreals[sessionid] = nerfreal
+        
+        #ice_server = RTCIceServer(urls='stun:stun.l.google.com:19302')
+        ice_server = RTCIceServer(urls='stun:stun.freeswitch.org:3478')
+        pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=[ice_server]))
+        pcs.add(pc)
 
-    @pc.on("connectionstatechange")
-    async def on_connectionstatechange():
-        logger.info("Connection state is %s" % pc.connectionState)
-        if pc.connectionState == "failed":
-            await cancel_chat_task(sessionid)
-            await pc.close()
-            pcs.discard(pc)
-            rag_session_ids.pop(sessionid, None)
-            rag_session_confirmed.pop(sessionid, None)
-            camera_customer_hints.pop(sessionid, None)
-            del nerfreals[sessionid]
-        if pc.connectionState == "closed":
-            await cancel_chat_task(sessionid)
-            pcs.discard(pc)
-            rag_session_ids.pop(sessionid, None)
-            rag_session_confirmed.pop(sessionid, None)
-            camera_customer_hints.pop(sessionid, None)
-            del nerfreals[sessionid]
-            # gc.collect()
+        @pc.on("connectionstatechange")
+        async def on_connectionstatechange():
+            logger.info("Connection state is %s" % pc.connectionState)
+            if pc.connectionState == "failed":
+                await cancel_chat_task(sessionid)
+                await pc.close()
+                pcs.discard(pc)
+                rag_session_ids.pop(sessionid, None)
+                rag_session_confirmed.pop(sessionid, None)
+                camera_customer_hints.pop(sessionid, None)
+                camera_frame_cache.pop(sessionid, None)
+                del nerfreals[sessionid]
+            if pc.connectionState == "closed":
+                await cancel_chat_task(sessionid)
+                pcs.discard(pc)
+                rag_session_ids.pop(sessionid, None)
+                rag_session_confirmed.pop(sessionid, None)
+                camera_customer_hints.pop(sessionid, None)
+                camera_frame_cache.pop(sessionid, None)
+                del nerfreals[sessionid]
+                # gc.collect()
 
-    player = HumanPlayer(nerfreals[sessionid])
-    audio_sender = pc.addTrack(player.audio)
-    video_sender = pc.addTrack(player.video)
-    capabilities = RTCRtpSender.getCapabilities("video")
-    preferences = list(filter(lambda x: x.name == "H264", capabilities.codecs))
-    preferences += list(filter(lambda x: x.name == "VP8", capabilities.codecs))
-    preferences += list(filter(lambda x: x.name == "rtx", capabilities.codecs))
-    transceiver = pc.getTransceivers()[1]
-    transceiver.setCodecPreferences(preferences)
+        player = HumanPlayer(nerfreals[sessionid])
+        audio_sender = pc.addTrack(player.audio)
+        video_sender = pc.addTrack(player.video)
+        capabilities = RTCRtpSender.getCapabilities("video")
+        preferences = list(filter(lambda x: x.name == "H264", capabilities.codecs))
+        preferences += list(filter(lambda x: x.name == "VP8", capabilities.codecs))
+        preferences += list(filter(lambda x: x.name == "rtx", capabilities.codecs))
+        transceiver = pc.getTransceivers()[1]
+        transceiver.setCodecPreferences(preferences)
 
-    await pc.setRemoteDescription(offer)
+        await pc.setRemoteDescription(offer)
 
-    answer = await pc.createAnswer()
-    await pc.setLocalDescription(answer)
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
 
-    #return jsonify({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
+        #return jsonify({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
 
-    return web.Response(
-        content_type="application/json",
-        text=json.dumps(
-            {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type, "sessionid":sessionid}
-        ),
-    )
+        return web.Response(
+            content_type="application/json",
+            text=json.dumps(
+                {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type, "sessionid":sessionid}
+            ),
+        )
+    except Exception as e:
+        logger.exception('offer exception:')
+        return web.Response(
+            status=500,
+            content_type="application/json",
+            text=json.dumps(
+                {"code": -1, "msg": str(e)}
+            ),
+        )
 
 async def human(request):
     try:
@@ -315,6 +447,31 @@ async def human(request):
             raise ValueError('LiveTalking session is not ready. Please start the avatar connection first.')
         incoming_rag_session_id = (params.get('rag_session_id') or '').strip()
         rag_session_id = incoming_rag_session_id
+        image_bytes: Optional[bytes] = None
+        image_content_type = "image/jpeg"
+        image_base64 = (params.get("image_base64") or "").strip()
+        referer = (request.headers.get("Referer") or "").strip()
+        user_agent = (request.headers.get("User-Agent") or "").strip()
+        if image_base64:
+            try:
+                image_bytes, image_content_type = _decode_image_data_url(image_base64)
+                camera_frame_cache[sessionid] = (image_bytes, image_content_type)
+                logger.info(
+                    "UI image_base64 received session=%s bytes=%s content_type=%s",
+                    sessionid,
+                    len(image_bytes or b""),
+                    image_content_type,
+                )
+            except Exception as decode_exc:
+                logger.warning("invalid image_base64 from UI, fallback to local capture: %s", decode_exc)
+        else:
+            logger.warning(
+                "UI image_base64 missing for session=%s referer=%s ua=%s; will use cache/local capture",
+                sessionid,
+                referer or "unknown",
+                user_agent[:120] if user_agent else "unknown",
+            )
+
         if not rag_session_id:
             rag_session_id = rag_session_ids.get(sessionid) or build_rag_session_id()
         if incoming_rag_session_id:
@@ -336,6 +493,8 @@ async def human(request):
                     rag_session_id=rag_session_id,
                     message=params['text'],
                     raw_transcript=raw_transcript,
+                    image_bytes=image_bytes,
+                    image_content_type=image_content_type,
                 )
             )
             chat_tasks[sessionid] = chat_task
@@ -408,32 +567,52 @@ async def local_whisper_transcribe(request):
         if not whisper_base_url:
             raise ValueError("NOBLE_WHISPER_API_URL is not configured")
 
-        payload = aiohttp.FormData()
-        payload.add_field("file", filebytes, filename=filename, content_type=fileobj.content_type or "audio/webm")
-        payload.add_field("language", language)
-        payload.add_field("word_timestamps", "false")
+        if len(filebytes) < 512:
+            raise ValueError("audio is too short")
 
         timeout = aiohttp.ClientTimeout(total=180)
+        retry_eof = max(0, int((os.getenv("NOBLE_WHISPER_EOF_RETRY") or "1").strip() or "1"))
+
+        def _build_payload() -> aiohttp.FormData:
+            payload = aiohttp.FormData()
+            payload.add_field(
+                "file",
+                filebytes,
+                filename=filename,
+                content_type=fileobj.content_type or "audio/webm",
+            )
+            payload.add_field("language", language)
+            payload.add_field("word_timestamps", "false")
+            return payload
+
+        last_error = ""
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(f"{whisper_base_url}/transcribe", data=payload) as response:
-                body = await response.text()
-                if response.status >= 400:
-                    raise RuntimeError(f"whisper-service returned {response.status}: {body[:300]}")
+            for attempt in range(retry_eof + 1):
+                async with session.post(f"{whisper_base_url}/transcribe", data=_build_payload()) as response:
+                    body = await response.text()
+                    if response.status >= 400:
+                        last_error = f"whisper-service returned {response.status}: {body[:300]}"
+                        eof_error = "end of file" in body.lower() or "eof" in body.lower()
+                        if eof_error and attempt < retry_eof:
+                            await asyncio.sleep(0.2)
+                            continue
+                        raise RuntimeError(last_error)
 
-                try:
-                    data = json.loads(body) if body else {}
-                except Exception:
-                    data = {}
+                    try:
+                        data = json.loads(body) if body else {}
+                    except Exception:
+                        data = {}
 
-                text = str(
-                    data.get("text")
-                    or data.get("transcript")
-                    or data.get("full_text")
-                    or ""
-                ).strip()
-                if not text and body and not body.lstrip().startswith("{"):
-                    text = body.strip()
-                return web.json_response({"text": text, "language": language})
+                    text = str(
+                        data.get("text")
+                        or data.get("transcript")
+                        or data.get("full_text")
+                        or ""
+                    ).strip()
+                    if not text and body and not body.lstrip().startswith("{"):
+                        text = body.strip()
+                    return web.json_response({"text": text, "language": language})
+        raise RuntimeError(last_error or "whisper-service returned empty response")
     except Exception as e:
         logger.exception("whisper-service proxy transcribe failed")
         return web.Response(
@@ -441,6 +620,84 @@ async def local_whisper_transcribe(request):
             content_type="application/json",
             text=json.dumps({"detail": str(e)}),
         )
+
+
+async def on_startup_vision_smoke(_app):
+    """Chụp 1 frame (OpenCV) rồi POST tới vision — chỉ khi bạn chủ động bật.
+
+    - VISION_STARTUP_SMOKE=1 và NOBLE_VISION_SOURCE=camera: chạy smoke OpenCV.
+    - NOBLE_VISION_SOURCE=browser (mặc định Noble): bỏ qua — ảnh lấy từ trình duyệt khi chat, không có webcam OpenCV lúc start.
+    - Muốn vẫn thử OpenCV khi đang browser: VISION_STARTUP_SMOKE=1 và VISION_STARTUP_SMOKE_FORCE=1.
+    """
+    if not _env_flag("VISION_STARTUP_SMOKE", False):
+        return
+    vision_source = (os.getenv("NOBLE_VISION_SOURCE") or "browser").strip().lower()
+    if vision_source == "browser" and not _env_flag("VISION_STARTUP_SMOKE_FORCE", False):
+        logger.info(
+            "VISION_STARTUP_SMOKE: skipped (NOBLE_VISION_SOURCE=browser). "
+            "Set NOBLE_VISION_SOURCE=camera or VISION_STARTUP_SMOKE_FORCE=1 to run OpenCV smoke."
+        )
+        return
+    cfg = get_noble_runtime_config()
+    base = (cfg.get("vision_base_url") or "").strip().rstrip("/")
+    if not base:
+        logger.warning("VISION_STARTUP_SMOKE: skip — NOBLE_VISION_API_URL / vision_base_url empty")
+        return
+    rel = (os.getenv("VISION_STARTUP_PATH") or "vision/identify-and-context").strip().strip("/")
+    url = f"{base}/{rel}"
+    loop = asyncio.get_event_loop()
+    try:
+        jpeg = await loop.run_in_executor(None, _capture_for_vision_smoke_sync)
+    except Exception as e:
+        logger.warning("VISION_STARTUP_SMOKE: camera capture failed: %s", e)
+        return
+    session_id = f"livetalking_smoke_{uuid4().hex[:12]}"
+    payload = aiohttp.FormData()
+    payload.add_field("session_id", session_id)
+    payload.add_field("source", "livetalking_startup")
+    payload.add_field("channel", "camera-kiosk")
+    payload.add_field("allow_create_unknown", "true")
+    payload.add_field(
+        "image",
+        jpeg,
+        filename="smoke.jpg",
+        content_type="image/jpeg",
+    )
+    try:
+        timeout = aiohttp.ClientTimeout(total=120)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, data=payload) as resp:
+                status = resp.status
+                response_body = await resp.read()
+        try:
+            data = json.loads(response_body.decode("utf-8"))
+            if isinstance(data, dict):
+                vs = data.get("vision_summary")
+                logger.info(
+                    "VISION_STARTUP_SMOKE: POST %s http_status=%s session_id=%s top_keys=%s vision_summary_keys=%s",
+                    url,
+                    status,
+                    session_id,
+                    sorted(data.keys()),
+                    sorted(vs.keys()) if isinstance(vs, dict) else None,
+                )
+            else:
+                logger.info(
+                    "VISION_STARTUP_SMOKE: POST %s http_status=%s session_id=%s non-object JSON",
+                    url,
+                    status,
+                    session_id,
+                )
+        except Exception:
+            logger.info(
+                "VISION_STARTUP_SMOKE: POST %s http_status=%s session_id=%s body_prefix=%r",
+                url,
+                status,
+                session_id,
+                response_body[:400],
+            )
+    except Exception as e:
+        logger.warning("VISION_STARTUP_SMOKE: POST %s failed: %s", url, e)
 
 
 async def proxy_vision_identify(request):
@@ -603,6 +860,7 @@ async def on_shutdown(app):
     rag_session_ids.clear()
     rag_session_confirmed.clear()
     camera_customer_hints.clear()
+    camera_frame_cache.clear()
 
 async def post(url,data):
     try:
@@ -670,7 +928,7 @@ if __name__ == '__main__':
     parser.add_argument('--H', type=int, default=450, help="GUI height")
 
     #musetalk opt
-    parser.add_argument('--avatar_id', type=str, default='half_avatar', help="define which avatar in data/avatars")
+    parser.add_argument('--avatar_id', type=str, default='half-avatar', help="define which avatar in data/avatars")
     #parser.add_argument('--bbox_shift', type=int, default=5)
     parser.add_argument('--batch_size', type=int, default=16, help="infer batch")
 
@@ -738,8 +996,32 @@ if __name__ == '__main__':
         rendthrd.start()
 
     #############################################################################
-    appasync = web.Application(client_max_size=1024**2*100)
+    @web.middleware
+    async def no_cache_frontend_middleware(request, handler):
+        response = await handler(request)
+        path = request.path.lower()
+        if path.endswith(".html") or path.endswith(".js"):
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+        return response
+
+    appasync = web.Application(
+        client_max_size=1024**2*100,
+        middlewares=[no_cache_frontend_middleware],
+    )
+    appasync.on_startup.append(on_startup_vision_smoke)
     appasync.on_shutdown.append(on_shutdown)
+
+    default_page = 'dashboard.html'
+    if opt.transport == 'rtmp':
+        default_page = 'echoapi.html'
+    elif opt.transport == 'rtcpush':
+        default_page = 'rtcpushapi.html'
+
+    async def root_index(_request):
+        raise web.HTTPFound('/' + default_page)
+
+    appasync.router.add_get("/", root_index)
     appasync.router.add_post("/offer", offer)
     appasync.router.add_post("/human", human)
     appasync.router.add_post("/humanaudio", humanaudio)
@@ -766,11 +1048,7 @@ if __name__ == '__main__':
     for route in list(appasync.router.routes()):
         cors.add(route)
 
-    pagename='webrtcapi.html'
-    if opt.transport=='rtmp':
-        pagename='echoapi.html'
-    elif opt.transport=='rtcpush':
-        pagename='rtcpushapi.html'
+    pagename = default_page
     logger.info('start http server; http://<serverip>:'+str(opt.listenport)+'/'+pagename)
     logger.info('如果使用webrtc，推荐访问webrtc集成前端: http://<serverip>:'+str(opt.listenport)+'/dashboard.html')
     def run_server(runner):
@@ -778,7 +1056,18 @@ if __name__ == '__main__':
         asyncio.set_event_loop(loop)
         loop.run_until_complete(runner.setup())
         site = web.TCPSite(runner, '0.0.0.0', opt.listenport)
-        loop.run_until_complete(site.start())
+        try:
+            loop.run_until_complete(site.start())
+        except OSError as e:
+            winerr = getattr(e, "winerror", None)
+            errno = getattr(e, "errno", None)
+            if winerr == 10048 or errno == 98:
+                logger.error(
+                    "Port %s already in use — close the other LiveTalking (or any app on this port) "
+                    "or set env LIVETALKING_PORT to another value.",
+                    opt.listenport,
+                )
+            raise
         if opt.transport=='rtcpush':
             push_success = 0
             for k in range(opt.max_session):

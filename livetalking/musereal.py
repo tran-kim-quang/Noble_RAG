@@ -291,7 +291,8 @@ class MuseReal(BaseReal):
 
         self.batch_size = opt.batch_size
         self.idx = 0
-        self.res_frame_queue = mp.Queue(self.batch_size*2)
+        # Use thread queue on Windows to avoid WinError 5 on mp.Queue creation.
+        self.res_frame_queue = Queue(self.batch_size * 2)
 
         self.vae, self.unet, self.pe, self.timesteps, self.audio_processor = model
         self.frame_list_cycle,self.mask_list_cycle,self.coord_list_cycle,self.mask_coords_list_cycle, self.input_latent_list_cycle = avatar
@@ -300,7 +301,7 @@ class MuseReal(BaseReal):
         self.asr = MuseASR(opt,self,self.audio_processor)
         self.asr.warm_up()
         
-        self.render_event = mp.Event()
+        self.render_event = Event()
 
     # def __del__(self):
     #     logger.info(f'musereal({self.sessionid}) delete')

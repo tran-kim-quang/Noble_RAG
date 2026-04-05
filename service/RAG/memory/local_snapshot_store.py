@@ -95,3 +95,53 @@ def delete_local_session_snapshot(session_id: str) -> bool:
         return False
     path.unlink()
     return True
+
+
+def delete_all_live_session_snapshots() -> int:
+    """Xóa mọi file ``*.txt`` trong ``live_snapshots`` (purge-all / quên toàn bộ phiên local)."""
+    d = _snapshot_dir()
+    if not d.is_dir():
+        return 0
+    n = 0
+    for path in list(d.glob("*.txt")):
+        try:
+            path.unlink()
+            n += 1
+        except OSError:
+            continue
+    return n
+
+
+def purge_chat_history_from_all_local_snapshots() -> int:
+    """Đặt chat_history=[] trong mọi file snapshot dưới live_snapshots (giữ lead_profile / session_context)."""
+    n = 0
+    for path in sorted(_snapshot_dir().glob("*.txt")):
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        first_brace = raw.find("{")
+        last_brace = raw.rfind("}")
+        if first_brace < 0 or last_brace < first_brace:
+            continue
+        try:
+            snap = json.loads(raw[first_brace : last_brace + 1])
+        except Exception:
+            continue
+        if not isinstance(snap, dict):
+            continue
+        sid = str(snap.get("session_id") or path.stem).strip() or path.stem
+        save_local_session_snapshot(
+            sid,
+            snap.get("lead_profile") or {},
+            snap.get("session_context") or {},
+            [],
+        )
+        written = _snapshot_path(sid).resolve()
+        if written != path.resolve():
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        n += 1
+    return n

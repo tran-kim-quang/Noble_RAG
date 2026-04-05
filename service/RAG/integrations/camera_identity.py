@@ -7,7 +7,7 @@ import asyncpg
 import httpx
 
 from core.config import get_settings
-from memory.chat_history_store import delete_chat_history, load_chat_history, save_chat_history
+from memory.chat_history_store import load_chat_history, save_chat_history
 from memory.lead_profile_store import load_lead_profile, save_lead_profile
 from memory.session_context_service import normalize_customer_profile
 from memory.session_store import load_session_context, save_session_context
@@ -92,6 +92,30 @@ def _fresh_lead_profile(session_id: str) -> Dict[str, Any]:
     }
 
 
+def _gender_estimate_usable_for_vision_seed(value: Any) -> bool:
+    """Chỉ ghi vào vision_context khi có giá trị thật — tránh chuỗi 'unknown' (truthy) làm tắc nguồn từ camera."""
+    if value is None or isinstance(value, bool):
+        return False
+    s = str(value).strip().lower()
+    if not s:
+        return False
+    if s in {
+        "unknown",
+        "unk",
+        "none",
+        "null",
+        "n/a",
+        "na",
+        "-",
+        "chua ro",
+        "chưa rõ",
+        "khong ro",
+        "không rõ",
+    }:
+        return False
+    return True
+
+
 def _pick_identity_estimate(payload: Dict[str, Any], key: str, fallback: str = "unknown") -> str:
     value = str(payload.get(key) or "").strip()
     if value:
@@ -132,11 +156,14 @@ async def _apply_identity_payload(session_id: str, payload: Dict[str, Any]) -> D
         return payload
 
     if previous_customer_id and new_customer_id and previous_customer_id != new_customer_id:
-        await delete_chat_history(session_id)
-        session_context = _fresh_session_context(session_id)
-        lead_profile = _fresh_lead_profile(session_id)
         session_context["identity_customer_switched"] = True
         session_context["previous_customer_id"] = previous_customer_id
+        log.info(
+            "camera_identity: customer_id changed session=%s %s -> %s (giữ nguyên chat Redis, session_context, lead_profile)",
+            session_id,
+            previous_customer_id,
+            new_customer_id,
+        )
 
     session_context["customer_id"] = payload.get("customer_id") or session_context.get("customer_id")
     session_context["identity_status"] = "matched" if payload.get("is_existing_customer") else "new"
@@ -213,10 +240,12 @@ async def _apply_identity_payload(session_id: str, payload: Dict[str, Any]) -> D
     if customer_profile:
         context_json["customer_profile"] = customer_profile
     vision_context = dict(context_json.get("vision_context") or {})
-    if session_context.get("gender_estimate"):
-        vision_context.setdefault("gender_guess", session_context.get("gender_estimate"))
-    if session_context.get("age_group_estimate"):
-        vision_context.setdefault("age_range", session_context.get("age_group_estimate"))
+    ge = session_context.get("gender_estimate")
+    if _gender_estimate_usable_for_vision_seed(ge):
+        vision_context.setdefault("gender_guess", ge)
+    age_est = session_context.get("age_group_estimate")
+    if _gender_estimate_usable_for_vision_seed(age_est):
+        vision_context.setdefault("age_range", age_est)
     if vision_context:
         context_json["vision_context"] = vision_context
         session_context["context_ready"] = True

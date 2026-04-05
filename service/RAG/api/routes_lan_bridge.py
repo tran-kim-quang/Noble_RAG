@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict
 from urllib.parse import quote
 
@@ -10,9 +11,11 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
 from core.config import get_settings
+from integrations.machine_b_face_client import notify_machine_b_delete_face
 
 router = APIRouter(prefix="/api/v1/lan", tags=["lan-bridge"])
 settings = get_settings()
+log = logging.getLogger("rag-service")
 
 
 def _machine_b_base() -> str:
@@ -85,6 +88,26 @@ async def machine_b_get_face(customer_id: str):
     except Exception:
         payload = {"raw": resp.text}
     return JSONResponse(status_code=200, content=payload)
+
+
+@router.delete("/machine-b/face/{customer_id}")
+async def machine_b_delete_face(customer_id: str):
+    """Proxy xóa face embedding trên Machine B cho customer_id.
+
+    Machine B cần VISION_FACE_DELETE_TOKEN được cấu hình trên cả hai đầu.
+    """
+    cid = (customer_id or "").strip()
+    if not cid:
+        raise HTTPException(status_code=400, detail="customer_id is required")
+    result = await notify_machine_b_delete_face(cid)
+    if result is None:
+        cfg = get_settings()
+        if not cfg.machine_b_base_url:
+            raise HTTPException(status_code=400, detail="MACHINE_B_BASE_URL is not configured")
+        if not cfg.vision_face_delete_token:
+            raise HTTPException(status_code=503, detail="VISION_FACE_DELETE_TOKEN is not configured")
+        raise HTTPException(status_code=502, detail="Machine B did not respond successfully")
+    return JSONResponse(status_code=200, content=result)
 
 
 @router.post("/machine-b/face/register")

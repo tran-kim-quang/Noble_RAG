@@ -21,6 +21,20 @@
         max-width: 1280px;
     }
     </style>
+    <script>
+    (function redirectLegacyPage() {
+        try {
+            var params = new URLSearchParams(window.location.search || '');
+            if (params.get('legacy') === '1') {
+                return;
+            }
+            var target = '/dashboard.html' + (window.location.search || '') + (window.location.hash || '');
+            window.location.replace(target);
+        } catch (e) {
+            console.warn('redirect to dashboard failed', e);
+        }
+    })();
+    </script>
 </head>
 <body>
 

@@ -43,6 +43,43 @@ def _rag_chat_mode() -> str:
     return mode
 
 
+def _clean_text_for_tts(text: str) -> str:
+    """Loại bỏ Markdown và các ký tự đặc biệt gây khó cho TTS."""
+    if not text:
+        return ""
+    # Chuyển % thành chữ để tránh lỗi ElevenLabs loop
+    text = text.replace("%", " phần trăm")
+    # Loại bỏ Bold, Italic, Header
+    text = re.sub(r"[\*#_~`>]", " ", text)
+    # Loại bỏ các khoảng trắng thừa
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _split_into_sentences(text: str) -> list[str]:
+    """Chia văn bản thành danh sách câu để phát TTS từng phần."""
+    if not text:
+        return []
+    # Tách theo các dấu kết thúc câu phổ biến
+    parts = re.split(r"([.!?;:\n]+)", text)
+    sentences = []
+    current = ""
+    for i in range(0, len(parts) - 1, 2):
+        sentence = (parts[i] + parts[i+1]).strip()
+        if sentence:
+            cleaned = _clean_text_for_tts(sentence)
+            if cleaned:
+                sentences.append(cleaned)
+    # Phần còn dư nếu có
+    if len(parts) % 2 == 1:
+        last = parts[-1].strip()
+        if last:
+            cleaned = _clean_text_for_tts(last)
+            if cleaned:
+                sentences.append(cleaned)
+    return sentences
+
+
 def get_noble_runtime_config() -> Dict[str, str]:
     return {
         "rag_base_url": _service_base_url("NOBLE_RAG_API_URL", 8010),
@@ -108,7 +145,12 @@ async def _relay_stream_response_to_avatar(
             elapsed = time.perf_counter() - last_flush_ts
             if not _should_flush_buffer(candidate, elapsed, tts_cfg):
                 return
-        nerfreal.put_msg_txt(candidate)
+        
+        # Làm sạch trước khi đưa vào TTS
+        cleaned = _clean_text_for_tts(candidate)
+        if cleaned:
+            nerfreal.put_msg_txt(cleaned)
+        
         speech_buffer = ""
         last_flush_ts = time.perf_counter()
 
@@ -209,7 +251,9 @@ async def relay_rag_chat_to_avatar(
 
         answer = str(result.get("response") or "").strip()
         if answer:
-            nerfreal.put_msg_txt(answer)
+            sentences = _split_into_sentences(answer)
+            for sentence in sentences:
+                nerfreal.put_msg_txt(sentence)
 
         return result
 
@@ -259,7 +303,24 @@ async def relay_rag_chat_with_camera_to_avatar(
                 logger.warning("RAG camera chat response is not JSON, using raw text fallback.")
                 result = {"response": response_text}
 
+    fp = result.get("face_payload") if isinstance(result, dict) else None
+    if isinstance(fp, dict):
+        mk = list(fp.get("meta", {}).keys()) if isinstance(fp.get("meta"), dict) else []
+        logger.info(
+            "Noble RAG camera: Máy A đã gọi Máy B (qua chat-with-camera); response customer_id=%s session_id=%s face_payload_keys=%s meta_keys=%s",
+            result.get("customer_id"),
+            result.get("session_id"),
+            sorted(fp.keys()),
+            mk,
+        )
+    else:
+        logger.warning(
+            "Noble RAG camera: response không có face_payload (kiểm tra Máy A / MACHINE_B_BASE_URL trong container rag-service)"
+        )
+
     answer = str(result.get("response") or "").strip()
     if answer:
-        nerfreal.put_msg_txt(answer)
+        sentences = _split_into_sentences(answer)
+        for sentence in sentences:
+            nerfreal.put_msg_txt(sentence)
     return result

@@ -207,6 +207,8 @@ class ElevenLabsTTS(BaseTTS):
         text, _ = msg
         if not text or not text.strip():
             return
+        # flush_talk() đặt PAUSE; đảm bảo RUNNING trước khi stream (tránh race với interrupt).
+        self.state = State.RUNNING
         self.stream_tts(self.elevenlabs_stream(text), msg)
 
     def elevenlabs_stream(self, text: str) -> Iterator[bytes]:
@@ -247,6 +249,14 @@ class ElevenLabsTTS(BaseTTS):
                 logger.error("elevenlabs error (%s): %s", response.status_code, response.text)
                 return
 
+            ct = (response.headers.get("Content-Type") or "").lower()
+            if ct and ("mpeg" in ct or "mp3" in ct):
+                logger.warning(
+                    "ElevenLabs Content-Type=%s — nếu không có tiếng, đặt ELEVEN_OUTPUT_FORMAT=pcm_16000 "
+                    "và model tương thích (vd. eleven_multilingual_v2).",
+                    ct,
+                )
+
             first = True
             for chunk in response.iter_content(chunk_size=4096):
                 if not chunk or self.state != State.RUNNING:
@@ -261,6 +271,7 @@ class ElevenLabsTTS(BaseTTS):
 
     def stream_tts(self, audio_stream: Iterator[bytes], msg: tuple[str, dict]):
         text, textevent = msg
+        self.state = State.RUNNING
         first = True
         pending_bytes = b""
         for chunk in audio_stream:
@@ -273,7 +284,7 @@ class ElevenLabsTTS(BaseTTS):
                 continue
 
             stream = np.frombuffer(pcm_bytes[:even_bytes_len], dtype=np.int16).astype(np.float32) / 32767
-            pending_bytes = pcm_bytes[even_bytes_len:]
+            
             streamlen = stream.shape[0]
             idx = 0
             while streamlen >= self.chunk and self.state == State.RUNNING:
@@ -285,6 +296,22 @@ class ElevenLabsTTS(BaseTTS):
                 self.parent.put_audio_frame(stream[idx:idx + self.chunk], eventpoint)
                 streamlen -= self.chunk
                 idx += self.chunk
+            
+            # Cập nhật pending_bytes dựa trên số lượng bytes thực tế đã consume (idx * 2 samples)
+            # Cộng thêm các bytes lẻ (nếu có) từ pcm_bytes ban đầu
+            pending_bytes = pcm_bytes[idx * 2:]
+
+        # Sau khi kết thúc luồng, nếu vẫn còn dữ liệu dư thì padding và gửi nốt
+        if pending_bytes and self.state == State.RUNNING:
+            try:
+                raw_samples = np.frombuffer(pending_bytes, dtype=np.int16).astype(np.float32) / 32767
+                if raw_samples.shape[0] > 0:
+                    # Padding cho đủ 1 chunk (MuseTalk cần frames 20ms)
+                    pad = self.chunk - raw_samples.shape[0]
+                    last_pcm = np.concatenate([raw_samples, np.zeros(pad, dtype=np.float32)])
+                    self.parent.put_audio_frame(last_pcm, {})
+            except:
+                pass
 
         eventpoint = {'status': 'end', 'text': text}
         eventpoint.update(**textevent)

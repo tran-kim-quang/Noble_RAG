@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import asyncpg
 
@@ -295,6 +295,55 @@ async def upsert_session_context_row(
             session_id,
             customer_id,
             json.dumps(context_json, ensure_ascii=False),
+        )
+    finally:
+        await conn.close()
+
+
+async def purge_sales_db_for_session_ids(session_ids: List[str]) -> Dict[str, int]:
+    """Xóa Postgres theo danh sách session_id: lead_profiles + customer_sessions (CASCADE chat/vision/session_context)."""
+    if not session_ids:
+        return {"postgres_lead_profiles_deleted": 0, "postgres_customer_sessions_deleted": 0}
+    await ensure_pipeline_schema()
+    conn = await asyncpg.connect(_postgres_url())
+    try:
+        r_lead = await conn.fetch(
+            "DELETE FROM sales.lead_profiles WHERE session_id = ANY($1::text[]) RETURNING session_id",
+            session_ids,
+        )
+        r_cs = await conn.fetch(
+            "DELETE FROM sales.customer_sessions WHERE session_id = ANY($1::text[]) RETURNING session_id",
+            session_ids,
+        )
+        return {
+            "postgres_lead_profiles_deleted": len(r_lead),
+            "postgres_customer_sessions_deleted": len(r_cs),
+        }
+    finally:
+        await conn.close()
+
+
+async def purge_all_sales_session_tables_postgres() -> Tuple[Dict[str, int], List[str]]:
+    """Khi Redis không còn key để gom id: xóa toàn bộ phiên sales trên Postgres; trả customer_id để gọi Máy B."""
+    await ensure_pipeline_schema()
+    conn = await asyncpg.connect(_postgres_url())
+    try:
+        cid_rows = await conn.fetch(
+            """
+            SELECT DISTINCT TRIM(customer_id) AS customer_id
+            FROM sales.customer_sessions
+            WHERE customer_id IS NOT NULL AND TRIM(customer_id) <> ''
+            """
+        )
+        cids = sorted({str(r["customer_id"]).strip() for r in cid_rows if r["customer_id"]})
+        r_lead = await conn.fetch("DELETE FROM sales.lead_profiles RETURNING session_id")
+        r_cs = await conn.fetch("DELETE FROM sales.customer_sessions RETURNING session_id")
+        return (
+            {
+                "postgres_lead_profiles_deleted": len(r_lead),
+                "postgres_customer_sessions_deleted": len(r_cs),
+            },
+            cids,
         )
     finally:
         await conn.close()

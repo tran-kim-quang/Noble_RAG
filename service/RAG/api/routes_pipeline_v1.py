@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
+import unicodedata
 import uuid
 from typing import Any, Dict, Optional
 
@@ -15,6 +17,8 @@ from fastapi.responses import JSONResponse
 
 from api.routes_sales import _run_sales_or_search
 from core.config import get_settings
+
+log = logging.getLogger("rag-service")
 from core.dependencies import rag
 from memory.lead_profile_store import ensure_sales_schema, load_lead_profile, save_lead_profile
 from memory.pipeline_store import (
@@ -64,22 +68,234 @@ def _assets_dir(kind: str) -> str:
     return root
 
 
+def _fold_vn_token(value: str) -> str:
+    text = (value or "").strip().lower()
+    if not text:
+        return ""
+    decomp = unicodedata.normalize("NFD", text)
+    no_mark = "".join(ch for ch in decomp if unicodedata.category(ch) != "Mn")
+    return no_mark.replace("đ", "d")
+
+
+def _normalize_gender_from_machine_b(raw: str) -> str:
+    """Chuẩn hóa giới tính từ Máy B → male | female | unknown (lưu vào gender_guess)."""
+    s = (raw or "").strip().lower()
+    if not s:
+        return "unknown"
+    if s in {"1", "01"}:
+        return "male"
+    if s in {"2", "02"}:
+        return "female"
+    if s in {"male", "nam", "man", "m", "anh", "ong"}:
+        return "male"
+    if s in {"female", "nu", "nữ", "woman", "f", "chi", "chị", "co", "cô"}:
+        return "female"
+    return "unknown"
+
+
+def _coerce_age_range_from_machine_b(age_token: str) -> str:
+    """Map age_band / nhom_tuoi / age_range từ Máy B → nhãn gợi ý (vd. 20-30, 30-45, 45+)."""
+    t = (age_token or "").strip()
+    if not t:
+        return "unknown"
+    tl = t.lower().replace("–", "-").replace("—", "-")
+    m = re.match(r"^(\d{1,2})\s*-\s*(\d{1,3})$", tl)
+    if m:
+        return f"{int(m.group(1))}-{m.group(2)}"
+    if re.match(r"^\d{1,3}\s*\+\s*$", tl):
+        return re.sub(r"\s+", "", tl)
+    fold = _fold_vn_token(t)
+    if fold in {"young", "tre", "thanh nien", "teen", "adolescent"}:
+        return "20-30"
+    if fold in {
+        "middle_aged",
+        "middle",
+        "mid",
+        "middle-aged",
+        "trung nien",
+        "trungnien",
+        "adult",
+    }:
+        return "30-45"
+    if fold in {"elderly", "old", "senior", "cao tuoi", "caotuoi", "lao nien", "laonien", "gia"}:
+        return "45+"
+    if t.lower() not in {"unknown", "unk", "none", "null", "n/a"}:
+        return t[:80]
+    return "unknown"
+
+
 def _default_vision_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
-    gender = str(payload.get("gender_estimate") or "unknown").strip().lower() or "unknown"
-    age_group = str(payload.get("age_group_estimate") or "unknown").strip().lower() or "unknown"
-    age_map = {
-        "young": "20-30",
-        "middle_aged": "30-45",
-        "elderly": "45+",
-    }
+    """Gom giới + độ tuổi từ JSON Máy B / relay.
+
+    Hợp đồng khuyến nghị (xem docs/LAN_MACHINE_B_INTEGRATION.md):
+    - Giới: `gender_guess` (male/female hoặc 1/2) và/hoặc `gioi_tinh` (nam/nữ).
+    - Tuổi: `age_range` (vd. 30-45), hoặc `age_band` (young|mid|elderly), hoặc `nhom_tuoi` (tiếng Việt).
+    - Máy B (SQLite `customer_faces`): thường đặt `gioi_tinh`, `nhom_tuoi`, `co_nguoi`, `face_score` trong object **`meta`** ở JSON response — luôn đọc `meta` + `metadata`.
+    """
+
+    def _pick(*values: Any) -> str:
+        for value in values:
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                text = str(int(value))
+            else:
+                text = str(value).strip()
+            # Bỏ qua các giá trị mang nghĩa "không xác định" để tiếp tục tìm ở các key dự phòng khác
+            if text and text.lower() not in {"unknown", "unk", "null", "none", "n/a", "không xác định", "chưa rõ", ""}:
+                return text
+        return ""
+
+    nested = payload.get("vision_summary") if isinstance(payload.get("vision_summary"), dict) else {}
+    if not isinstance(nested, dict):
+        nested = {}
+    vision = payload.get("vision") if isinstance(payload.get("vision"), dict) else {}
+    if not isinstance(vision, dict):
+        vision = {}
+    demographics = payload.get("user_demographics") if isinstance(payload.get("user_demographics"), dict) else {}
+    if not isinstance(demographics, dict):
+        demographics = {}
+    vision_detail = vision.get("detail") if isinstance(vision.get("detail"), dict) else {}
+    if not isinstance(vision_detail, dict):
+        vision_detail = {}
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+
+    gender_raw = _pick(
+        payload.get("gender_guess"),
+        nested.get("gender_guess"),
+        payload.get("gioi_tinh"),
+        nested.get("gioi_tinh"),
+        meta.get("gioi_tinh"),
+        meta.get("gender_guess"),
+        meta.get("gender_estimate"),
+        meta.get("gender"),
+        meta.get("sex"),
+        metadata.get("gioi_tinh"),
+        metadata.get("gender_guess"),
+        metadata.get("gender_estimate"),
+        metadata.get("gender"),
+        metadata.get("sex"),
+        payload.get("gender_estimate"),
+        nested.get("gender_estimate"),
+        payload.get("gender"),
+        nested.get("gender"),
+        payload.get("sex"),
+        nested.get("sex"),
+        vision.get("gender_guess"),
+        vision.get("gioi_tinh"),
+        demographics.get("gender_guess"),
+        demographics.get("gioi_tinh"),
+        demographics.get("gender"),
+        demographics.get("sex"),
+        vision_detail.get("gender_guess"),
+        vision_detail.get("gioi_tinh"),
+        vision_detail.get("gender"),
+        vision_detail.get("sex"),
+    )
+    gender = _normalize_gender_from_machine_b(gender_raw)
+
+    age_band_raw = _pick(
+        payload.get("age_band"),
+        nested.get("age_band"),
+        meta.get("age_band"),
+        metadata.get("age_band"),
+        vision.get("age_band"),
+        demographics.get("age_band"),
+        vision_detail.get("age_band"),
+    )
+    nhom_raw = _pick(
+        payload.get("nhom_tuoi"),
+        nested.get("nhom_tuoi"),
+        meta.get("nhom_tuoi"),
+        metadata.get("nhom_tuoi"),
+        vision.get("nhom_tuoi"),
+        demographics.get("nhom_tuoi"),
+        vision_detail.get("nhom_tuoi"),
+    )
+    age_token = _pick(
+        payload.get("age_range"),
+        nested.get("age_range"),
+        meta.get("age_range"),
+        metadata.get("age_range"),
+        age_band_raw,
+        nhom_raw,
+        payload.get("age_group_estimate"),
+        nested.get("age_group_estimate"),
+        meta.get("age_group_estimate"),
+        metadata.get("age_group_estimate"),
+        vision.get("age_range"),
+        vision.get("age_band"),
+        vision.get("nhom_tuoi"),
+        vision.get("age_group_estimate"),
+        demographics.get("age_range"),
+        demographics.get("age_band"),
+        demographics.get("nhom_tuoi"),
+        demographics.get("age_group_estimate"),
+        vision_detail.get("age_range"),
+        vision_detail.get("age_band"),
+        vision_detail.get("nhom_tuoi"),
+    )
+    
+    log.info(
+        "[VISION_PICK] gender_raw=%r age_band_raw=%r nhom_raw=%r age_token=%r",
+        gender_raw, age_band_raw, nhom_raw, age_token
+    )
+
+    gender = _normalize_gender_from_machine_b(gender_raw)
+    age_range = _coerce_age_range_from_machine_b(age_token)
+
     return {
-        "age_range": age_map.get(age_group, "unknown"),
+        "age_range": age_range,
+        "age_band": age_band_raw or "unknown",
+        "nhom_tuoi": nhom_raw or "unknown",
         "gender_guess": gender,
+        "gioi_tinh": "nam" if gender == "male" else ("nu" if gender == "female" else "unknown"),
         "emotion": "unknown",
         "dress_style": "unknown",
         "visible_attributes": [],
         "scene_context": "unknown",
     }
+
+
+def _vision_context_from_machine_b_register(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Gộp JSON `POST /v1/face/register` (Máy B) → vision_context.
+
+    Hai nhóm bắt buộc cho xưng hô / tư vấn: giới (`gender_guess`/`gioi_tinh`) và tuổi (`age_range`/`age_band`/`nhom_tuoi`).
+    Thêm các scalar hữu ích (match_score, …) nếu có — xem docs/LAN_MACHINE_B_INTEGRATION.md.
+    """
+    merged: Dict[str, Any] = dict(_default_vision_summary(payload))
+    passthrough_keys = (
+        "match_score",
+        "matched",
+        "is_existing_customer",
+        "is_new_customer",
+        "similarity",
+        "confidence",
+        "quality_score",
+        "face_score",
+        "co_nguoi",
+        "face_detected",
+        "status",
+        "message",
+        "error_code",
+    )
+    for key in passthrough_keys:
+        if key not in payload:
+            continue
+        val = payload[key]
+        if val is None:
+            continue
+        if isinstance(val, (dict, list)) and key != "detail":
+            continue
+        merged[key] = val
+    for nested_key in ("user_demographics", "demographics", "attributes", "vision", "vision_summary", "meta", "metadata"):
+        sub = payload.get(nested_key)
+        if isinstance(sub, dict) and sub:
+            merged[nested_key] = sub
+    return merged
 
 
 def _extract_detail(response: httpx.Response) -> str:
@@ -163,6 +379,7 @@ async def _register_face_to_machine_b(
     filename: str,
     content_type: str,
 ) -> Dict[str, Any]:
+    base = _machine_b_base()
     files = {
         "file": (
             filename or "capture.jpg",
@@ -170,11 +387,20 @@ async def _register_face_to_machine_b(
             content_type or "application/octet-stream",
         )
     }
-    form = {"customer_id": customer_id}
+    force_update = (os.getenv("MACHINE_B_FORCE_UPDATE") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    form = {
+        "customer_id": customer_id,
+        "force_update": "true" if force_update else "false",
+    }
     try:
         async with httpx.AsyncClient(timeout=max(20.0, settings.machine_b_timeout_sec)) as client:
             resp = await client.post(
-                f"{_machine_b_base()}/v1/face/register",
+                f"{base}/v1/face/register",
                 data=form,
                 files=files,
                 headers=_machine_b_headers(),
@@ -189,6 +415,15 @@ async def _register_face_to_machine_b(
         raise HTTPException(status_code=502, detail=f"machine B returned invalid JSON: {exc!s}") from exc
     if not isinstance(payload, dict):
         raise HTTPException(status_code=502, detail="machine B returned non-object payload")
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    log.info(
+        "machine_b_face_register: POST %s/v1/face/register http_status=%s customer_id=%s response_keys=%s meta_keys=%s",
+        base,
+        resp.status_code,
+        str(payload.get("customer_id") or customer_id),
+        sorted(payload.keys()),
+        sorted(meta.keys()) if meta else [],
+    )
     return payload
 
 
@@ -207,15 +442,26 @@ async def _open_or_resume_session(
         raise HTTPException(status_code=400, detail="customer_id is required")
 
     incoming_session_id = (requested_session_id or "").strip()
-    session_id = incoming_session_id
+    session_id = ""
     reused_session = False
-    if not session_id and allow_resume:
+
+    if incoming_session_id:
+        session_id = incoming_session_id
+    elif allow_resume:
         latest = await get_latest_active_session_by_customer_id(cid)
-        if latest and str(latest.get("session_id") or "").strip():
-            session_id = str(latest.get("session_id")).strip()
+        latest_sid = str((latest or {}).get("session_id") or "").strip()
+        # Pin history/session key to customer_id for vision-driven conversations.
+        if latest_sid and latest_sid == cid:
+            session_id = latest_sid
             reused_session = True
+
     if not session_id:
-        session_id = f"ses_{uuid.uuid4().hex[:12]}"
+        session_id = cid
+
+    if not reused_session and not incoming_session_id and allow_resume and session_id == cid:
+        existing_row = await load_session_context_row(session_id)
+        if existing_row:
+            reused_session = True
 
     await create_customer_session(
         session_id=session_id,
@@ -248,6 +494,40 @@ async def _open_or_resume_session(
     if customer_profile:
         lead_profile.update(customer_profile)
     lead_profile["customer_id"] = cid
+    if isinstance(vision_summary, dict):
+        gender_guess = str(
+            vision_summary.get("gender_guess")
+            or vision_summary.get("gender_estimate")
+            or vision_summary.get("gender")
+            or vision_summary.get("sex")
+            or ""
+        ).strip()
+        gioi_tinh = str(vision_summary.get("gioi_tinh") or "").strip()
+        age_group = str(
+            vision_summary.get("age_group_estimate")
+            or vision_summary.get("age_band")
+            or vision_summary.get("nhom_tuoi")
+            or ""
+        ).strip()
+        if gender_guess:
+            lead_profile["gender_guess"] = gender_guess
+            lead_profile["gender_estimate"] = gender_guess
+        if gioi_tinh:
+            lead_profile["gioi_tinh"] = gioi_tinh
+        if age_group:
+            lead_profile["age_group_estimate"] = age_group
+        if vision_summary.get("is_existing_customer") is not None:
+            lead_profile["identity_status"] = (
+                "matched" if bool(vision_summary.get("is_existing_customer")) else "new"
+            )
+        if vision_summary.get("matched") is not None and "identity_status" not in lead_profile:
+            lead_profile["identity_status"] = "matched" if bool(vision_summary.get("matched")) else "new"
+        ms = vision_summary.get("match_score")
+        if ms is not None and ms != "":
+            try:
+                lead_profile["face_match_score"] = float(ms)
+            except (TypeError, ValueError):
+                lead_profile["face_match_score"] = ms
     await save_lead_profile(session_id, lead_profile)
 
     should_seed_context = (
@@ -450,9 +730,12 @@ async def vision_identify_and_context_v1(
         else vision_payload.get("is_existing_customer")
     )
     match_score = vision_payload.get("match_score")
-    vision_summary = vision_payload.get("vision_summary")
-    if not isinstance(vision_summary, dict):
-        vision_summary = _default_vision_summary(vision_payload)
+    inner_summary = vision_payload.get("vision_summary")
+    vision_summary = _vision_context_from_machine_b_register(vision_payload)
+    if isinstance(inner_summary, dict):
+        for k, v in inner_summary.items():
+            if v not in (None, "", [], "unknown"):
+                vision_summary[k] = v
 
     await create_customer_session(
         session_id=session_id,
@@ -472,6 +755,40 @@ async def vision_identify_and_context_v1(
         "context_seeded_at": time.time(),
     }
     lead_profile["customer_id"] = customer_id
+    if isinstance(vision_summary, dict):
+        gender_guess = str(
+            vision_summary.get("gender_guess")
+            or vision_summary.get("gender_estimate")
+            or vision_summary.get("gender")
+            or vision_summary.get("sex")
+            or ""
+        ).strip()
+        gioi_tinh = str(vision_summary.get("gioi_tinh") or "").strip()
+        age_group = str(
+            vision_summary.get("age_group_estimate")
+            or vision_summary.get("age_band")
+            or vision_summary.get("nhom_tuoi")
+            or ""
+        ).strip()
+        if gender_guess:
+            lead_profile["gender_guess"] = gender_guess
+            lead_profile["gender_estimate"] = gender_guess
+        if gioi_tinh:
+            lead_profile["gioi_tinh"] = gioi_tinh
+        if age_group:
+            lead_profile["age_group_estimate"] = age_group
+        if vision_summary.get("is_existing_customer") is not None:
+            lead_profile["identity_status"] = (
+                "matched" if bool(vision_summary.get("is_existing_customer")) else "new"
+            )
+        if vision_summary.get("matched") is not None and "identity_status" not in lead_profile:
+            lead_profile["identity_status"] = "matched" if bool(vision_summary.get("matched")) else "new"
+        ms = vision_summary.get("match_score")
+        if ms is not None and ms != "":
+            try:
+                lead_profile["face_match_score"] = float(ms)
+            except (TypeError, ValueError):
+                lead_profile["face_match_score"] = ms
     await save_lead_profile(session_id, lead_profile)
 
     merged_context = await build_and_save_session_context(
@@ -643,10 +960,57 @@ async def sales_chat_with_camera_v1(
     if not customer_id:
         raise HTTPException(status_code=502, detail="machine B did not return customer_id")
 
-    vision_summary = raw_vision_summary or _default_vision_summary(face_payload)
+    # ── DEBUG: log raw face_payload fields từ Máy B để trace gender
+    _fp_gioi_tinh = face_payload.get("gioi_tinh")
+    _fp_nhom_tuoi = face_payload.get("nhom_tuoi")
+    _fp_face_reg  = face_payload.get("face_registered")
+    _fp_co_nguoi  = face_payload.get("co_nguoi")
+    _fp_vision    = face_payload.get("vision") or {}
+    _fp_vs        = face_payload.get("vision_summary") or {}
+    log.info(
+        "[DEBUG machine_b raw] face_registered=%s co_nguoi=%s gioi_tinh=%r nhom_tuoi=%r "
+        "vision.gioi_tinh=%r vision.nhom_tuoi=%r vision_summary=%r",
+        _fp_face_reg, _fp_co_nguoi, _fp_gioi_tinh, _fp_nhom_tuoi,
+        _fp_vision.get("gioi_tinh"), _fp_vision.get("nhom_tuoi"),
+        dict(list(_fp_vs.items())[:4]) if isinstance(_fp_vs, dict) else _fp_vs,
+    )
+    print(
+        f"[MACHINE_B_RAW] face_registered={_fp_face_reg} co_nguoi={_fp_co_nguoi} "
+        f"gioi_tinh={_fp_gioi_tinh!r} nhom_tuoi={_fp_nhom_tuoi!r} "
+        f"vision.gioi_tinh={_fp_vision.get('gioi_tinh')!r} "
+        f"vision_summary.gender_guess={_fp_vs.get('gender_guess')!r}",
+        flush=True,
+    )
+    machine_b_summary = _vision_context_from_machine_b_register(face_payload)
+    if raw_vision_summary:
+        vision_summary = dict(raw_vision_summary)
+        for key, value in machine_b_summary.items():
+            if value in (None, "", "unknown", [], {}):
+                continue
+            vision_summary[key] = value
+    else:
+        vision_summary = machine_b_summary
+    log.info(
+        "chat-with-camera: vision_summary_for_session gender_guess=%s gioi_tinh=%s age_range=%s (sau chuẩn hoá Máy B)",
+        vision_summary.get("gender_guess"),
+        vision_summary.get("gioi_tinh"),
+        vision_summary.get("age_range"),
+    )
+    print(
+        f"[VISION_SUMMARY] gender_guess={vision_summary.get('gender_guess')!r} "
+        f"gioi_tinh={vision_summary.get('gioi_tinh')!r} "
+        f"age_range={vision_summary.get('age_range')!r} "
+        f"nhom_tuoi={vision_summary.get('nhom_tuoi')!r}",
+        flush=True,
+    )
+    # In camera flow, bind conversation history to customer_id from vision result.
+    effective_session_id = customer_id
+    if requested_session_id and requested_session_id.strip() == customer_id:
+        effective_session_id = requested_session_id.strip()
+
     open_result = await _open_or_resume_session(
         customer_id=customer_id,
-        requested_session_id=requested_session_id,
+        requested_session_id=effective_session_id,
         allow_resume=bool(allow_resume),
         channel=(channel or "").strip() or None,
         source=(source or "").strip() or "machine_b_auto",

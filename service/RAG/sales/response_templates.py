@@ -1,6 +1,7 @@
 """Deterministic response templates for scripted sales steps."""
 
 import re
+import unicodedata
 from typing import Any, Dict, List
 
 from utils.text import split_into_sentences
@@ -12,6 +13,97 @@ _SLOT_LABELS = {
     "purpose": "mục đích mua để ở hay kinh doanh",
     "location_preference": "khu vực ưu tiên",
 }
+
+
+def _fold_vn(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    decomp = unicodedata.normalize("NFD", text)
+    no_mark = "".join(ch for ch in decomp if unicodedata.category(ch) != "Mn")
+    return no_mark.replace("đ", "d")
+
+
+def _normalize_gender(value: Any) -> str:
+    if value is None or isinstance(value, bool):
+        return "unknown"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        n = int(value)
+        if n == 1:
+            return "male"
+        if n == 2:
+            return "female"
+        return "unknown"
+    folded = _fold_vn(value)
+    if folded in {"1", "01"}:
+        return "male"
+    if folded in {"2", "02"}:
+        return "female"
+    if folded in {"male", "nam", "man", "m", "anh", "ong"}:
+        return "male"
+    if folded in {"female", "nu", "woman", "f", "chi", "co"}:
+        return "female"
+    return "unknown"
+
+
+def _resolve_gender_from_state(state: Dict[str, Any]) -> str:
+    lead = state.get("lead_profile") or {}
+    session_context = state.get("session_context") or {}
+    context_json = session_context.get("context_json") if isinstance(session_context, dict) else {}
+    if not isinstance(context_json, dict):
+        context_json = {}
+    vision_context = context_json.get("vision_context") if isinstance(context_json, dict) else {}
+    if not isinstance(vision_context, dict):
+        vision_context = {}
+
+    candidates = [
+        vision_context.get("gender_guess"),
+        vision_context.get("gender_estimate"),
+        vision_context.get("gioi_tinh"),
+        vision_context.get("gender"),
+        vision_context.get("sex"),
+        session_context.get("gender_estimate") if isinstance(session_context, dict) else None,
+        session_context.get("gender_guess") if isinstance(session_context, dict) else None,
+        session_context.get("gioi_tinh") if isinstance(session_context, dict) else None,
+        lead.get("gender_estimate"),
+        lead.get("gender_guess"),
+        lead.get("gioi_tinh"),
+    ]
+    for item in candidates:
+        gender = _normalize_gender(item)
+        if gender != "unknown":
+            return gender
+    return "unknown"
+
+
+def _customer_ref(state: Dict[str, Any], *, title_case: bool = True) -> str:
+    gender = _resolve_gender_from_state(state)
+    if gender == "male":
+        return "Anh" if title_case else "anh"
+    if gender == "female":
+        return "Chị" if title_case else "chị"
+    return "Anh/Chị" if title_case else "anh/chị"
+
+
+def _apply_customer_pronoun(text: str, state: Dict[str, Any]) -> str:
+    if not text:
+        return text
+    cap = _customer_ref(state, title_case=True)
+    low = _customer_ref(state, title_case=False)
+    patched = text
+    replacements = {
+        "Anh/Chị": cap,
+        "Anh chị": cap,
+        "Anh Chi": cap,
+        "Anh/Chi": cap,
+        "anh/chị": low,
+        "anh chị": low,
+        "anh chi": low,
+        "anh/chi": low,
+    }
+    for old, new in replacements.items():
+        patched = patched.replace(old, new)
+    return patched
 
 
 def _normalize_candidate_line(line: str) -> str:
@@ -57,9 +149,12 @@ def render_match_options_from_candidates(state: Dict[str, Any], candidates: List
         seen.add(key)
         deduped.append(candidate)
     if not deduped:
-        return (
+        return _apply_customer_pronoun(
+            (
             "Dựa trên thông tin hiện tại, em chưa lọc được phương án thật sự rõ ràng để gửi Anh/Chị. "
             "Anh/Chị cho em thêm 1 tiêu chí ưu tiên nhất để em lọc sát hơn nhé."
+            ),
+            state,
         )
 
     if len(deduped) == 1:
@@ -75,7 +170,7 @@ def render_match_options_from_candidates(state: Dict[str, Any], candidates: List
             for reason in reasons:
                 lines.append(f"- {reason}")
         lines.append("Nếu Anh/Chị muốn, em sẽ đi sâu tiếp loại căn phù hợp nhất với nhu cầu của gia đình mình ạ.")
-        return "\n".join(lines).strip()
+        return _apply_customer_pronoun("\n".join(lines).strip(), state)
 
     top_k = min(3, len(deduped))
     top_items = deduped[:top_k]
@@ -98,7 +193,7 @@ def render_match_options_from_candidates(state: Dict[str, Any], candidates: List
         lines.append("")
 
     lines.append("Nếu Anh/Chị muốn, em sẽ bóc tách tiếp phương án nổi bật nhất hoặc so nhanh giữa các lựa chọn này để mình chốt hướng dễ hơn ạ.")
-    return "\n".join(lines).strip()
+    return _apply_customer_pronoun("\n".join(lines).strip(), state)
 
 
 def render_template_response(action: str, state: Dict[str, Any]) -> str:
@@ -107,9 +202,12 @@ def render_template_response(action: str, state: Dict[str, Any]) -> str:
     objection_type = state.get("objection_type") or "khac"
 
     if action == "ask_opening":
-        return (
+        return _apply_customer_pronoun(
+            (
             "Chào Anh/Chị, em là tư vấn viên bất động sản của Noble. "
             "Để em hỗ trợ đúng nhu cầu, gia đình mình hiện có bao nhiêu người ạ?"
+            ),
+            state,
         )
 
     if action == "ask_family_size":
@@ -119,62 +217,95 @@ def render_template_response(action: str, state: Dict[str, Any]) -> str:
         return "Gia đình mình hiện có bao nhiêu con nhỏ để em ưu tiên tiện ích phù hợp ạ?"
 
     if action == "ask_purpose":
-        return "Hiện tại Anh/Chị đang tìm sản phẩm để ở hay để kinh doanh/đầu tư ạ?"
+        return _apply_customer_pronoun("Hiện tại Anh/Chị đang tìm sản phẩm để ở hay để kinh doanh/đầu tư ạ?", state)
 
     if action == "ask_location":
-        return "Anh/Chị đang ưu tiên khu vực nào để em lọc đúng dự án phù hợp ạ?"
+        return _apply_customer_pronoun("Anh/Chị đang ưu tiên khu vực nào để em lọc đúng dự án phù hợp ạ?", state)
 
     if action == "check_interest":
-        return "Trong phương án em vừa tư vấn, Anh/Chị thấy hướng nào phù hợp hơn để em đi sâu tiếp ạ?"
+        return _apply_customer_pronoun(
+            "Trong phương án em vừa tư vấn, Anh/Chị thấy hướng nào phù hợp hơn để em đi sâu tiếp ạ?",
+            state,
+        )
 
     if action == "handle_objection":
         if objection_type == "gia_cao":
-            return (
+            return _apply_customer_pronoun(
+                (
                 "Em hiểu băn khoăn của Anh/Chị về mức giá, vì với bất động sản cao cấp thì mình cần nhìn rất kỹ vào giá trị thực nhận và phương án thanh toán. "
                 "Nếu Anh/Chị muốn, em sẽ gửi bảng giá kèm chính sách thanh toán để mình đối chiếu rõ xem mức giá có thực sự phù hợp hay không ạ."
+                ),
+                state,
             )
         if objection_type == "phap_ly":
-            return (
+            return _apply_customer_pronoun(
+                (
                 "Em hiểu pháp lý là phần mình cần chắc chắn trước khi đi tiếp. "
                 "Em sẽ ưu tiên rà lại hồ sơ pháp lý và gửi Anh/Chị phần thông tin xác thực, rõ ràng nhất để mình yên tâm đánh giá ạ."
+                ),
+                state,
             )
         if objection_type == "vi_tri":
-            return (
+            return _apply_customer_pronoun(
+                (
                 "Em hiểu vị trí là yếu tố ảnh hưởng trực tiếp tới trải nghiệm sống và tính thanh khoản nên mình cần cân nhắc kỹ. "
                 "Nếu Anh/Chị muốn, em sẽ đối chiếu lại đúng tiêu chí di chuyển và khu vực ưu tiên để xem dự án này có thật sự phù hợp không ạ."
+                ),
+                state,
             )
         if objection_type == "chua_du_tien":
-            return (
+            return _apply_customer_pronoun(
+                (
                 "Em hiểu mình cần cân đối dòng tiền thật an toàn trước khi quyết định. "
                 "Em có thể giúp Anh/Chị rà lại phương án thanh toán và mức tài chính phù hợp hơn để mình xem có cửa nào dễ vào hơn không ạ."
+                ),
+                state,
             )
-        return (
+        return _apply_customer_pronoun(
+            (
             "Em hiểu băn khoăn của Anh/Chị và đây là điều mình nên làm rõ trước khi đi tiếp. "
             "Nếu Anh/Chị đồng ý, em sẽ kiểm tra lại đúng phần thông tin liên quan và gửi mình câu trả lời ngắn gọn, rõ ràng nhất ạ."
+            ),
+            state,
         )
 
     if action == "soft_close":
-        return "Nếu phù hợp, em có thể gửi thêm shortlist ngắn gọn hoặc thông tin chi tiết để Anh/Chị tham khảo tiếp ạ?"
+        return _apply_customer_pronoun(
+            "Nếu phù hợp, em có thể gửi thêm shortlist ngắn gọn hoặc thông tin chi tiết để Anh/Chị tham khảo tiếp ạ?",
+            state,
+        )
 
     if action == "followup_closeout":
-        return (
+        return _apply_customer_pronoun(
+            (
             "Em cảm ơn Anh/Chị đã chia sẻ thông tin. "
             "Em sẽ tổng hợp phương án phù hợp nhất để mình tiện theo dõi, khi cần thêm gì Anh/Chị cứ nhắn em nhé."
+            ),
+            state,
         )
 
     if action == "redirect_out_of_scope":
-        return (
+        return _apply_customer_pronoun(
+            (
             "Em hiện hỗ trợ tư vấn các dự án bất động sản của Noble. "
             "Nếu Anh/Chị muốn, mình quay lại nhu cầu mua để ở hoặc kinh doanh để em hỗ trợ đúng hơn nhé."
+            ),
+            state,
         )
 
     if missing_slots:
-        return (
+        return _apply_customer_pronoun(
+            (
             "Để em tư vấn sát hơn, Anh/Chị chia sẻ thêm giúp em "
             f"{_missing_slots_text(missing_slots)} nhé?"
+            ),
+            state,
         )
 
     if lead.get("purpose") == "mua_o":
         return "Em đã nắm được nhu cầu cơ bản của gia đình mình rồi. Em sẽ tư vấn ngay dự án phù hợp nhất ạ."
 
-    return "Em đã nắm được nhu cầu cơ bản rồi. Em sẽ tư vấn phương án phù hợp nhất cho Anh/Chị ngay ạ."
+    return _apply_customer_pronoun(
+        "Em đã nắm được nhu cầu cơ bản rồi. Em sẽ tư vấn phương án phù hợp nhất cho Anh/Chị ngay ạ.",
+        state,
+    )

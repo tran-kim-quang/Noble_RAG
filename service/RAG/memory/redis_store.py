@@ -3,7 +3,7 @@ shared-state issues in async contexts."""
 
 import json
 import logging
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
 log = logging.getLogger("rag-service")
 
@@ -51,6 +51,44 @@ async def redis_delete(redis_url: str, key: str) -> bool:
     except Exception as e:
         log.error("Redis DELETE error key=%s: %s", key, e)
         return False
+    finally:
+        if client:
+            await client.aclose()
+
+
+async def redis_scan_keys_matching(redis_url: str, pattern: str) -> AsyncIterator[str]:
+    """Duyệt key khớp pattern (SCAN)."""
+    import redis.asyncio as redis
+
+    client = None
+    try:
+        client = redis.Redis.from_url(
+            redis_url, decode_responses=True, socket_timeout=30, socket_connect_timeout=5
+        )
+        async for key in client.scan_iter(match=pattern, count=500):
+            yield key
+    finally:
+        if client:
+            await client.aclose()
+
+
+async def redis_delete_keys_matching_pattern(redis_url: str, pattern: str) -> int:
+    """Xóa mọi key khớp pattern (SCAN, không dùng KEYS *). Trả về số key đã xóa."""
+    import redis.asyncio as redis
+
+    client = None
+    deleted = 0
+    try:
+        client = redis.Redis.from_url(
+            redis_url, decode_responses=True, socket_timeout=30, socket_connect_timeout=5
+        )
+        async for key in client.scan_iter(match=pattern, count=500):
+            await client.delete(key)
+            deleted += 1
+        return deleted
+    except Exception as e:
+        log.error("Redis SCAN+DELETE error pattern=%s: %s", pattern, e)
+        return deleted
     finally:
         if client:
             await client.aclose()

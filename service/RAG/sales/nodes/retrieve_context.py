@@ -28,6 +28,7 @@ _STATE_QUERY_TEMPLATES: Dict[str, str] = {
         "Ưu tiên thông tin thực tế về tiện ích, phong cách sống, nhóm sản phẩm, vị trí, kết nối, hoặc điểm phù hợp với nhu cầu sau: "
         "mục đích {purpose}, loại hình {property_type}, khu vực {location}, gia đình {family_size} người, "
         "có {children_count} con nhỏ. "
+        "Nếu khách chỉ mở lời tư vấn chung, chưa nêu tiêu chí: trả lời tối đa 2–3 câu, không liệt kê brochure dài. "
         "Nếu dữ liệu chưa đủ để kết luận, hãy nêu 2-4 dữ kiện/định hướng hữu ích nhất để sales dùng trả lời ngắn gọn rồi hỏi tiếp. "
         "Câu khách: {user_text}"
     ),
@@ -606,6 +607,19 @@ async def _load_chunks_for_doc_ids(doc_ids: List[str], max_chunks_per_doc: int =
 
 
 async def retrieve_context(state: SalesAgentState) -> Dict[str, Any]:
+    next_st = (state.get("next_sales_state") or "").strip()
+    action = (state.get("response_action") or "").strip()
+    if next_st == "greeting" and action not in {"catalog_overview", "project_qa"}:
+        log.info("retrieve_context: skip retrieval for greeting")
+        return {
+            "retrieved_candidates": [],
+            "retrieved_context": [],
+            "has_retrieved_context": False,
+            "project_qa_blocked": False,
+            "resolved_project_name": state.get("resolved_project_name"),
+            "retrieval_mode": "greeting_skip",
+        }
+
     if (state.get("response_action") or "") == "catalog_overview":
         projects = await _load_catalog_projects()
         project_facts = await _load_project_facts()

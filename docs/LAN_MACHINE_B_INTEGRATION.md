@@ -42,15 +42,15 @@ Request body mẫu:
     "project_interest": "Noble Tây Thăng Long"
   },
   "vision_summary": {
-    "age_range": "30-45",
     "gender_guess": "male",
-    "emotion": "neutral",
-    "dress_style": "formal",
-    "visible_attributes": ["glasses"],
-    "scene_context": "indoor"
+    "gioi_tinh": "nam",
+    "age_band": "mid",
+    "nhom_tuoi": "trung niên"
   }
 }
 ```
+
+Máy B (vision) chỉ gửi các khóa trên trong `vision_summary`: **giới tính** (`gender_guess` + `gioi_tinh` để xưng hô), **độ tuổi** (`age_band` + `nhom_tuoi` để tư vấn). Trường **có người** (`co_nguoi`) chỉ dùng nội bộ trên Máy B — **không** gửi sang Máy A; chỉ khi face detect thành công Máy B mới gọi `session/open` (kèm `customer_id` ở cấp body để Máy A gắn lịch sử chat).
 
 Response mẫu:
 
@@ -111,37 +111,6 @@ Response mẫu:
 
 ---
 
-## 4.1) Luồng một bước cho nút Mic/Chat (khuyến nghị mới)
-
-Mỗi lần user bấm Mic/Chat trên máy B:
-
-1. Chụp 1 frame camera.
-2. Gọi `POST /api/v1/sales/chat-with-camera` sang máy A.
-3. Endpoint này tự động:
-4. Forward ảnh sang API face của máy B.
-5. Nhận `customer_id` từ máy B.
-6. Open/resume `session_id` theo `customer_id`.
-7. Chạy chat và trả response trong cùng 1 request.
-
-Multipart fields:
-
-- `file` (required)
-- `message` (required)
-- `channel` (optional, default `kiosk`)
-- `source` (optional, default `machine_b_auto`)
-- `session_id` (optional)
-- `customer_id_hint` (optional)
-- `allow_resume` (optional, default `true`)
-
-```bash
-curl -X POST "http://192.168.100.7:8010/api/v1/sales/chat-with-camera" ^
-  -F "file=@C:\\temp\\snap.jpg" ^
-  -F "message=xin chao, cho minh biet phap ly du an noble tay thang long" ^
-  -F "allow_resume=true"
-```
-
----
-
 ## 5) Ví dụ gọi nhanh bằng cURL (từ máy B)
 
 ```bash
@@ -180,3 +149,90 @@ curl -X POST "http://192.168.100.7:8010/api/v1/sales/chat" ^
 - `GET /status`
 - `GET /sales/history/{session_id}`
 - `POST /query/stream` (alias stream)
+
+---
+
+## 8) Cấu hình Máy B (vision / repo này) để nhận dữ liệu và truyền lên Máy A
+
+Máy B chạy API `api_customer_embedding` (FastAPI), có thể:
+
+1. Lưu **embedding** khuôn mặt theo `customer_id` (local SQLite).
+2. **Gọi** `POST /api/v1/session/open` trên Máy A sau khi đăng ký ảnh (relay).
+3. **Proxy** thủ công `session/open` và `sales/chat` qua các route tích hợp.
+
+### Biến môi trường trên Máy B
+
+| Biến | Ý nghĩa |
+|------|--------|
+| `MACHINE_A_BASE_URL` | Base URL Máy A, **không** có slash cuối. Ví dụ: `http://192.168.100.7:8010` |
+| `RELAY_SESSION_AFTER_FACE_REGISTER` | `1` / `true`: sau mỗi `POST /v1/face/register` thành công, **tự** gọi `session/open` trên Máy A (không cần form `relay_to_machine_a`). |
+| `PORT` | Cổng HTTP của API trên Máy B (mặc định 8000). |
+
+**PowerShell (phiên hiện tại):**
+
+```powershell
+$env:MACHINE_A_BASE_URL = "http://192.168.100.7:8010"
+$env:RELAY_SESSION_AFTER_FACE_REGISTER = "1"   # tùy chọn: tự relay sau đăng ký mặt
+.\venv\Scripts\python.exe -m uvicorn api_customer_embedding:app --host 0.0.0.0 --port 8001
+```
+
+### Firewall & mạng
+
+- **Máy B → Máy A:** cần mở **outbound** tới `TCP <MAY_A_IP>:8010` (thường mặc định cho phép).
+- **Máy A → Máy B** (nếu A cần gọi API embedding trên B): mở **inbound** trên Máy B cho cổng đang chạy (ví dụ `8001`).
+- Kiểm tra: từ Máy B: `curl http://192.168.100.7:8010/health`
+
+### Endpoint tích hợp trên Máy B
+
+| Phương thức | Đường dẫn | Mô tả |
+|-------------|-----------|--------|
+| GET | `/v1/integration/machine-a` | Kiểm tra `MACHINE_A_BASE_URL` và `GET .../health` trên Máy A |
+| POST | `/v1/integration/session-open` | Body JSON giống mục 3 — proxy tới Máy A |
+| POST | `/v1/integration/sales/chat` | Body JSON giống mục 3 — proxy tới Máy A |
+| POST | `/v1/face/register` | Form `relay_to_machine_a=true` + `full_name` / `phone` / `project_interest` để vừa lưu embedding vừa gọi `session/open` trên A |
+
+Response `POST /v1/face/register` có thêm field `machine_a`: kết quả relay (HTTP status + body từ Máy A) hoặc lỗi.
+
+### Định dạng JSON body từ `POST /v1/face/register` (Máy A đọc để xưng hô / tuổi)
+
+Dữ liệu lưu SQLite `customer_faces` (cột `meta`) thường được **nhúng nguyên** vào response HTTP dưới key **`meta`** (hoặc tương đương `metadata`). Máy A (`_default_vision_summary` trong `routes_pipeline_v1.py`) đọc các khóa sau:
+
+| Nhóm | Khóa trong `meta` (hoặc top-level) | Ví dụ | Ghi chú |
+|------|-------------------------------------|-------|---------|
+| Giới tính | `gioi_tinh` | `nam`, `nữ` | Ưu tiên cho tiếng Việt; có thể thêm `gender_guess`: `male` / `female` hoặc `1` / `2`. |
+| Độ tuổi | `nhom_tuoi` | `trẻ`, `trung niên`, … | Map sang `age_range` gợi ý (vd. `trẻ` → `20-30`). |
+| Độ tuổi | `age_band` | `young`, `mid`, `elderly` | Tương đương nhóm tuổi. |
+| Độ tuổi | `age_range` | `30-45` | Nếu có sẵn khoảng số, giữ nguyên. |
+| Nội bộ B | `co_nguoi` | `true` / `false` | Chỉ cờ có người; Máy A có thể lưu kèm, **không** bắt buộc cho xưng hô. |
+| Chất lượng | `face_score` | `0.9997` | Tuỳ chọn; Máy A có thể passthrough vào `vision_context`. |
+
+Ví dụ payload tối thiểu (đủ cho Sunny gọi đúng “anh/chị”):
+
+```json
+{
+  "customer_id": "cam_ebabd4e00c01",
+  "meta": {
+    "co_nguoi": true,
+    "gioi_tinh": "nam",
+    "nhom_tuoi": "trẻ",
+    "face_score": 0.9997
+  }
+}
+```
+
+Sau khi chuẩn hóa, `vision_context` trên Máy A sẽ có dạng `gender_guess: "male"`, `gioi_tinh: "nam"`, `age_range: "20-30"`, `nhom_tuoi: "trẻ"`, v.v.
+
+### Ví dụ: đăng ký mặt và relay session lên Máy A
+
+```powershell
+curl -X POST "http://127.0.0.1:8001/v1/face/register" `
+  -F "customer_id=cust_001" `
+  -F "file=@C:\anh.jpg" `
+  -F "relay_to_machine_a=true" `
+  -F "full_name=Nguyen Van A" `
+  -F "phone=0900000000" `
+  -F "project_interest=Noble Tay Thang Long"
+```
+
+Phụ thuộc `httpx` (đã có trong `requirements.txt`).
+

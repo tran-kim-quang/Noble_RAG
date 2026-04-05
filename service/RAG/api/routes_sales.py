@@ -5,14 +5,21 @@ import json
 import logging
 import random
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from core.dependencies import llm_model_func
 from integrations.camera_identity import maybe_enrich_identity
 from models.api_models import LeadUpdateRequest, SalesChatRequest, SalesChatResponse
-from memory.chat_history_store import append_turn, delete_chat_history, load_chat_history
+from core.config import get_settings
+from memory.chat_history_store import (
+    append_turn,
+    delete_chat_history,
+    load_chat_history,
+    purge_all_chat_history,
+)
 from memory.lead_profile_store import (
     delete_lead_profile_cache,
     ensure_sales_schema,
@@ -26,18 +33,33 @@ from memory.local_snapshot_store import (
 )
 from memory.session_store import delete_session_context, load_session_context
 from rag.retriever import (
-    decompose_subqueries,
+    build_rag_fact_constraints,
+    plan_query_adaptive,
     query_rag,
     query_rag_stream,
-    route_query,
     summarize_search_answer,
 )
+from integrations.machine_b_face_client import notify_machine_b_customer_removed
 from sales.graph import sales_graph
 from sales.session_export import export_session_to_txt
+from sales.response_templates import _apply_customer_pronoun
+from sales.prompt_builder import build_prompt
 from utils.text import iter_stream_chunks
+from utils.time import now_vietnam_str
 
 router = APIRouter(prefix="/sales", tags=["sales"])
 log = logging.getLogger("rag-service")
+
+
+def _require_chat_purge_token(x_chat_history_purge_token: Optional[str]) -> None:
+    expected = (get_settings().chat_history_purge_token or "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="CHAT_HISTORY_PURGE_TOKEN is not configured on server",
+        )
+    if (x_chat_history_purge_token or "").strip() != expected:
+        raise HTTPException(status_code=403, detail="Invalid X-Chat-History-Purge-Token")
 _THINKING_ACK_MESSAGES = [
     "Em đã nhận được thông tin rồi ạ, Anh/Chị chờ em một chút để em kiểm tra nhanh nhé.",
     "Em nhận yêu cầu của Anh/Chị rồi, cho em ít giây để em xử lý và phản hồi chuẩn nhất nhé.",
@@ -77,14 +99,127 @@ async def _run_search_flow(
         system_persona=_SEARCH_PERSONA,
         max_sentences=4,
     )
-    await _persist_chat_turn(session_id, user_text, answer)
+    # Áp dụng xưng hô (Anh/Chị/Nam/Nữ) dựa trên dữ liệu Máy B
+    context = await load_session_context(session_id)
+    profile = await load_lead_profile(session_id)
+    state_for_pronoun = {"lead_profile": profile, "session_context": context}
+    patched_answer = _apply_customer_pronoun(answer, state_for_pronoun)
+
+    await _persist_chat_turn(session_id, user_text, patched_answer)
     return {
         "route_category": "SEARCH",
-        "final_response": answer,
+        "final_response": patched_answer,
         "next_sales_state": None,
-        "lead_profile": await load_lead_profile(session_id),
+        "lead_profile": profile,
         "missing_slots": None,
     }
+
+
+def _summarize_history_for_other(history: List[Dict[str, Any]], max_turns: int = 6) -> str:
+    if not history:
+        return "Chưa có lịch sử hội thoại trước đó."
+    lines: List[str] = []
+    for item in history[-(max_turns * 2):]:
+        role = str(item.get("role") or "user").strip().lower()
+        content = str(item.get("content") or "").strip()
+        if not content:
+            continue
+        speaker = "Người dùng" if role == "user" else ("Trợ lý" if role == "assistant" else role)
+        lines.append(f"- {speaker}: {content}")
+    return "\n".join(lines) if lines else "Chưa có lịch sử hội thoại trước đó."
+
+
+async def _run_other_llm_flow(
+    *,
+    session_id: str,
+    user_text: str,
+    history: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    history_summary = _summarize_history_for_other(history)
+    # Chuẩn bị state tối thiểu để build_prompt có đủ dữ liệu xưng hô
+    context = await load_session_context(session_id)
+    profile = await load_lead_profile(session_id)
+    state = {
+        "session_id": session_id,
+        "user_text": user_text,
+        "chat_history": history,
+        "lead_profile": profile,
+        "session_context": context,
+        "next_sales_state": "out_of_scope", # Dùng state này để prompt builder biết là flow tự do
+    }
+    
+    # Lấy system prompt chuẩn từ prompt_builder (có xưng hô Máy B)
+    system_prompt = build_prompt(state)
+    
+    prompt = f"""
+{system_prompt}
+
+YÊU CẦU BỔ SUNG CHO LUỒNG TỰ DO:
+- Đã tóm tắt lịch sử hội thoại: {history_summary}
+- Luôn trả lời tự nhiên, lịch sự, ngắn gọn, đúng ngữ cảnh.
+- Nếu câu hỏi quá chung chung thì hỏi lại 1 câu làm rõ, không dùng kịch bản sales cứng.
+""".strip()
+
+    answer = ""
+    try:
+        answer = str(
+            await llm_model_func(
+                prompt,
+                history_messages=history[-6:],
+                temperature=0.2,
+            )
+            or ""
+        ).strip()
+    except Exception as e:
+        log.warning("OTHER llm flow failed: %s", e)
+
+    if not answer:
+        answer = "Em đang ở đây để hỗ trợ mình. Anh/Chị muốn em tư vấn thông tin nào cụ thể hơn ạ?"
+
+    # Áp dụng xưng hô (Anh/Chị/Nam/Nữ) dựa trên dữ liệu Máy B
+    context = await load_session_context(session_id)
+    profile = await load_lead_profile(session_id)
+    state_for_pronoun = {"lead_profile": profile, "session_context": context}
+    patched_answer = _apply_customer_pronoun(answer, state_for_pronoun)
+
+    await _persist_chat_turn(session_id, user_text, patched_answer)
+    return {
+        "route_category": "OTHER",
+        "final_response": patched_answer,
+        "next_sales_state": None,
+        "lead_profile": profile,
+        "missing_slots": None,
+    }
+
+
+def _stream_meta_from_flow_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Các khóa final_meta cho /chat/stream sau khi chạy _run_*_flow."""
+    return {
+        "route_category": result.get("route_category"),
+        "sales_state": result.get("next_sales_state"),
+        "missing_slots": result.get("missing_slots"),
+        "lead_profile": result.get("lead_profile"),
+    }
+
+
+def _ndjson_response_line(session_id: str, chunk: str) -> str:
+    """Một dòng NDJSON phase=response (dùng cho stream token hoặc chunk)."""
+    return json.dumps(
+        {
+            "chunk": chunk,
+            "done": False,
+            "phase": "response",
+            "session_id": session_id,
+        },
+        ensure_ascii=False,
+    ) + "\n"
+
+
+async def _yield_ndjson_response_chunks(session_id: str, full_text: str):
+    """Sinh các dòng NDJSON (phase=response) từ nội dung đã có sẵn."""
+    for chunk in iter_stream_chunks((full_text or "").strip()):
+        yield _ndjson_response_line(session_id, chunk)
+        await asyncio.sleep(0)
 
 
 async def _run_sales_flow(
@@ -104,6 +239,101 @@ async def _run_sales_flow(
     return result
 
 
+def _normalize_plan(user_text: str, plan: Dict[str, Any]) -> Dict[str, Any]:
+    route = str(plan.get("route") or "RAG").upper().strip()
+    if route not in {"RAG", "SEARCH", "OTHER"}:
+        route = "RAG"
+
+    refined = str(plan.get("refined_query") or user_text).strip() or user_text
+    raw_subqueries = plan.get("subqueries")
+    subqueries: List[Dict[str, str]] = []
+    if isinstance(raw_subqueries, list):
+        for item in raw_subqueries[:2]:
+            if not isinstance(item, dict):
+                continue
+            query = str(item.get("query") or "").strip()
+            sub_route = str(item.get("route") or route).upper().strip()
+            if not query:
+                continue
+            if sub_route not in {"RAG", "SEARCH", "OTHER"}:
+                sub_route = route
+            subqueries.append({"query": query, "route": sub_route})
+
+    multi_intent = bool(plan.get("multi_intent")) and len(subqueries) > 1
+    if not multi_intent:
+        subqueries = []
+
+    return {
+        "route": route,
+        "refined_query": refined,
+        "multi_intent": multi_intent,
+        "subqueries": subqueries,
+    }
+
+
+async def _run_rag_flow(
+    *,
+    session_id: str,
+    user_text: str,
+    rag_query: str,
+    history: List[Dict[str, Any]],
+    raw_transcript: Optional[str] = None,
+) -> Dict[str, Any]:
+    fact_context = await build_rag_fact_constraints(rag_query or user_text)
+    rag_answer = await query_rag(
+        text=rag_query or user_text,
+        top_k=6,
+        history=history,
+        system_context=fact_context,
+    )
+    if rag_answer.strip():
+        # Áp dụng xưng hô (Anh/Chị/Nam/Nữ) dựa trên dữ liệu Máy B
+        context = await load_session_context(session_id)
+        profile = await load_lead_profile(session_id)
+        state_for_pronoun = {"lead_profile": profile, "session_context": context}
+        patched_answer = _apply_customer_pronoun(rag_answer, state_for_pronoun)
+
+        await _persist_chat_turn(session_id, user_text, patched_answer)
+        return {
+            "route_category": "RAG",
+            "final_response": patched_answer,
+            "next_sales_state": None,
+            "lead_profile": profile,
+            "missing_slots": None,
+        }
+
+    return await _run_sales_flow(
+        session_id=session_id,
+        user_text=user_text,
+        raw_transcript=raw_transcript,
+    )
+
+
+async def _answer_subquery_non_sales(
+    *,
+    subquery: str,
+    route: str,
+    history: List[Dict[str, Any]],
+) -> str:
+    if route == "SEARCH":
+        return await summarize_search_answer(
+            user_query=subquery,
+            search_query=subquery,
+            history=history,
+            system_persona=_SEARCH_PERSONA,
+            max_sentences=3,
+        )
+    if route == "RAG":
+        fact_context = await build_rag_fact_constraints(subquery)
+        return await query_rag(
+            text=subquery,
+            top_k=6,
+            history=history,
+            system_context=fact_context,
+        )
+    return ""
+
+
 async def _run_sales_or_search(
     *,
     session_id: str,
@@ -111,70 +341,56 @@ async def _run_sales_or_search(
     raw_transcript: Optional[str] = None,
 ) -> Dict[str, Any]:
     history = await load_chat_history(session_id)
-    subqueries = await decompose_subqueries(user_text)
-    if len(subqueries) > 1:
-        plans: List[Tuple[int, str, str, Optional[str]]] = []
-        for idx, subquery in enumerate(subqueries, start=1):
-            category, routed_query = await route_query(subquery, history)
-            plans.append((idx, subquery, category, routed_query))
+    plan = _normalize_plan(user_text, await plan_query_adaptive(user_text, history))
 
-        has_search = any(category == "SEARCH" for _, _, category, _ in plans)
-        has_sales = any(category != "SEARCH" for _, _, category, _ in plans)
-        if has_search and has_sales:
-            log.info("Mixed tool routing: %s", [(idx, category) for idx, _, category, _ in plans])
-            part_answers: Dict[int, str] = {}
-
-            async def _run_search_subquery(
-                idx: int,
-                subquery: str,
-                routed_query: Optional[str],
-            ) -> tuple[int, str]:
-                answer = await summarize_search_answer(
-                    user_query=subquery,
-                    search_query=routed_query or subquery,
-                    history=history,
-                    system_persona=_SEARCH_PERSONA,
-                    max_sentences=3,
-                )
-                return idx, answer
-
-            search_tasks = [
-                asyncio.create_task(_run_search_subquery(idx, subquery, routed_query))
-                for idx, subquery, category, routed_query in plans
-                if category == "SEARCH"
-            ]
-            if search_tasks:
-                for idx, answer in await asyncio.gather(*search_tasks):
-                    part_answers[idx] = (answer or "").strip()
-
-            sales_segments = [subquery for _, subquery, category, _ in plans if category != "SEARCH"]
-            sales_query = " ".join(segment.strip() for segment in sales_segments if segment.strip()).strip()
-            sales_result = await _run_sales_flow(
+    if plan["multi_intent"] and plan["subqueries"]:
+        subqueries = list(plan["subqueries"])
+        if any(item["route"] == "OTHER" for item in subqueries):
+            return await _run_other_llm_flow(
                 session_id=session_id,
-                user_text=sales_query or user_text,
-                raw_transcript=raw_transcript,
+                user_text=user_text,
+                history=history,
             )
-            sales_text = (sales_result.get("final_response") or "").strip()
-            if sales_text:
-                first_sales_idx = next(idx for idx, _, category, _ in plans if category != "SEARCH")
-                part_answers[first_sales_idx] = sales_text
 
-            ordered_lines: List[str] = []
-            for idx, _, _, _ in plans:
-                text = (part_answers.get(idx) or "").strip()
-                if text:
-                    ordered_lines.append(f"{idx}) {text}")
-            final_response = "\n\n".join(ordered_lines).strip() or sales_text
+        tasks = [
+            _answer_subquery_non_sales(
+                subquery=item["query"],
+                route=item["route"],
+                history=history,
+            )
+            for item in subqueries
+        ]
+        answers = await asyncio.gather(*tasks, return_exceptions=True)
 
+        ordered_lines: List[str] = []
+        for idx, answer in enumerate(answers, start=1):
+            if isinstance(answer, Exception):
+                log.warning("subquery[%s] failed: %s", idx, answer)
+                continue
+            text = str(answer or "").strip()
+            if text:
+                ordered_lines.append(f"{idx}) {text}")
+
+        final_response = "\n\n".join(ordered_lines).strip()
+        if final_response:
+            await _persist_chat_turn(session_id, user_text, final_response)
             return {
                 "route_category": "MIXED",
                 "final_response": final_response,
-                "next_sales_state": sales_result.get("next_sales_state"),
-                "lead_profile": sales_result.get("lead_profile") or await load_lead_profile(session_id),
-                "missing_slots": sales_result.get("missing_slots"),
+                "next_sales_state": None,
+                "lead_profile": await load_lead_profile(session_id),
+                "missing_slots": None,
             }
 
-    category, routed_query = await route_query(user_text, history)
+        return await _run_sales_flow(
+            session_id=session_id,
+            user_text=user_text,
+            raw_transcript=raw_transcript,
+        )
+
+    category = str(plan["route"])
+    routed_query = str(plan["refined_query"] or user_text)
+
     if category == "SEARCH":
         return await _run_search_flow(
             session_id=session_id,
@@ -183,25 +399,18 @@ async def _run_sales_or_search(
             history=history,
         )
     if category == "RAG":
-        rag_answer = await query_rag(
-            text=routed_query or user_text,
-            top_k=6,
+        return await _run_rag_flow(
+            session_id=session_id,
+            user_text=user_text,
+            rag_query=routed_query or user_text,
             history=history,
+            raw_transcript=raw_transcript,
         )
-        if rag_answer.strip():
-            await _persist_chat_turn(session_id, user_text, rag_answer)
-            return {
-                "route_category": "RAG",
-                "final_response": rag_answer,
-                "next_sales_state": None,
-                "lead_profile": await load_lead_profile(session_id),
-                "missing_slots": None,
-            }
 
-    return await _run_sales_flow(
+    return await _run_other_llm_flow(
         session_id=session_id,
         user_text=user_text,
-        raw_transcript=raw_transcript,
+        history=history,
     )
 
 
@@ -255,7 +464,7 @@ async def sales_chat_stream(request: SalesChatRequest):
         }
         yield json.dumps(
             {
-                "chunk": random.choice(_THINKING_ACK_MESSAGES),
+                "chunk": _apply_customer_pronoun(random.choice(_THINKING_ACK_MESSAGES), {"lead_profile": await load_lead_profile(request.session_id), "session_context": await load_session_context(request.session_id)}),
                 "done": False,
                 "phase": "thinking_ack",
                 "session_id": request.session_id,
@@ -265,58 +474,71 @@ async def sales_chat_stream(request: SalesChatRequest):
 
         try:
             history = await load_chat_history(request.session_id)
-            subqueries = await decompose_subqueries(user_text)
+            plan = _normalize_plan(user_text, await plan_query_adaptive(user_text, history))
+            if plan["multi_intent"] and plan["subqueries"]:
+                if any(item["route"] == "OTHER" for item in plan["subqueries"]):
+                    result = await _run_other_llm_flow(
+                        session_id=request.session_id,
+                        user_text=user_text,
+                        history=history,
+                    )
+                    async for line in _yield_ndjson_response_chunks(
+                        request.session_id,
+                        str(result.get("final_response") or ""),
+                    ):
+                        yield line
+                    final_meta.update(_stream_meta_from_flow_result(result))
+                else:
+                    final_meta["route_category"] = "MIXED"
+                    parts: List[str] = []
+                    for idx, item in enumerate(plan["subqueries"], start=1):
+                        answer = await _answer_subquery_non_sales(
+                            subquery=item["query"],
+                            route=item["route"],
+                            history=history,
+                        )
+                        normalized = str(answer or "").strip()
+                        if not normalized:
+                            continue
+                        numbered = f"{idx}) {normalized}"
+                        parts.append(numbered)
+                        async for line in _yield_ndjson_response_chunks(request.session_id, numbered):
+                            yield line
 
-            if len(subqueries) > 1:
-                # Preserve mixed behavior (search + sales) for multi-intent input.
-                result = await _run_sales_or_search(
-                    session_id=request.session_id,
-                    user_text=user_text,
-                    raw_transcript=request.raw_transcript,
-                )
-                full_answer = (result.get("final_response") or "").strip()
-                for chunk in iter_stream_chunks(full_answer):
-                    yield json.dumps(
-                        {
-                            "chunk": chunk,
-                            "done": False,
-                            "phase": "response",
-                            "session_id": request.session_id,
-                        },
-                        ensure_ascii=False,
-                    ) + "\n"
-                    await asyncio.sleep(0)
-                final_meta.update(
-                    {
-                        "route_category": result.get("route_category"),
-                        "sales_state": result.get("next_sales_state"),
-                        "missing_slots": result.get("missing_slots"),
-                        "lead_profile": result.get("lead_profile"),
-                    }
-                )
+                    full_answer = "\n\n".join(parts).strip()
+                    if full_answer:
+                        await _persist_chat_turn(request.session_id, user_text, full_answer)
+                        final_meta["lead_profile"] = await load_lead_profile(request.session_id)
+                    else:
+                        result = await _run_sales_flow(
+                            session_id=request.session_id,
+                            user_text=user_text,
+                            raw_transcript=request.raw_transcript,
+                        )
+                        async for line in _yield_ndjson_response_chunks(
+                            request.session_id,
+                            str(result.get("final_response") or ""),
+                        ):
+                            yield line
+                        final_meta.update(_stream_meta_from_flow_result(result))
             else:
-                category, routed_query = await route_query(user_text, history)
+                category = str(plan["route"])
+                routed_query = str(plan["refined_query"] or user_text)
                 if category == "RAG":
                     final_meta["route_category"] = "RAG"
+                    fact_context = await build_rag_fact_constraints(routed_query or user_text)
                     parts: List[str] = []
                     async for delta in query_rag_stream(
                         text=routed_query or user_text,
                         top_k=6,
                         history=history,
+                        system_context=fact_context,
                     ):
                         chunk = str(delta or "")
                         if not chunk:
                             continue
                         parts.append(chunk)
-                        yield json.dumps(
-                            {
-                                "chunk": chunk,
-                                "done": False,
-                                "phase": "response",
-                                "session_id": request.session_id,
-                            },
-                            ensure_ascii=False,
-                        ) + "\n"
+                        yield _ndjson_response_line(request.session_id, chunk)
                         await asyncio.sleep(0)
 
                     full_answer = "".join(parts).strip()
@@ -324,32 +546,17 @@ async def sales_chat_stream(request: SalesChatRequest):
                         await _persist_chat_turn(request.session_id, user_text, full_answer)
                         final_meta["lead_profile"] = await load_lead_profile(request.session_id)
                     else:
-                        # Retrieval returned empty: fallback to full sales flow.
                         result = await _run_sales_flow(
                             session_id=request.session_id,
                             user_text=user_text,
                             raw_transcript=request.raw_transcript,
                         )
-                        fallback_text = (result.get("final_response") or "").strip()
-                        for chunk in iter_stream_chunks(fallback_text):
-                            yield json.dumps(
-                                {
-                                    "chunk": chunk,
-                                    "done": False,
-                                    "phase": "response",
-                                    "session_id": request.session_id,
-                                },
-                                ensure_ascii=False,
-                            ) + "\n"
-                            await asyncio.sleep(0)
-                        final_meta.update(
-                            {
-                                "route_category": result.get("route_category"),
-                                "sales_state": result.get("next_sales_state"),
-                                "missing_slots": result.get("missing_slots"),
-                                "lead_profile": result.get("lead_profile"),
-                            }
-                        )
+                        async for line in _yield_ndjson_response_chunks(
+                            request.session_id,
+                            str(result.get("final_response") or ""),
+                        ):
+                            yield line
+                        final_meta.update(_stream_meta_from_flow_result(result))
                 elif category == "SEARCH":
                     result = await _run_search_flow(
                         session_id=request.session_id,
@@ -357,52 +564,24 @@ async def sales_chat_stream(request: SalesChatRequest):
                         search_query=routed_query or user_text,
                         history=history,
                     )
-                    full_answer = (result.get("final_response") or "").strip()
-                    for chunk in iter_stream_chunks(full_answer):
-                        yield json.dumps(
-                            {
-                                "chunk": chunk,
-                                "done": False,
-                                "phase": "response",
-                                "session_id": request.session_id,
-                            },
-                            ensure_ascii=False,
-                        ) + "\n"
-                        await asyncio.sleep(0)
-                    final_meta.update(
-                        {
-                            "route_category": result.get("route_category"),
-                            "sales_state": result.get("next_sales_state"),
-                            "missing_slots": result.get("missing_slots"),
-                            "lead_profile": result.get("lead_profile"),
-                        }
-                    )
+                    async for line in _yield_ndjson_response_chunks(
+                        request.session_id,
+                        str(result.get("final_response") or ""),
+                    ):
+                        yield line
+                    final_meta.update(_stream_meta_from_flow_result(result))
                 else:
-                    result = await _run_sales_flow(
+                    result = await _run_other_llm_flow(
                         session_id=request.session_id,
                         user_text=user_text,
-                        raw_transcript=request.raw_transcript,
+                        history=history,
                     )
-                    full_answer = (result.get("final_response") or "").strip()
-                    for chunk in iter_stream_chunks(full_answer):
-                        yield json.dumps(
-                            {
-                                "chunk": chunk,
-                                "done": False,
-                                "phase": "response",
-                                "session_id": request.session_id,
-                            },
-                            ensure_ascii=False,
-                        ) + "\n"
-                        await asyncio.sleep(0)
-                    final_meta.update(
-                        {
-                            "route_category": result.get("route_category"),
-                            "sales_state": result.get("next_sales_state"),
-                            "missing_slots": result.get("missing_slots"),
-                            "lead_profile": result.get("lead_profile"),
-                        }
-                    )
+                    async for line in _yield_ndjson_response_chunks(
+                        request.session_id,
+                        str(result.get("final_response") or ""),
+                    ):
+                        yield line
+                    final_meta.update(_stream_meta_from_flow_result(result))
 
             if not final_meta.get("route_category"):
                 final_meta["route_category"] = "SALES"
@@ -573,14 +752,81 @@ async def close_session(session_id: str):
     await delete_session_context(session_id)
     await delete_lead_profile_cache(session_id)
 
+    # Đồng bộ xóa face embedding bên Machine B nếu session này có customer_id.
+    customer_id = str(profile.get("customer_id") or "").strip()
+    if not customer_id and isinstance(ctx, dict):
+        customer_id = str(ctx.get("customer_id") or "").strip()
+    machine_b_deleted: bool = False
+    if customer_id:
+        result = await notify_machine_b_customer_removed(customer_id)
+        machine_b_deleted = bool(result and result.get("deleted"))
+
     return JSONResponse(
         {
             "session_id": session_id,
             "status": "closed",
             "export_path": export_path,
             "messages_exported": len(history),
+            "machine_b_face_deleted": machine_b_deleted,
         }
     )
+
+
+@router.post("/customer/{customer_id}/machine-b-face-removal")
+async def notify_machine_b_after_customer_record_removed(
+    customer_id: str,
+    x_chat_history_purge_token: Optional[str] = Header(
+        None, alias="X-Chat-History-Purge-Token"
+    ),
+):
+    """Sau khi đã xóa / vô hiệu hóa khách trong DB (khóa `customer_id`), báo Máy B xóa embedding tương ứng.
+
+    Gọi từ job/worker phía A ngay sau khi commit xóa bản ghi Postgres (hoặc tương đương).
+    Cùng header bảo vệ với `purge-all`: `X-Chat-History-Purge-Token`.
+    """
+    _require_chat_purge_token(x_chat_history_purge_token)
+    cid = (customer_id or "").strip()
+    if not cid:
+        raise HTTPException(status_code=400, detail="customer_id is required")
+    result = await notify_machine_b_customer_removed(cid)
+    if result is None:
+        raise HTTPException(
+            status_code=502,
+            detail="Could not notify Machine B (check MACHINE_B_BASE_URL, network, VISION_FACE_DELETE_TOKEN)",
+        )
+    return JSONResponse({"ok": True, "customer_id": cid, "machine_b": result})
+
+
+@router.post("/chat-history/purge-all")
+async def purge_all_chat_history_endpoint(
+    x_chat_history_purge_token: Optional[str] = Header(
+        None, alias="X-Chat-History-Purge-Token"
+    ),
+    notify_machine_b: bool = Query(
+        True,
+        description=(
+            "True: trước khi xóa Redis, gom customer_id từ session_context + lead_profile_cache; "
+            "sau purge gọi Máy B DELETE /v1/face/{id} cho từng id (cần MACHINE_B_BASE_URL + VISION_FACE_DELETE_TOKEN). "
+            "False: chỉ xóa cache/snapshot, không gọi B."
+        ),
+    ),
+):
+    """Xóa sạch phiên sales: Redis, Postgres (`lead_profiles` + `customer_sessions` và CASCADE),
+    toàn bộ file trong `live_snapshots/*.txt` (không chỉ xóa chat trong file).
+
+    Gộp với nhu cầu \"quên phiên\": không chỉ xóa tin nhắn mà xóa luôn context/lead cache Redis
+    để lần sau không đọc nhầm `customer_id` cũ.
+
+    Response gồm `postgres_*_deleted`, `redis_session_context_keys_deleted`, `live_snapshot_files_deleted`,
+    `customer_ids_collected_before_purge`, `session_ids_seen_in_redis_before_purge`, và `machine_b`.
+
+    Tắt gọi B toàn cục: `.env` `PURGE_ALL_NOTIFY_MACHINE_B=false` (ghi đè ý định gọi API).
+
+    Cần CHAT_HISTORY_PURGE_TOKEN; gửi header X-Chat-History-Purge-Token.
+    """
+    _require_chat_purge_token(x_chat_history_purge_token)
+    stats = await purge_all_chat_history(notify_machine_b=notify_machine_b)
+    return JSONResponse({"ok": True, **stats})
 
 
 @router.get("/history/{session_id}")

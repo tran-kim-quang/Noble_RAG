@@ -1,7 +1,7 @@
 NOBLE SALES SESSION SNAPSHOT
 {
   "session_id": "demo_001",
-  "updated_at": "2026-03-31T14:36:23.797012+00:00",
+  "updated_at": "2026-04-04T23:27:24.783911+00:00",
   "lead_profile": {
     "lead_id": "demo_001",
     "current_state": "product_matching",
@@ -26,68 +26,8 @@ NOBLE SALES SESSION SNAPSHOT
     "last_user_text": "ok cho tôi xem danh sách căn phù hợp nhất",
     "last_detected_intent": "other"
   },
-  "chat_history": [
-    {
-      "role": "user",
-      "content": "bây giờ là mấy giờ và có mấy căn hộ shophouse"
-    },
-    {
-      "role": "assistant",
-      "content": "Chào Anh/Chị, em là tư vấn viên bất động sản của Noble. Để em hỗ trợ đúng nhu cầu, gia đình mình hiện có bao nhiêu người ạ?"
-    },
-    {
-      "role": "user",
-      "content": "tôi muốn mua đầu tư cho thuê"
-    },
-    {
-      "role": "assistant",
-      "content": "Anh/Chị đang ưu tiên khu vực nào để em lọc đúng dự án phù hợp ạ?"
-    },
-    {
-      "role": "user",
-      "content": "ngân sách khoảng 4 đến 6 tỷ"
-    },
-    {
-      "role": "assistant",
-      "content": "Anh/Chị đang ưu tiên khu vực nào để em lọc đúng dự án phù hợp ạ?"
-    },
-    {
-      "role": "user",
-      "content": "quan tâm khu vực quận 7"
-    },
-    {
-      "role": "assistant",
-      "content": "Anh/Chị đang ưu tiên khu vực nào để em lọc đúng dự án phù hợp ạ?"
-    },
-    {
-      "role": "user",
-      "content": "giá vậy có cao quá không, dưới 5 tỷ được không"
-    },
-    {
-      "role": "assistant",
-      "content": "Anh/Chị đang ưu tiên khu vực nào để em lọc đúng dự án phù hợp ạ?"
-    },
-    {
-      "role": "user",
-      "content": "ok cho tôi xem danh sách căn phù hợp nhất"
-    },
-    {
-      "role": "assistant",
-      "content": "Anh/Chị đang ưu tiên khu vực nào để em lọc đúng dự án phù hợp ạ?"
-    }
-  ]
+  "chat_history": []
 }
 
 CHAT HISTORY
-1. user: bây giờ là mấy giờ và có mấy căn hộ shophouse
-2. assistant: Chào Anh/Chị, em là tư vấn viên bất động sản của Noble. Để em hỗ trợ đúng nhu cầu, gia đình mình hiện có bao nhiêu người ạ?
-3. user: tôi muốn mua đầu tư cho thuê
-4. assistant: Anh/Chị đang ưu tiên khu vực nào để em lọc đúng dự án phù hợp ạ?
-5. user: ngân sách khoảng 4 đến 6 tỷ
-6. assistant: Anh/Chị đang ưu tiên khu vực nào để em lọc đúng dự án phù hợp ạ?
-7. user: quan tâm khu vực quận 7
-8. assistant: Anh/Chị đang ưu tiên khu vực nào để em lọc đúng dự án phù hợp ạ?
-9. user: giá vậy có cao quá không, dưới 5 tỷ được không
-10. assistant: Anh/Chị đang ưu tiên khu vực nào để em lọc đúng dự án phù hợp ạ?
-11. user: ok cho tôi xem danh sách căn phù hợp nhất
-12. assistant: Anh/Chị đang ưu tiên khu vực nào để em lọc đúng dự án phù hợp ạ?
+(empty)

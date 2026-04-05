@@ -1,124 +1,86 @@
 """Build LLM prompts per sales state."""
 
+from __future__ import annotations
+
 import json
+import unicodedata
+from datetime import datetime
 from typing import Any, Dict, List
+from zoneinfo import ZoneInfo
 
-SYSTEM_PROMPT = """Bạn là AI Sales Agent bất động sản của Noble.
+_VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
-MỤC TIÊU CHÍNH
-- Hiểu đúng nhu cầu thật của khách hàng.
-- Tư vấn dự án/sản phẩm dựa trên dữ liệu retrieve từ kho tri thức RAG của Noble.
-- Đề xuất sản phẩm phù hợp nhất dựa trên hồ sơ khách và dữ liệu retrieve được.
-- Xử lý băn khoăn một cách trung thực, tinh tế, không ép mua.
-- Dẫn hội thoại theo kịch bản sales để tăng mức độ quan tâm và đưa khách tới bước tiếp theo rõ ràng: gửi shortlist, gửi bảng giá, hẹn call, hẹn xem dự án.
+SYSTEM_PROMPT = """Bạn là Sunny, trợ lý bất động sản cho dự án Noble Place Tây Thăng Long.
 
-VAI TRÒ
-- Bạn không phải chatbot FAQ thuần túy.
-- Bạn là chuyên viên sales tư vấn dự án theo quy trình.
-- Bạn cần chủ động dẫn dắt nhưng vẫn tự nhiên và tôn trọng khách.
+Vai trò:
+- Tư vấn rõ ràng, trung thực, bám sát dữ liệu đã truy xuất từ RAG.
+- Không tự bịa thông tin pháp lý, giá, tiến độ, số lượng sản phẩm.
+- Thiếu dữ kiện trong ngữ cảnh thì nói rõ và đề nghị bước tiếp theo.
 
-NGUYÊN TẮC BẮT BUỘC
-1. Không bịa thông tin về giá, pháp lý, ưu đãi, tiến độ, tồn kho.
-2. Chỉ sử dụng thông tin có trong context, knowledge base RAG hoặc tool results.
-3. Nếu thiếu dữ liệu, nói rõ chưa đủ thông tin và hỏi thêm hoặc đề xuất bước tiếp theo.
-4. Không cam kết lợi nhuận, không hứa chắc tăng giá, không dùng lời lẽ thao túng.
-5. Chỉ được pitch dự án khi đã có đủ 4 tiêu chí cốt lõi: số người trong gia đình, số con nhỏ, mục đích mua, khu vực ưu tiên.
-6. Sau mỗi lượt trả lời, tạo ra một bước tiến nhỏ trong sales funnel.
-7. Không hỏi lại thông tin đã có trong HỒ SƠ KHÁCH HÀNG.
-8. Nếu chưa đủ điều kiện pitch theo state machine, không được tư vấn dự án cụ thể; chỉ xác nhận nhu cầu đã hiểu và hỏi thêm đúng phần còn thiếu.
-9. Mỗi lượt chỉ nên có một mục tiêu chính: tư vấn, xử lý băn khoăn, hoặc chốt bước tiếp theo.
-10. Khi chưa có retrieved context về dự án hoặc vị trí, không được tự nêu ví dụ về tên dự án, quận, khu vực, tuyến đường hay địa danh cụ thể.
-11. Nếu đang hỏi để lấy khu vực ưu tiên, chỉ hỏi chung như "Anh/Chị ưu tiên gần khu vực nào?" và không tự gợi ý địa điểm mẫu.
+Quy tắc nội dung:
+1. Chỉ dùng dữ liệu trong hồ sơ khách, khối NHẬN DIỆN KHÁCH (MÁY B), ngữ cảnh RAG và kết quả công cụ.
+2. Không cam kết lợi nhuận; không gây áp lực chốt sale.
+3. Trả lời ngắn gọn, đúng trọng tâm câu hỏi hiện tại trước.
+4. Nhiều ý trong một câu: ưu tiên các ý quan trọng nhất.
 
-PHONG CÁCH
-- Xưng "em", gọi khách là "Anh/Chị".
-- Tự nhiên, gọn, rõ.
-- Không chào hỏi máy móc ở mọi lượt.
-- Không liệt kê quá nhiều lựa chọn cùng lúc.
-- Ưu tiên 1 đến 3 phương án tốt nhất."""
+Xưng hô và lời chào — ưu tiên dữ liệu Máy B (camera / nhận diện khuôn mặt):
+- Nguồn chuẩn: khối "NHẬN DIỆN KHÁCH (MÁY B)" trong prompt và dòng "Xưng hô bắt buộc" ngay dưới YÊU CẦU TRẢ LỜI. Hai nguồn này phải được tuân thủ; không được bỏ qua hoặc ghi đè bằng suy đoán.
+- Đã xác định NAM (ví dụ gender_guess=male, gioi_tinh/nam, hoặc mã 1): suốt hội thoại gọi khách là "anh" (đầu câu viết "Anh"). Lời chào mở đầu phải là kiểu "Chào anh," — tuyệt đối không dùng "Anh/Chị", "anh/chị", "Chào anh/chị".
+- Đã xác định NỮ (female, nữ, hoặc mã 2): gọi "chị"/"Chị"; chào "Chào chị," — không dùng dạng song song Anh/Chị.
+- Chưa xác định giới (unknown, thiếu khối Máy B hoặc không có tín hiệu rõ): mới được dùng "Anh/Chị" hoặc "anh/chị" trung tính.
+- Không xen kẽ "anh" và "chị" với "Anh/Chị" trong cùng lượt khi giới đã rõ.
+
+Trạng thái GREETING (lời mở đầu):
+- Tối đa 2 câu, 1 câu hỏi mở. Câu chào đầu tiên bắt buộc khớp giới từ Máy B như trên; giới thiệu Sunny ngắn gọn, sau đó hỏi nhu cầu.
+
+Khi khách chỉ mở lời tư vấn chung, chưa hỏi chi tiết dự án:
+- Không trình bày brochure dạng danh sách/bullet dài; ưu tiên chào ngắn (đúng giới) và một câu hỏi làm rõ nhu cầu.
+"""
 
 _STATE_PROMPTS: Dict[str, str] = {
     "greeting": """TRẠNG THÁI: GREETING
-NHIỆM VỤ
-- Chào khách tự nhiên trong 1 câu ngắn.
-- Sau đó hỏi đúng 1 câu mở để khách nói nhu cầu.
-- Không hỏi nhiều ý cùng lúc.
-- Không liệt kê tiêu chí, không pitch, không xin quá nhiều thông tin ở lượt đầu.""",
-
+NHIỆM VỤ:
+- Tối đa 2 câu; đúng 1 câu hỏi mở.
+- Câu 1: chào + giới thiệu Sunny; bắt buộc dùng đúng xưng hô theo Máy B (anh hoặc chị, không Anh/Chị nếu giới đã rõ).
+- Câu 2 (nếu tách riêng): một câu hỏi nhu cầu.""",
     "qualification": """TRẠNG THÁI: QUALIFICATION
-NHIỆM VỤ
-- Xác định mục đích: mua để ở, đầu tư cho thuê, đầu tư tăng giá, giữ tài sản, hay chỉ tham khảo.""",
-
+NHIỆM VỤ:
+- Làm rõ mục đích mua: ở thực, đầu tư cho thuê, đầu tư tăng giá, hay tham khảo.""",
     "need_discovery": """TRẠNG THÁI: NEED_DISCOVERY
-NHIỆM VỤ
-- Chỉ hỏi để lấy các slot còn thiếu trong nhóm tiêu chí cốt lõi.
-- Nếu có NGỮ CẢNH TỪ KHO TÀI LIỆU, có thể phản hồi ngắn gọn theo tri thức dự án để định hướng cho khách trước khi hỏi tiếp.
-- Không chốt dự án cụ thể khi vẫn thiếu tiêu chí cốt lõi.
-- Không nêu ví dụ dự án hoặc khu vực cụ thể nếu dữ liệu retrieve không chỉ rõ.
-- Không suy diễn địa điểm, loại hình, ngân sách hoặc chân dung gia đình nếu khách chưa nói.
-- Nếu khách chưa xác định rõ nhu cầu ở, có thể gợi ý 1-2 tiêu chí chọn nơi ở trung lập dựa trên thông tin đã có về gia đình, con cái, mục đích mua.
-- Các gợi ý phải ở mức tiêu chí sống, ví dụ: gần công viên, gần trường học, an toàn, thuận tiện đi làm, cộng đồng yên tĩnh.
-- Không được lái khách sang một loại hình sản phẩm cụ thể nếu khách chưa tự nêu.
-- Nếu khách vừa hỏi tư vấn/recommendation khi thông tin còn thiếu, hãy trả lời ngắn theo dữ liệu retrieve rồi chốt bằng đúng 1 câu hỏi để lấy slot còn thiếu quan trọng nhất.
-- Nếu khách đã nêu một tiêu chí rõ như gần trường học, tiện đi làm, yên tĩnh, có thể phản hồi 1-2 ý bám theo tiêu chí đó từ tài liệu thay vì chỉ hỏi lại máy móc.
-- Mỗi lượt tối đa 1 câu hỏi chính; tối đa 1 câu phụ nếu thật sự cần.
-- Nếu câu khách rất ngắn hoặc chỉ là chào hỏi, chỉ hỏi 1 câu duy nhất.
-- Không hỏi lại các thông tin đã có trong hồ sơ khách.
-- Nếu thiếu location_preference, chỉ hỏi chung về khu vực ưu tiên, không nêu ví dụ như quận, khu đô thị hay dự án cụ thể.""",
-
+NHIỆM VỤ:
+- Thu thập thêm các slot còn thiếu, mỗi lượt chỉ hỏi tối đa 1 câu chính.
+- Nếu đã có ngữ cảnh RAG phù hợp, có thể trả lời ngắn trước rồi hỏi bổ sung.
+- Nếu khách mới chỉ mở lời tư vấn chung: không tổng hợp toàn bộ dự án; tối đa 1–2 ý chọn lọc rồi hỏi tiếp.""",
     "budget_alignment": """TRẠNG THÁI: BUDGET_ALIGNMENT
-NHIỆM VỤ
-- Trạng thái này hiếm khi dùng.
-- Không ưu tiên hỏi ngân sách.
-- Nếu thiếu 1 trong 4 tiêu chí cốt lõi thì quay lại hỏi đúng tiêu chí đó.""",
-
+NHIỆM VỤ:
+- Căn chỉnh theo năng lực tài chính nếu người dùng chủ động đề cập.
+- Không ép hỏi ngân sách khi chưa cần thiết.""",
     "project_qa": """TRẠNG THÁI: PROJECT_QA
-NHIỆM VỤ
-- Trả lời trực tiếp câu hỏi người dùng về dự án/sản phẩm/chính sách.
-- Chỉ dùng dữ liệu có trong NGỮ CẢNH TỪ KHO TÀI LIỆU.
-- Không ép hội thoại quay về flow discovery nếu câu hỏi hiện tại có thể trả lời được.
-- Không tự biến câu trả lời thành shortlist 2 phương án nếu khách không yêu cầu.
-- Chỉ gợi ý bước tiếp theo rất nhẹ ở cuối nếu thật sự phù hợp.""",
-
+NHIỆM VỤ:
+- Trả lời trực tiếp câu hỏi thông tin dự án dựa trên ngữ cảnh RAG.
+- Không tự thêm dữ kiện không có trong tài liệu.""",
     "product_matching": """TRẠNG THÁI: PRODUCT_MATCHING
-NHIỆM VỤ
-- Đề xuất tối đa 3 lựa chọn phù hợp với hồ sơ khách.
-- Mỗi lựa chọn phải có: (1) tên dự án/sản phẩm, (2) vì sao phù hợp, (3) 1 điểm cần lưu ý.
-- Luôn gắn đề xuất với nhu cầu thật của khách như để ở, gia đình có con nhỏ, ngân sách, khu vực, tài chính.
-- Nếu khách chưa chốt loại hình sản phẩm, trình bày theo mức độ phù hợp với nhu cầu sống trước, không ép vào một loại hình cụ thể.""",
-
+NHIỆM VỤ:
+- Đề xuất tối đa 3 lựa chọn phù hợp.
+- Mỗi lựa chọn nêu ngắn: vì sao hợp + 1 điểm cần lưu ý.""",
     "comparison": """TRẠNG THÁI: COMPARISON
-NHIỆM VỤ
-- So sánh 2-3 lựa chọn theo tiêu chí: giá, vị trí, pháp lý, tiến độ, thanh toán, tiềm năng cho thuê.
-- Giúp khách ra quyết định, không khuyến cáo chung chung.""",
-
+NHIỆM VỤ:
+- So sánh 2-3 phương án theo tiêu chí người dùng quan tâm.""",
     "objection_handling": """TRẠNG THÁI: OBJECTION_HANDLING
-NHIỆM VỤ
-- Xác định phản đối chính của khách.
-- Đồng cảm trước, giải thích sau.
-- Không tranh luận tay đôi, không ép mua.
-- Sau khi xử lý, mở ra 1 bước tiếp theo hợp lý.""",
-
+NHIỆM VỤ:
+- Đồng cảm trước, giải thích sau, không tranh luận căng thẳng.""",
     "buy_signal": """TRẠNG THÁI: BUY_SIGNAL
-NHIỆM VỤ
-- Xác nhận sự quan tâm của khách.
-- Dẫn ngay vào bước closing phù hợp.""",
-
+NHIỆM VỤ:
+- Xác nhận mức quan tâm và gợi ý bước chốt phù hợp.""",
     "closing_next_step": """TRẠNG THÁI: CLOSING_NEXT_STEP
-NHIỆM VỤ
-- Chốt một bước tiếp theo nhỏ, rõ ràng.
-- Ưu tiên CTA phù hợp: gửi shortlist, gửi bảng giá, hẹn call, hẹn xem dự án.
-- Không tạo cảm giác bị ép.""",
-
+NHIỆM VỤ:
+- Chốt một bước tiếp theo rõ ràng, dễ thực hiện.""",
     "follow_up": """TRẠNG THÁI: FOLLOW_UP
-NHIỆM VỤ
-- Nhắc lại mối quan tâm chính của khách.
-- Kéo khách quay lại funnel một cách tự nhiên.""",
-
+NHIỆM VỤ:
+- Nhắc lại nhu cầu chính và kéo hội thoại quay lại đúng mục tiêu.""",
     "out_of_scope": """TRẠNG THÁI: OUT_OF_SCOPE
-NHIỆM VỤ
-- Từ chối lịch sự câu hỏi ngoài phạm vi.
-- Gợi ý đưa hội thoại quay lại bất động sản Noble.""",
+NHIỆM VỤ:
+- Từ chối lịch sự các yêu cầu ngoài phạm vi và điều hướng lại.""",
 }
 
 
@@ -133,66 +95,179 @@ def build_prompt(state: Dict[str, Any]) -> str:
     missing_slots: List[str] = state.get("missing_slots") or []
 
     state_prompt = _STATE_PROMPTS.get(next_state, _STATE_PROMPTS["need_discovery"])
+    now_text = datetime.now(_VN_TZ).strftime("%H:%M:%S, %A, %d/%m/%Y")
 
     lead_summary = _format_lead_profile(lead_profile)
     missing_slots_text = ", ".join(missing_slots) if missing_slots else "không có"
 
     context_block = ""
     has_context = False
-    if retrieved_context:
-        snippets = []
-        for item in retrieved_context:
-            if isinstance(item, dict):
-                content = item.get("content") or item.get("text") or str(item)
-            else:
-                content = str(item)
-            if content.strip():
-                snippets.append(content.strip())
-        if snippets:
-            has_context = True
-            context_block = "\n\nNGỮ CẢNH TỪ KHO TÀI LIỆU:\n" + "\n---\n".join(snippets[:5])
+    snippets: List[str] = []
+    for item in retrieved_context:
+        content = ""
+        if isinstance(item, dict):
+            content = str(item.get("content") or item.get("text") or "").strip()
+        else:
+            content = str(item).strip()
+        if content:
+            snippets.append(content)
+    if snippets:
+        has_context = True
+        context_block = "\n\nNGỮ CẢNH RAG:\n" + "\n---\n".join(snippets[:6])
 
     discovery_guidance = _build_discovery_guidance(next_state, lead_profile, missing_slots)
-
     output_rules = _build_output_rules(next_state, has_context)
     pronoun_rules = _build_pronoun_rules(lead_profile, session_context)
+    vision_machine_b_block = _format_vision_machine_b_block(session_context)
 
-    prompt = (
-        f"{SYSTEM_PROMPT}\n\n"
+    return (
+        f"{SYSTEM_PROMPT}\n"
+        f"Thời gian hệ thống hiện tại: {now_text}\n\n"
         f"{state_prompt}\n\n"
         f"SCRIPT STEP HIỆN TẠI: {next_script_step}\n"
         f"RESPONSE ACTION: {response_action}\n\n"
         f"HỒ SƠ KHÁCH HÀNG:\n{lead_summary}\n\n"
+        f"{vision_machine_b_block}"
         f"THÔNG TIN CÒN THIẾU:\n{missing_slots_text}"
         f"{discovery_guidance}"
         f"{context_block}\n\n"
         f"Tin nhắn của khách: {user_text}\n\n"
         "YÊU CẦU TRẢ LỜI:\n"
-        "- Ưu tiên trả lời đúng trọng tâm câu khách vừa hỏi.\n"
-        "- Nếu RESPONSE ACTION là match_options hoặc explain_option_detail: không được hỏi thêm slot mới.\n"
-        "- Nếu RESPONSE ACTION là match_options: chỉ đề xuất tối đa 2 phương án.\n"
-        "- Nếu khách mua để ở mà chưa chốt loại hình, không được tự đẩy sang shophouse.\n"
-        "- Không lặp lại cùng một câu hỏi nếu hồ sơ đã có dữ liệu.\n"
-        "- Không tự thêm ví dụ địa điểm hoặc dự án nếu các ví dụ đó không có trong hồ sơ khách hoặc ngữ cảnh retrieve.\n"
+        "- Trả lời đúng trọng tâm, ưu tiên câu hỏi đang được hỏi.\n"
+        "- Nếu thiếu dữ kiện, nói rõ thiếu gì và đề nghị cách lấy thêm dữ liệu.\n"
+        "- Không dùng dữ kiện ngoài ngữ cảnh retrieve.\n"
+        "- Áp dụng nguyên văn khối xưng hô bên dưới; với GREETING, câu đầu phải chào đúng giới.\n"
         f"{pronoun_rules}\n"
         f"{output_rules}\n\n"
-        "Trả lời (theo phong cách sales, tự nhiên, đúng state):"
+        "Trả lời:"
     )
-    return prompt
+
+
+def _fold_vn(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    decomp = unicodedata.normalize("NFD", text)
+    no_mark = "".join(ch for ch in decomp if unicodedata.category(ch) != "Mn")
+    return no_mark.replace("đ", "d")
+
+
+def _normalize_gender_value(value: Any) -> str:
+    if value is None or isinstance(value, bool):
+        return "unknown"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        n = int(value)
+        if n == 1:
+            return "male"
+        if n == 2:
+            return "female"
+        return "unknown"
+    folded = _fold_vn(value)
+    if not folded:
+        return "unknown"
+    if folded in {"1", "01"}:
+        return "male"
+    if folded in {"2", "02"}:
+        return "female"
+    if folded in {"male", "nam", "man", "m", "anh", "ong"}:
+        return "male"
+    if folded in {"female", "nu", "woman", "f", "chi", "co"}:
+        return "female"
+    return "unknown"
+
+
+_VISION_MACHINE_B_PROMPT_KEYS: tuple[str, ...] = (
+    "gender_guess",
+    "gioi_tinh",
+    "gender_estimate",
+    "gender",
+    "age_range",
+    "age_band",
+    "nhom_tuoi",
+    "age_group_estimate",
+)
+
+
+def _format_vision_machine_b_block(session_context: Dict[str, Any]) -> str:
+    """Chỉ đưa 2 nhóm dữ liệu hợp đồng Máy B (giới + độ tuổi) vào prompt."""
+    if not isinstance(session_context, dict):
+        return ""
+    context_json = session_context.get("context_json")
+    if not isinstance(context_json, dict):
+        return ""
+    vision_context = context_json.get("vision_context")
+    if not isinstance(vision_context, dict) or not vision_context:
+        return ""
+    filtered: Dict[str, Any] = {}
+    for k in _VISION_MACHINE_B_PROMPT_KEYS:
+        v = vision_context.get(k)
+        if v in (None, "", [], "unknown"):
+            continue
+        filtered[k] = v
+    if not filtered:
+        return ""
+    try:
+        blob = json.dumps(filtered, ensure_ascii=False, indent=2)
+    except (TypeError, ValueError):
+        return ""
+    return (
+        "NHẬN DIỆN KHÁCH (MÁY B) — chỉ dùng các khóa sau cho xưng hô và gợi ý độ tuổi, không bịa thêm:\n"
+        f"{blob}\n\n"
+    )
 
 
 def _build_pronoun_rules(lead_profile: Dict[str, Any], session_context: Dict[str, Any]) -> str:
-    gender = str(
-        lead_profile.get("gender_estimate")
-        or session_context.get("gender_estimate")
-        or "unknown"
-    ).strip().lower()
+    context_json = session_context.get("context_json") if isinstance(session_context, dict) else {}
+    if not isinstance(context_json, dict):
+        context_json = {}
+    vision_context = context_json.get("vision_context") if isinstance(context_json, dict) else {}
+    if not isinstance(vision_context, dict):
+        vision_context = {}
 
-    if gender == "male":
-        return "- Xưng hô bắt buộc: gọi khách là \"Anh\" và xưng \"em\"."
-    if gender == "female":
-        return "- Xưng hô bắt buộc: gọi khách là \"Chị\" và xưng \"em\"."
-    return "- Xưng hô mặc định: gọi khách là \"Anh/Chị\" và xưng \"em\"."
+    # Ưu tiên vision (camera / Máy B) trước lead/session để không bị hồ sơ cũ hoặc "unknown" che mất nhận diện.
+    candidates = [
+        vision_context.get("gender_guess"),
+        vision_context.get("gender_estimate"),
+        vision_context.get("gioi_tinh"),
+        vision_context.get("gender"),
+        vision_context.get("sex"),
+        session_context.get("gender_estimate") if isinstance(session_context, dict) else None,
+        session_context.get("gender_guess") if isinstance(session_context, dict) else None,
+        session_context.get("gioi_tinh") if isinstance(session_context, dict) else None,
+        lead_profile.get("gender_estimate"),
+        lead_profile.get("gender_guess"),
+        lead_profile.get("gioi_tinh"),
+    ]
+
+    resolved = "unknown"
+    for item in candidates:
+        gender = _normalize_gender_value(item)
+        if gender != "unknown":
+            resolved = gender
+            break
+
+    if resolved == "male":
+        return (
+            "XƯNG HÔ BẮT BUỘC (NAM — theo Máy B):\n"
+            '- Gọi khách: "anh" trong câu, "Anh" đầu câu.\n'
+            '- Xưng: "em".\n'
+            '- Mở đầu chào hợp lệ: "Chào anh, em là Sunny..."\n'
+            '- Cấm trong lượt này: "Anh/Chị", "anh/chị", "Chào anh/chị".'
+        )
+    if resolved == "female":
+        return (
+            "XƯNG HÔ BẮT BUỘC (NỮ — theo Máy B):\n"
+            '- Gọi khách: "chị" / "Chị".\n'
+            '- Xưng: "em".\n'
+            '- Mở đầu chào hợp lệ: "Chào chị, em là Sunny..."\n'
+            '- Cấm trong lượt này: "Anh/Chị", "anh/chị", "Chào anh/chị".'
+        )
+    return (
+        "XƯNG HÔ (chưa có giới từ Máy B):\n"
+        '- Gọi khách: "Anh/Chị" hoặc "anh/chị" trung tính.\n'
+        '- Xưng: "em".\n'
+        '- Mở đầu chào hợp lệ: "Chào anh/chị, em là Sunny..."'
+    )
 
 
 def _build_discovery_guidance(next_state: str, lead_profile: Dict[str, Any], missing_slots: List[str]) -> str:
@@ -200,20 +275,18 @@ def _build_discovery_guidance(next_state: str, lead_profile: Dict[str, Any], mis
         return ""
 
     hints: List[str] = []
-    purpose = lead_profile.get("purpose")
+    purpose = str(lead_profile.get("purpose") or "").strip().lower()
     family_size = lead_profile.get("family_member_count")
     children_count = lead_profile.get("children_count")
 
     if purpose == "mua_o":
-        hints.append("Khách đang thiên về nhu cầu ở thực.")
-    if family_size and family_size >= 3:
-        hints.append("Gia đình đông người thường quan tâm không gian sống đủ rộng và sinh hoạt thuận tiện.")
-    if children_count and children_count > 0:
-        hints.append("Gia đình có con nhỏ thường quan tâm tiêu chí gần trường học, công viên, khu vui chơi và môi trường an toàn.")
-    if "location_preference" in missing_slots and hints:
-        hints.append("Nếu cần gợi mở, hãy dùng các tiêu chí sống trên để giúp khách tự xác định khu vực phù hợp.")
+        hints.append("Khách thiên về nhu cầu ở thực.")
+    if isinstance(family_size, int) and family_size >= 3:
+        hints.append("Gia đình đông người thường ưu tiên công năng và không gian.")
+    if isinstance(children_count, int) and children_count > 0:
+        hints.append("Có con nhỏ thường quan tâm trường học, công viên và môi trường an toàn.")
     if missing_slots:
-        hints.append("Nếu có context từ kho tài liệu, có thể tóm tắt 1 định hướng ngắn trước khi hỏi đúng 1 slot còn thiếu.")
+        hints.append("Nếu có ngữ cảnh RAG, trả lời định hướng ngắn rồi hỏi tiếp 1 slot còn thiếu.")
 
     if not hints:
         return ""
@@ -225,23 +298,26 @@ def _build_output_rules(next_state: str, has_context: bool) -> str:
     rules = ["RÀNG BUỘC HÌNH THỨC:"]
 
     if next_state == "greeting":
-        rules.extend([
-            "- Tối đa 2 câu.",
-            "- Chỉ có 1 câu hỏi.",
-        ])
+        rules.extend(
+            [
+                "- Tối đa 2 câu.",
+                "- Chỉ 1 câu hỏi mở.",
+                "- Câu chào đầu bám đúng giới Máy B (Chào anh / Chào chị / Chào anh/chị khi chưa rõ).",
+            ]
+        )
     elif next_state == "need_discovery":
-        rules.extend([
-            "- Nếu không có context: tối đa 2 câu.",
-            "- Nếu có context: tối đa 3 câu.",
-            "- Nếu có context, câu đầu có thể là định hướng tư vấn ngắn bám theo tài liệu.",
-            "- Chỉ hỏi về các slot đang thiếu.",
-            "- Chỉ có 1 câu hỏi chính.",
-        ])
+        rules.extend(
+            [
+                "- Tối đa 3 câu.",
+                "- Chỉ hỏi 1 câu chính ở cuối lượt.",
+                "- Không hỏi lại thông tin đã có trong hồ sơ khách.",
+            ]
+        )
 
     if next_state in grounded_states:
-        rules.append("- Chỉ dùng thông tin có trong NGỮ CẢNH TỪ KHO TÀI LIỆU.")
+        rules.append("- Chỉ sử dụng dữ liệu trong NGỮ CẢNH RAG.")
         if not has_context:
-            rules.append("- Hiện không có retrieved context, nên không được nêu tên dự án hay dữ kiện dự án cụ thể.")
+            rules.append("- Hiện chưa có ngữ cảnh phù hợp, không nêu số liệu hoặc dữ kiện cụ thể.")
 
     return "\n".join(rules)
 
@@ -250,12 +326,35 @@ def _format_lead_profile(profile: Dict[str, Any]) -> str:
     if not profile:
         return "(chưa có thông tin)"
     relevant_keys = [
-        "family_member_count", "children_count", "purpose", "property_type",
-        "budget_text", "budget_min", "budget_max", "location_preference",
-        "timeline", "financing_need", "key_concerns",
-        "lead_temperature", "current_state", "gender_estimate", "age_group_estimate",
+        "customer_id",
+        "full_name",
+        "family_member_count",
+        "children_count",
+        "purpose",
+        "property_type",
+        "budget_text",
+        "budget_min",
+        "budget_max",
+        "location_preference",
+        "timeline",
+        "financing_need",
+        "key_concerns",
+        "lead_temperature",
+        "current_state",
+        "gender_estimate",
+        "gender_guess",
+        "gioi_tinh",
+        "age_group_estimate",
+        "age_band",
+        "nhom_tuoi",
+        "identity_status",
+        "face_match_score",
     ]
-    filtered = {k: v for k, v in profile.items() if k in relevant_keys and v not in (None, [], "khong_ro", "")}
+    filtered = {
+        k: v
+        for k, v in profile.items()
+        if k in relevant_keys and v not in (None, [], "khong_ro", "unknown", "")
+    }
     if not filtered:
         return "(chưa thu thập được thông tin)"
     return json.dumps(filtered, ensure_ascii=False, indent=2)

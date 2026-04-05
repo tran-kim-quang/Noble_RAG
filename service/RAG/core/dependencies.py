@@ -8,7 +8,9 @@ from __future__ import annotations
 import logging as _logging
 import os
 import json
+from datetime import datetime
 from typing import Any, AsyncIterator, List
+from zoneinfo import ZoneInfo
 
 import httpx
 import numpy as np
@@ -24,6 +26,20 @@ _logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = _logging.getLogger("rag-service")
+_VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+
+
+def _runtime_system_prompt() -> str:
+    now = datetime.now(_VN_TZ)
+    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    return (
+        "Bạn tên là Sunny, trợ lý bất động sản cho Noble Place Tây Thăng Long. "
+        "Luôn trả lời rõ ràng, đúng trọng tâm, lịch sự, tiếng Việt tự nhiên.\n"
+        "Khi tin nhắn người dùng có khối nhận diện từ Máy B và phần xưng hô bắt buộc, "
+        "bạn phải chào và xưng hô đúng giới (chỉ anh hoặc chỉ chị), "
+        'không được dùng "Anh/Chị" hay "Chào anh/chị" nếu giới đã rõ.\n'
+        f"Thời gian hệ thống hiện tại (Asia/Ho_Chi_Minh): {timestamp}."
+    )
 
 
 def _openai_client(base_url: str | None = None) -> AsyncOpenAI:
@@ -41,8 +57,11 @@ def _build_chat_messages(
 ) -> List[dict[str, str]]:
     history = history_messages or []
     messages: List[dict[str, str]] = []
+    base_system_prompt = _runtime_system_prompt()
     if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "system", "content": f"{base_system_prompt}\n\n{system_prompt}"})
+    else:
+        messages.append({"role": "system", "content": base_system_prompt})
     for item in history[-8:]:
         role = str(item.get("role") or "user")
         content = str(item.get("content") or "").strip()

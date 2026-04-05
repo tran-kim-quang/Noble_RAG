@@ -1,7 +1,7 @@
 NOBLE SALES SESSION SNAPSHOT
 {
   "session_id": "latency_test_001",
-  "updated_at": "2026-03-31T14:16:41.888617+00:00",
+  "updated_at": "2026-04-04T23:27:24.785025+00:00",
   "lead_profile": {
     "lead_id": "latency_test_001",
     "current_state": "need_discovery",
@@ -26,28 +26,8 @@ NOBLE SALES SESSION SNAPSHOT
     "last_user_text": "tôi muốn đầu tư cho thuê, ngân sách 5 tỷ, quận 7",
     "last_detected_intent": "ask_recommendation"
   },
-  "chat_history": [
-    {
-      "role": "user",
-      "content": "bây giờ là mấy giờ và có mấy căn hộ shophouse"
-    },
-    {
-      "role": "assistant",
-      "content": "Để em trả lời chính xác về số lượng căn, phân khu, pháp lý hay tiện ích, Anh/Chị cho em xin đúng tên dự án Noble mình đang quan tâm nhé?"
-    },
-    {
-      "role": "user",
-      "content": "tôi muốn đầu tư cho thuê, ngân sách 5 tỷ, quận 7"
-    },
-    {
-      "role": "assistant",
-      "content": "Dạ vâng, em đã nắm được Anh/Chị đang quan tâm đầu tư shophouse tại Quận 7 với ngân sách 5 tỷ. Noble Palace có các căn shophouse phù hợp với tiêu chí này. Để em có thể tư vấn chi tiết hơn, Anh/Chị cho em hỏi gia đình mình có bao nhiêu thành viên ạ?"
-    }
-  ]
+  "chat_history": []
 }
 
 CHAT HISTORY
-1. user: bây giờ là mấy giờ và có mấy căn hộ shophouse
-2. assistant: Để em trả lời chính xác về số lượng căn, phân khu, pháp lý hay tiện ích, Anh/Chị cho em xin đúng tên dự án Noble mình đang quan tâm nhé?
-3. user: tôi muốn đầu tư cho thuê, ngân sách 5 tỷ, quận 7
-4. assistant: Dạ vâng, em đã nắm được Anh/Chị đang quan tâm đầu tư shophouse tại Quận 7 với ngân sách 5 tỷ. Noble Palace có các căn shophouse phù hợp với tiêu chí này. Để em có thể tư vấn chi tiết hơn, Anh/Chị cho em hỏi gia đình mình có bao nhiêu thành viên ạ?
+(empty)

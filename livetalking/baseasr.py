@@ -20,7 +20,6 @@ import numpy as np
 
 import queue
 from queue import Queue
-import torch.multiprocessing as mp
 
 from basereal import BaseReal
 
@@ -34,7 +33,8 @@ class BaseASR:
         self.sample_rate = 16000
         self.chunk = self.sample_rate // self.fps # 320 samples per chunk (20ms * 16000 / 1000)
         self.queue = Queue()
-        self.output_queue = mp.Queue()
+        # Keep ASR queues in-process to avoid WinError 5 on multiprocessing Pipe creation.
+        self.output_queue = Queue()
 
         self.batch_size = opt.batch_size
 
@@ -42,7 +42,7 @@ class BaseASR:
         self.stride_left_size = opt.l
         self.stride_right_size = opt.r
         #self.context_size = 10
-        self.feat_queue = mp.Queue(2)
+        self.feat_queue = Queue(2)
 
         #self.warm_up()
 

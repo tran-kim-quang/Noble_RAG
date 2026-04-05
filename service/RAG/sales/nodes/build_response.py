@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 
 from sales.graph_state import SalesAgentState
 from sales.prompt_builder import build_prompt
-from sales.response_templates import render_match_options_from_candidates
+from sales.response_templates import _apply_customer_pronoun, render_match_options_from_candidates
 from core.dependencies import llm_model_func
 from utils.json_extract import extract_first_json_object
 from utils.text import normalize_whitespace, split_into_sentences
@@ -814,11 +814,12 @@ async def _repair_response(state: SalesAgentState, invalid_response: str) -> str
         "- Không nêu tên dự án hoặc địa danh ví dụ nếu chưa có context.\n"
         "- Nếu khách chưa rõ nhu cầu ở, có thể gợi ý tiêu chí sống trung lập dựa trên gia đình, con cái, mục đích mua.\n"
         "- Không ép khách sang một loại hình sản phẩm nếu khách chưa tự nêu.\n"
-        "- Giữ giọng điệu tự nhiên, xưng em, gọi Anh/Chị.\n\n"
+        "- Tuân thủ xưng hô bắt buộc trong prompt (Máy B): không dùng Anh/Chị khi đã có nam/nữ.\n\n"
         f"Câu trả lời cần viết lại:\n{invalid_response}"
     )
     repaired = await llm_model_func(repair_prompt, history_messages=[])
-    return _enforce_short_form(str(repaired).strip(), max_sentences=3 if has_context else 2)
+    out = _enforce_short_form(str(repaired).strip(), max_sentences=3 if has_context else 2)
+    return _apply_customer_pronoun(out, state)
 
 
 async def build_response(state: SalesAgentState) -> Dict[str, Any]:
@@ -828,9 +829,12 @@ async def build_response(state: SalesAgentState) -> Dict[str, Any]:
         deterministic = _catalog_overview_response(state)
         return {"draft_response": deterministic, "final_response": deterministic}
     if response_action == "project_qa" and state.get("project_qa_blocked"):
-        project_prompt = (
-            "Để em trả lời chính xác về số lượng căn, phân khu, pháp lý hay tiện ích, "
-            "Anh/Chị cho em xin đúng tên dự án Noble mình đang quan tâm nhé?"
+        project_prompt = _apply_customer_pronoun(
+            (
+                "Để em trả lời chính xác về số lượng căn, phân khu, pháp lý hay tiện ích, "
+                "Anh/Chị cho em xin đúng tên dự án Noble mình đang quan tâm nhé?"
+            ),
+            state,
         )
         return {"draft_response": project_prompt, "final_response": project_prompt}
     if next_state in _GROUNDED_STATES and not _has_retrieved_context(state):
@@ -864,6 +868,7 @@ async def build_response(state: SalesAgentState) -> Dict[str, Any]:
         if response_action in {"match_options", "explain_option_detail"}:
             if _question_count(response_text) > 0:
                 response_text = _enforce_short_form(response_text, max_sentences=4)
+        response_text = _apply_customer_pronoun(response_text, state)
         log.info(
             "build_response: state=%s action=%s response_len=%d",
             next_state,
@@ -873,5 +878,8 @@ async def build_response(state: SalesAgentState) -> Dict[str, Any]:
         return {"draft_response": response_text, "final_response": response_text}
     except Exception as e:
         log.error("build_response error: %s", e)
-        fallback = "Xin lỗi, em gặp lỗi khi xử lý. Anh/Chị thử lại giúp em nhé."
+        fallback = _apply_customer_pronoun(
+            "Xin lỗi, em gặp lỗi khi xử lý. Anh/Chị thử lại giúp em nhé.",
+            state,
+        )
         return {"draft_response": fallback, "final_response": fallback, "errors": [str(e)]}

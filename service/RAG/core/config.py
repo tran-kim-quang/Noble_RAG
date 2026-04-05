@@ -81,6 +81,10 @@ class Settings(BaseSettings):
     machine_b_base_url: str = ""
     machine_b_timeout_sec: float = 8.0
     machine_b_api_key: str = ""
+    vision_face_delete_token: str = ""
+    chat_history_purge_token: str = ""
+    # Khi false: purge-all chỉ xóa Redis/snapshot, không gọi Máy B xóa embedding (ghi đè query notify_machine_b).
+    purge_all_notify_machine_b: bool = True
 
     @model_validator(mode="after")
     def _assemble_derived_fields(self) -> "Settings":
