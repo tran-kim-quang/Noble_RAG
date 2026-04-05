@@ -40,3 +40,12 @@ livetalking/.cache/
 livetalking/outputs/
 livetalking/data/videos/
 livetalking/data/*.wav
+livetalking/logs/
+livetalking/_temp_unzip/
+livetalking/_backup_avatars/
+livetalking/check_avatar_len.py
+livetalking/find_recycle_coords.py
+logs/
+*.pid
+_backup_avatars/
+_temp_unzip/
