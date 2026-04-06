@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from core.dependencies import llm_model_func
 from integrations.camera_identity import maybe_enrich_identity
+from knowledge_base.service import build_knowledge_payload
 from models.api_models import LeadUpdateRequest, SalesChatRequest, SalesChatResponse
 from core.config import get_settings
 from memory.chat_history_store import (
@@ -38,6 +39,7 @@ from rag.retriever import (
     query_rag,
     query_rag_stream,
     summarize_search_answer,
+    summarize_search_results,
 )
 from integrations.machine_b_face_client import notify_machine_b_customer_removed
 from sales.session_export import export_session_to_txt
@@ -278,6 +280,45 @@ async def _run_rag_flow(
     history: List[Dict[str, Any]],
     raw_transcript: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if get_settings().enable_cosine_search_fallback:
+        knowledge_payload = await build_knowledge_payload(
+            query=rag_query or user_text,
+            history=history,
+            top_k=6,
+        )
+        decision = dict(knowledge_payload.get("decision") or {})
+        log.info(
+            "RAG knowledge decision: session=%s top_score=%.4f should_search=%s reason=%s",
+            session_id,
+            float(decision.get("top_score") or 0.0),
+            bool(decision.get("should_search")),
+            str(decision.get("decision_reason") or ""),
+        )
+        search_evidence = list(knowledge_payload.get("search_evidence") or [])
+        if decision.get("should_search") and search_evidence:
+            search_blob = str(search_evidence[0].get("content") or "").strip()
+            if search_blob:
+                answer = await summarize_search_results(
+                    user_query=user_text,
+                    search_results=search_blob,
+                    history=history,
+                    system_persona=_SEARCH_PERSONA,
+                    max_sentences=4,
+                )
+                context = await load_session_context(session_id)
+                profile = await load_lead_profile(session_id)
+                state_for_pronoun = {"lead_profile": profile, "session_context": context}
+                patched_answer = _apply_customer_pronoun(answer, state_for_pronoun)
+
+                await _persist_chat_turn(session_id, user_text, patched_answer)
+                return {
+                    "route_category": "SEARCH",
+                    "final_response": patched_answer,
+                    "next_sales_state": None,
+                    "lead_profile": profile,
+                    "missing_slots": None,
+                }
+
     fact_context = await build_rag_fact_constraints(rag_query or user_text)
     rag_answer = await query_rag(
         text=rag_query or user_text,

@@ -9,6 +9,11 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 
 from qdrant_client.models import FieldCondition, Filter, MatchValue
 
+from knowledge_base.planner import (
+    KnowledgePlan,
+    decompose_subqueries as planner_decompose_subqueries,
+    build_knowledge_plan,
+)
 from core.config import get_settings
 from core.dependencies import llm_model_func, rag
 from tools.tavily_tool import tavily_search
@@ -73,46 +78,36 @@ async def kb_evidence_probe(query: str, history: List[Dict[str, Any]]) -> bool:
 
 
 async def decompose_subqueries(query: str) -> List[str]:
-    """LLM-based decomposition only (no keyword hardcode)."""
-    text = re.sub(r"\s+", " ", (query or "")).strip()
-    if not text:
+    """Compatibility wrapper around the extracted knowledge-base planner."""
+    return await planner_decompose_subqueries(query)
+
+
+def _legacy_route_from_plan(plan: KnowledgePlan) -> str:
+    notes = plan.get("planner_notes") or {}
+    query_kind = str(notes.get("query_kind") or "").strip().lower()
+    if query_kind == "greeting":
+        return "OTHER"
+    if query_kind in {"fact", "consultative", "comparison", "objection", "generic", "unknown"}:
+        return "RAG"
+    return "RAG"
+
+
+def _legacy_subqueries_from_plan(plan: KnowledgePlan, route: str) -> List[Dict[str, str]]:
+    planned_subqueries = plan.get("subqueries") or []
+    if not (plan.get("multi_intent") and planned_subqueries):
         return []
 
-    prompt = f"""
-Phân rã câu hỏi người dùng thành các ý độc lập để xử lý.
-Trả về JSON duy nhất:
-{{
-  "subqueries": ["..."]
-}}
-
-Quy tắc:
-- Nếu câu hỏi chỉ có 1 ý thì trả đúng 1 phần tử.
-- Không thêm thông tin mới, không suy diễn ngoài câu gốc.
-- Tối đa 3 subqueries.
-
-User query: "{text}"
-""".strip()
-
-    try:
-        raw = await llm_model_func(
-            prompt,
-            enable_cot=False,
-            response_format={"type": "json_object"},
-        )
-        data = _parse_json_dict(str(raw))
-        subqueries = data.get("subqueries")
-        if isinstance(subqueries, list):
-            cleaned = []
-            for item in subqueries[:3]:
-                value = re.sub(r"\s+", " ", str(item or "")).strip()
-                if value:
-                    cleaned.append(value)
-            if cleaned:
-                return cleaned
-    except Exception as e:
-        log.warning("decompose_subqueries failed, fallback single query: %s", e)
-
-    return [text]
+    normalized: List[Dict[str, str]] = []
+    for item in planned_subqueries[:2]:
+        query = re.sub(r"\s+", " ", str(item.get("query") or "")).strip()
+        if not query:
+            continue
+        intent_hint = str(item.get("intent_hint") or "").strip().lower()
+        sub_route = "RAG"
+        if intent_hint == "unknown" and route == "OTHER":
+            sub_route = "OTHER"
+        normalized.append({"query": query, "route": sub_route})
+    return normalized
 
 
 async def route_query(
@@ -185,7 +180,7 @@ async def plan_query_adaptive(
     query: str,
     history: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Single LLM planner for route + optional decomposition."""
+    """Compatibility wrapper that adapts the extracted planner to the legacy schema."""
     if history is None:
         history = []
 
@@ -197,66 +192,8 @@ async def plan_query_adaptive(
             "multi_intent": False,
             "subqueries": [],
         }
-
-    history_lines = []
-    for item in (history or [])[-6:]:
-        role = str(item.get("role") or "user").strip()
-        content = re.sub(r"\s+", " ", str(item.get("content") or "")).strip()
-        if content:
-            history_lines.append(f"{role}: {content}")
-    history_text = "\n".join(history_lines) if history_lines else "(empty)"
-
-    prompt = f"""
-You are a query planner for a real-estate assistant.
-
-Allowed routes:
-- SALES: conversation/discovery/consulting intent that should follow sales state machine.
-- RAG: answer from internal project knowledge base.
-- SEARCH: answer requires external realtime/public information.
-- OTHER: social/small talk or generic conversation.
-
-Return JSON only:
-{{
-  "route": "SALES|RAG|SEARCH|OTHER",
-  "refined_query": "short rewritten query with same meaning",
-  "multi_intent": true|false,
-  "subqueries": [
-    {{"query": "...", "route": "RAG|SEARCH|OTHER"}}
-  ]
-}}
-
-Rules:
-- If user says they want consultation/advice without a specific fact request,
-  prefer route=SALES.
-- Prefer SALES for discovery turns such as "tôi muốn được tư vấn", "giúp mình chọn",
-  "em tư vấn giúp", "nên mua loại nào", even when domain is real-estate.
-- Use RAG when user asks concrete internal facts (pháp lý, giá, tiến độ, số căn, diện tích...)
-  and does not need sales-state progression.
-- Use decomposition only when the user has 2 independent intents.
-- If not needed, set multi_intent=false and subqueries=[].
-- Max 2 subqueries.
-- Keep intent and facts faithful to original user query.
-- If user asks to compare external market/projects with "dự án nhà mình",
-  treat "dự án nhà mình" as internal project knowledge (RAG) and external market part as SEARCH.
-- For comparison queries, prefer:
-  multi_intent=true with exactly 2 subqueries:
-  one SEARCH subquery (external comparison baseline),
-  one RAG subquery (internal project side to compare).
-
-History:
-{history_text}
-
-User query:
-{text}
-""".strip()
-
     try:
-        raw = await llm_model_func(
-            prompt,
-            enable_cot=False,
-            response_format={"type": "json_object"},
-        )
-        data = _parse_json_dict(str(raw))
+        plan = await build_knowledge_plan(text, history)
     except Exception as e:
         log.warning("plan_query_adaptive failed, fallback route_query: %s", e)
         route, refined = await route_query(text, history)
@@ -267,31 +204,10 @@ User query:
             "subqueries": [],
         }
 
-    route = str(data.get("route") or "").upper().strip()
-    if route not in {"SALES", "RAG", "SEARCH", "OTHER"}:
-        route = "SALES"
-
-    refined = re.sub(r"\s+", " ", str(data.get("refined_query") or text)).strip() or text
-    if route == "SEARCH":
-        refined = _normalize_search_query(text, refined)
-
-    raw_subqueries = data.get("subqueries")
-    planned_subqueries: List[Dict[str, str]] = []
-    if isinstance(raw_subqueries, list):
-        for item in raw_subqueries[:2]:
-            if not isinstance(item, dict):
-                continue
-            sq_query = re.sub(r"\s+", " ", str(item.get("query") or "")).strip()
-            sq_route = str(item.get("route") or "").upper().strip()
-            if not sq_query:
-                continue
-            if sq_route not in {"RAG", "SEARCH", "OTHER"}:
-                sq_route = route if route in {"RAG", "SEARCH", "OTHER"} else "RAG"
-            if sq_route == "SEARCH":
-                sq_query = _normalize_search_query(sq_query, sq_query)
-            planned_subqueries.append({"query": sq_query, "route": sq_route})
-
-    multi_intent = bool(data.get("multi_intent")) and len(planned_subqueries) > 1
+    refined = re.sub(r"\s+", " ", str(plan.get("rewritten_query") or text)).strip() or text
+    route = _legacy_route_from_plan(plan)
+    planned_subqueries = _legacy_subqueries_from_plan(plan, route)
+    multi_intent = bool(plan.get("multi_intent")) and len(planned_subqueries) > 1
     if not multi_intent:
         planned_subqueries = []
 
@@ -318,6 +234,22 @@ async def summarize_search_answer(
 ) -> str:
     normalized = _normalize_search_query(user_query, search_query)
     search_results = await tavily_search(normalized)
+    return await summarize_search_results(
+        user_query=user_query,
+        search_results=search_results,
+        history=history,
+        system_persona=system_persona,
+        max_sentences=max_sentences,
+    )
+
+
+async def summarize_search_results(
+    user_query: str,
+    search_results: str,
+    history: List[Dict[str, Any]],
+    system_persona: str,
+    max_sentences: int = 3,
+) -> str:
     summary_prompt = f"""{system_persona}
 
 Hãy trả lời dựa trên kết quả tìm kiếm.
@@ -328,6 +260,63 @@ Kết quả tìm kiếm:
 Trả lời:"""
     raw = await llm_model_func(summary_prompt, history_messages=history)
     return str(raw)
+
+
+async def retrieve_kb_candidates(
+    query: str,
+    top_k: int = 6,
+) -> List[Dict[str, Any]]:
+    """Low-level KB retrieval with raw similarity scores for confidence evaluation."""
+    search_query = re.sub(r"\s+", " ", (query or "")).strip()
+    if not search_query:
+        return []
+
+    try:
+        vector = (await rag._embed_texts([search_query]))[0]  # type: ignore[attr-defined]
+        query_response = rag.qdrant.query_points(
+            collection_name=rag.settings.collection_name,
+            query=vector,
+            limit=max(1, top_k),
+            with_payload=True,
+            query_filter=Filter(
+                must=[
+                    FieldCondition(
+                        key="workspace",
+                        match=MatchValue(value=rag.settings.workspace),
+                    )
+                ]
+            ),
+        )
+    except Exception as e:
+        log.warning("retrieve_kb_candidates failed: %s", e)
+        return []
+
+    candidates: List[Dict[str, Any]] = []
+    for point in list(getattr(query_response, "points", []) or []):
+        payload = dict(getattr(point, "payload", None) or {})
+        content = str(payload.get("content") or "").strip()
+        if not content:
+            continue
+        source = str(payload.get("file_path") or payload.get("document_id") or "unknown")
+        metadata = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"content", "file_path", "document_id"}
+        }
+        try:
+            score = float(getattr(point, "score", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        candidates.append(
+            {
+                "score": score,
+                "content": content,
+                "source": source,
+                "document_id": str(payload.get("document_id") or ""),
+                "metadata": metadata,
+            }
+        )
+    return candidates
 
 
 async def query_rag(
@@ -415,26 +404,10 @@ def _extract_generic_evidence_lines(query: str, corpus: str, max_lines: int = 8)
 async def build_rag_fact_constraints(user_text: str, top_k: int = 8) -> str:
     """Retrieve evidence from Qdrant and build generic constraints."""
     try:
-        vector = (await rag._embed_texts([user_text]))[0]  # type: ignore[attr-defined]
-        query_response = rag.qdrant.query_points(
-            collection_name=rag.settings.collection_name,
-            query=vector,
-            limit=max(4, top_k),
-            with_payload=True,
-            query_filter=Filter(
-                must=[
-                    FieldCondition(
-                        key="workspace",
-                        match=MatchValue(value=rag.settings.workspace),
-                    )
-                ]
-            ),
-        )
-        points = list(getattr(query_response, "points", []) or [])
         corpus_parts: List[str] = []
-        for point in points:
-            payload = dict(getattr(point, "payload", None) or {})
-            content = str(payload.get("content") or "").strip()
+        candidates = await retrieve_kb_candidates(user_text, top_k=max(4, top_k))
+        for item in candidates:
+            content = str(item.get("content") or "").strip()
             if content:
                 corpus_parts.append(content)
         if not corpus_parts:

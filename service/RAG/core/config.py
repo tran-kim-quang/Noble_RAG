@@ -59,6 +59,11 @@ class Settings(BaseSettings):
     router_low_confidence_threshold: float = 0.60
     router_skip_kb_probe_confidence: float = 0.90
     search_fallback_on_empty_rag: bool = True
+    enable_kb_chat_refactor: bool = False
+    enable_cosine_search_fallback: bool = True
+    enable_unified_chat_response: bool = False
+    enable_legacy_router: bool = True
+    kb_search_score_threshold: float = 0.5
 
     # Embedding runtime
     embedding_func_max_async: int = 2
