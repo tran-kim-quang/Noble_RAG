@@ -57,6 +57,30 @@ class QueryResponse(BaseModel):
     model: str
 
 
+class KnowledgeEvidenceItem(BaseModel):
+    source_type: str
+    content: str
+    score: Optional[float] = None
+    source_name: Optional[str] = None
+    document_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class KnowledgeDecisionPayload(BaseModel):
+    original_query: str
+    rewritten_query: str
+    multi_intent: bool = False
+    subqueries: List[Dict[str, Any]] = Field(default_factory=list)
+    top_score: Optional[float] = None
+    threshold: Optional[float] = None
+    should_search: bool = False
+    decision_reason: Optional[str] = None
+    kb_evidence: List[KnowledgeEvidenceItem] = Field(default_factory=list)
+    search_evidence: List[KnowledgeEvidenceItem] = Field(default_factory=list)
+    unresolved: bool = False
+    planner_notes: Dict[str, Any] = Field(default_factory=dict)
+
+
 # ── Sales endpoints ────────────────────────────────────────────────────────
 class SalesChatRequest(BaseModel):
     session_id: str
@@ -71,6 +95,9 @@ class SalesChatResponse(BaseModel):
     sales_state: Optional[str] = None
     lead_profile: Optional[Dict[str, Any]] = None
     missing_slots: Optional[List[str]] = None
+    knowledge_used: bool = False
+    search_used: bool = False
+    kb_top_score: Optional[float] = None
 
 
 class LeadUpdateRequest(BaseModel):

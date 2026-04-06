@@ -10,13 +10,23 @@
 
 ```bash
 # Cài đặt
-docker-compose up --build
+docker compose up --build
 
 # Chạy
-docker-compose up
+docker compose up
 
 # Dừng
-docker-compose down
+docker compose down
+```
+
+### Đóng gói service + chạy test trong Docker
+
+```bash
+# Build toàn bộ image service theo docker-compose
+docker compose build
+
+# Chạy riêng bộ test knowledge_base (container one-shot)
+docker compose --profile test run --rm rag-tests
 ```
 
 ### Web UI cho RAG Client

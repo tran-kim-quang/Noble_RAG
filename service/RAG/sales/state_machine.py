@@ -7,8 +7,48 @@ are deterministic and auditable.
 from typing import Any, Dict, List
 
 
+def _has_kb_evidence(state: Dict[str, Any]) -> bool:
+    payload = state.get("knowledge_payload")
+    if isinstance(payload, dict):
+        return bool(payload.get("kb_evidence"))
+    return False
+
+
+def _has_search_evidence(state: Dict[str, Any]) -> bool:
+    payload = state.get("knowledge_payload")
+    if isinstance(payload, dict):
+        return bool(payload.get("search_evidence"))
+    return False
+
+
+def _is_unresolved(state: Dict[str, Any]) -> bool:
+    payload = state.get("knowledge_payload")
+    if isinstance(payload, dict):
+        return bool(payload.get("unresolved"))
+    return False
+
+
+def _infer_intent_from_query_kind(intent: str, state: Dict[str, Any]) -> str:
+    if intent:
+        return intent
+    payload = state.get("knowledge_payload")
+    if not isinstance(payload, dict):
+        return ""
+    notes = payload.get("planner_notes")
+    if not isinstance(notes, dict):
+        return ""
+    query_kind = str(notes.get("query_kind") or "").strip().lower()
+    if query_kind in {"comparison", "compare"}:
+        return "comparison"
+    if query_kind in {"project_info", "fact", "project_qa"}:
+        return "project_info"
+    if query_kind in {"recommendation", "recommend", "matching"}:
+        return "ask_recommendation"
+    return ""
+
+
 def resolve_next_state(state: Dict[str, Any]) -> str:
-    intent: str = state.get("detected_intent") or ""
+    intent: str = _infer_intent_from_query_kind(str(state.get("detected_intent") or ""), state)
     turn_role: str = state.get("turn_role") or ""
     retrieval_goal: str = state.get("retrieval_goal") or "none"
     missing: List[str] = state.get("missing_slots") or []
@@ -19,6 +59,12 @@ def resolve_next_state(state: Dict[str, Any]) -> str:
     resolved_project_name = state.get("resolved_project_name")
     history = state.get("chat_history") or []
     is_first_turn = len(history) == 0
+    has_kb = _has_kb_evidence(state)
+    has_search = _has_search_evidence(state)
+    unresolved = _is_unresolved(state)
+
+    if unresolved and not extracted_slots:
+        return "need_discovery"
 
     # Hard exits
     if intent == "out_of_scope":
@@ -44,8 +90,12 @@ def resolve_next_state(state: Dict[str, Any]) -> str:
 
     # Intent-based transitions
     if intent == "project_info":
+        if not has_kb and not has_search:
+            return "need_discovery"
         return "project_qa"
     if intent == "comparison":
+        if not has_kb and not has_search:
+            return "need_discovery"
         return "comparison"
     if intent == "objection":
         return "objection_handling"
@@ -56,8 +106,12 @@ def resolve_next_state(state: Dict[str, Any]) -> str:
             return "need_discovery"
         return "product_matching"
     if retrieval_goal == "project_qa":
+        if not has_kb and not has_search:
+            return "need_discovery"
         return "project_qa"
     if retrieval_goal == "comparison":
+        if not has_kb and not has_search:
+            return "need_discovery"
         return "comparison"
     if retrieval_goal == "objection_support":
         return "objection_handling"
@@ -85,6 +139,8 @@ def resolve_next_state(state: Dict[str, Any]) -> str:
 
     if intent == "ask_recommendation":
         if missing:
+            return "need_discovery"
+        if not has_kb and not has_search:
             return "need_discovery"
         return "product_matching"
 

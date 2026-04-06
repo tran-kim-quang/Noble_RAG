@@ -10,9 +10,9 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from core.dependencies import llm_model_func
+from chat.service import run_chat_route
 from integrations.camera_identity import maybe_enrich_identity
-from knowledge_base.service import build_knowledge_payload
+from knowledge_base.service import resolve_knowledge
 from models.api_models import LeadUpdateRequest, SalesChatRequest, SalesChatResponse
 from core.config import get_settings
 from memory.chat_history_store import (
@@ -33,20 +33,10 @@ from memory.local_snapshot_store import (
     read_local_session_snapshot_text,
 )
 from memory.session_store import delete_session_context, load_session_context
-from rag.retriever import (
-    build_rag_fact_constraints,
-    plan_query_adaptive,
-    query_rag,
-    query_rag_stream,
-    summarize_search_answer,
-    summarize_search_results,
-)
 from integrations.machine_b_face_client import notify_machine_b_customer_removed
 from sales.session_export import export_session_to_txt
 from sales.response_templates import _apply_customer_pronoun
-from sales.prompt_builder import build_prompt
 from utils.text import iter_stream_chunks
-from utils.time import now_vietnam_str
 
 router = APIRouter(prefix="/sales", tags=["sales"])
 log = logging.getLogger("rag-service")
@@ -68,11 +58,6 @@ _THINKING_ACK_MESSAGES = [
     "Em đã ghi nhận câu hỏi, Anh/Chị đợi em một lát để em đối chiếu thông tin cho chính xác nhé.",
     "Em nhận được rồi ạ, em đang xử lý nhanh để gửi lại câu trả lời ngắn gọn cho Anh/Chị.",
 ]
-_SEARCH_PERSONA = (
-    "Bạn là trợ lý tư vấn của Noble. "
-    "Với câu hỏi ngoài kho tri thức dự án, hãy trả lời trực tiếp, tự nhiên, ngắn gọn nhưng hữu ích. "
-    "Nếu thông tin phụ thuộc thời gian, hãy ưu tiên dữ liệu vừa tìm được."
-)
 
 
 async def _persist_chat_turn(session_id: str, user_text: str, assistant_text: str) -> None:
@@ -86,116 +71,6 @@ async def _persist_chat_turn(session_id: str, user_text: str, assistant_text: st
         log.warning("append_turn failed: session=%s error=%s", session_id, e)
 
 
-async def _run_search_flow(
-    *,
-    session_id: str,
-    user_text: str,
-    search_query: str,
-    history: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    answer = await summarize_search_answer(
-        user_query=user_text,
-        search_query=search_query or user_text,
-        history=history,
-        system_persona=_SEARCH_PERSONA,
-        max_sentences=4,
-    )
-    # Áp dụng xưng hô (Anh/Chị/Nam/Nữ) dựa trên dữ liệu Máy B
-    context = await load_session_context(session_id)
-    profile = await load_lead_profile(session_id)
-    state_for_pronoun = {"lead_profile": profile, "session_context": context}
-    patched_answer = _apply_customer_pronoun(answer, state_for_pronoun)
-
-    await _persist_chat_turn(session_id, user_text, patched_answer)
-    return {
-        "route_category": "SEARCH",
-        "final_response": patched_answer,
-        "next_sales_state": None,
-        "lead_profile": profile,
-        "missing_slots": None,
-    }
-
-
-def _summarize_history_for_other(history: List[Dict[str, Any]], max_turns: int = 6) -> str:
-    if not history:
-        return "Chưa có lịch sử hội thoại trước đó."
-    lines: List[str] = []
-    for item in history[-(max_turns * 2):]:
-        role = str(item.get("role") or "user").strip().lower()
-        content = str(item.get("content") or "").strip()
-        if not content:
-            continue
-        speaker = "Người dùng" if role == "user" else ("Trợ lý" if role == "assistant" else role)
-        lines.append(f"- {speaker}: {content}")
-    return "\n".join(lines) if lines else "Chưa có lịch sử hội thoại trước đó."
-
-
-async def _run_other_llm_flow(
-    *,
-    session_id: str,
-    user_text: str,
-    history: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    history_summary = _summarize_history_for_other(history)
-    # Chuẩn bị state tối thiểu để build_prompt có đủ dữ liệu xưng hô
-    context = await load_session_context(session_id)
-    profile = await load_lead_profile(session_id)
-    state = {
-        "session_id": session_id,
-        "user_text": user_text,
-        "chat_history": history,
-        "lead_profile": profile,
-        "session_context": context,
-        "next_sales_state": "natural_consult",
-    }
-    
-    # Lấy system prompt chuẩn từ prompt_builder (có xưng hô Máy B)
-    system_prompt = build_prompt(state)
-    
-    prompt = f"""
-{system_prompt}
-
-YÊU CẦU BỔ SUNG CHO LUỒNG TỰ DO:
-- Đã tóm tắt lịch sử hội thoại: {history_summary}
-- Luôn trả lời tự nhiên, lịch sự, ngắn gọn, đúng ngữ cảnh.
-- Ưu tiên dùng dữ liệu khách từ vision_context/lead_profile trước khi hỏi thêm.
-- Nếu đã có độ tuổi, tên, mô tả/tính cách thì cá nhân hoá tư vấn và gợi ý sản phẩm phù hợp với hồ sơ đó.
-- Không hỏi theo mẫu cứng kiểu "Gia đình có mấy người?", "Có mấy con nhỏ?".
-- Nếu câu hỏi quá chung chung thì hỏi lại 1 câu làm rõ, không dùng kịch bản sales cứng.
-""".strip()
-
-    answer = ""
-    try:
-        answer = str(
-            await llm_model_func(
-                prompt,
-                history_messages=history[-6:],
-                temperature=0.2,
-            )
-            or ""
-        ).strip()
-    except Exception as e:
-        log.warning("OTHER llm flow failed: %s", e)
-
-    if not answer:
-        answer = "Em đang ở đây để hỗ trợ mình. Anh/Chị muốn em tư vấn thông tin nào cụ thể hơn ạ?"
-
-    # Áp dụng xưng hô (Anh/Chị/Nam/Nữ) dựa trên dữ liệu Máy B
-    context = await load_session_context(session_id)
-    profile = await load_lead_profile(session_id)
-    state_for_pronoun = {"lead_profile": profile, "session_context": context}
-    patched_answer = _apply_customer_pronoun(answer, state_for_pronoun)
-
-    await _persist_chat_turn(session_id, user_text, patched_answer)
-    return {
-        "route_category": "OTHER",
-        "final_response": patched_answer,
-        "next_sales_state": None,
-        "lead_profile": profile,
-        "missing_slots": None,
-    }
-
-
 def _stream_meta_from_flow_result(result: Dict[str, Any]) -> Dict[str, Any]:
     """Các khóa final_meta cho /chat/stream sau khi chạy _run_*_flow."""
     return {
@@ -203,6 +78,9 @@ def _stream_meta_from_flow_result(result: Dict[str, Any]) -> Dict[str, Any]:
         "sales_state": result.get("next_sales_state"),
         "missing_slots": result.get("missing_slots"),
         "lead_profile": result.get("lead_profile"),
+        "knowledge_used": bool(result.get("knowledge_used")),
+        "search_used": bool(result.get("search_used")),
+        "kb_top_score": result.get("kb_top_score"),
     }
 
 
@@ -233,225 +111,34 @@ async def _run_sales_flow(
     raw_transcript: Optional[str] = None,
 ) -> Dict[str, Any]:
     history = await load_chat_history(session_id)
-    return await _run_other_llm_flow(
-        session_id=session_id,
-        user_text=user_text,
+    session_context = await load_session_context(session_id)
+    lead_profile = await load_lead_profile(session_id)
+
+    knowledge_payload = await resolve_knowledge(
+        query=user_text,
         history=history,
-    )
-
-
-def _normalize_plan(user_text: str, plan: Dict[str, Any]) -> Dict[str, Any]:
-    route = str(plan.get("route") or "RAG").upper().strip()
-    if route not in {"RAG", "SEARCH", "OTHER"}:
-        route = "RAG"
-
-    refined = str(plan.get("refined_query") or user_text).strip() or user_text
-    raw_subqueries = plan.get("subqueries")
-    subqueries: List[Dict[str, str]] = []
-    if isinstance(raw_subqueries, list):
-        for item in raw_subqueries[:2]:
-            if not isinstance(item, dict):
-                continue
-            query = str(item.get("query") or "").strip()
-            sub_route = str(item.get("route") or route).upper().strip()
-            if not query:
-                continue
-            if sub_route not in {"RAG", "SEARCH", "OTHER"}:
-                sub_route = route
-            subqueries.append({"query": query, "route": sub_route})
-
-    multi_intent = bool(plan.get("multi_intent")) and len(subqueries) > 1
-    if not multi_intent:
-        subqueries = []
-
-    return {
-        "route": route,
-        "refined_query": refined,
-        "multi_intent": multi_intent,
-        "subqueries": subqueries,
-    }
-
-
-async def _run_rag_flow(
-    *,
-    session_id: str,
-    user_text: str,
-    rag_query: str,
-    history: List[Dict[str, Any]],
-    raw_transcript: Optional[str] = None,
-) -> Dict[str, Any]:
-    if get_settings().enable_cosine_search_fallback:
-        knowledge_payload = await build_knowledge_payload(
-            query=rag_query or user_text,
-            history=history,
-            top_k=6,
-        )
-        decision = dict(knowledge_payload.get("decision") or {})
-        log.info(
-            "RAG knowledge decision: session=%s top_score=%.4f should_search=%s reason=%s",
-            session_id,
-            float(decision.get("top_score") or 0.0),
-            bool(decision.get("should_search")),
-            str(decision.get("decision_reason") or ""),
-        )
-        search_evidence = list(knowledge_payload.get("search_evidence") or [])
-        if decision.get("should_search") and search_evidence:
-            search_blob = str(search_evidence[0].get("content") or "").strip()
-            if search_blob:
-                answer = await summarize_search_results(
-                    user_query=user_text,
-                    search_results=search_blob,
-                    history=history,
-                    system_persona=_SEARCH_PERSONA,
-                    max_sentences=4,
-                )
-                context = await load_session_context(session_id)
-                profile = await load_lead_profile(session_id)
-                state_for_pronoun = {"lead_profile": profile, "session_context": context}
-                patched_answer = _apply_customer_pronoun(answer, state_for_pronoun)
-
-                await _persist_chat_turn(session_id, user_text, patched_answer)
-                return {
-                    "route_category": "SEARCH",
-                    "final_response": patched_answer,
-                    "next_sales_state": None,
-                    "lead_profile": profile,
-                    "missing_slots": None,
-                }
-
-    fact_context = await build_rag_fact_constraints(rag_query or user_text)
-    rag_answer = await query_rag(
-        text=rag_query or user_text,
+        session_context=session_context,
         top_k=6,
-        history=history,
-        system_context=fact_context,
     )
-    if rag_answer.strip():
-        # Áp dụng xưng hô (Anh/Chị/Nam/Nữ) dựa trên dữ liệu Máy B
-        context = await load_session_context(session_id)
-        profile = await load_lead_profile(session_id)
-        state_for_pronoun = {"lead_profile": profile, "session_context": context}
-        patched_answer = _apply_customer_pronoun(rag_answer, state_for_pronoun)
-
-        await _persist_chat_turn(session_id, user_text, patched_answer)
-        return {
-            "route_category": "RAG",
-            "final_response": patched_answer,
-            "next_sales_state": None,
-            "lead_profile": profile,
-            "missing_slots": None,
-        }
-
-    return await _run_sales_flow(
+    result = await run_chat_route(
         session_id=session_id,
-        user_text=user_text,
+        message=user_text,
+        history=history,
+        lead_profile=lead_profile or {},
+        session_context=session_context or {},
+        knowledge_payload=knowledge_payload,
         raw_transcript=raw_transcript,
     )
 
-
-async def _answer_subquery_non_sales(
-    *,
-    subquery: str,
-    route: str,
-    history: List[Dict[str, Any]],
-) -> str:
-    if route == "SEARCH":
-        return await summarize_search_answer(
-            user_query=subquery,
-            search_query=subquery,
-            history=history,
-            system_persona=_SEARCH_PERSONA,
-            max_sentences=3,
-        )
-    if route == "RAG":
-        fact_context = await build_rag_fact_constraints(subquery)
-        return await query_rag(
-            text=subquery,
-            top_k=6,
-            history=history,
-            system_context=fact_context,
-        )
-    return ""
-
-
-async def _run_sales_or_search(
-    *,
-    session_id: str,
-    user_text: str,
-    raw_transcript: Optional[str] = None,
-) -> Dict[str, Any]:
-    history = await load_chat_history(session_id)
-    plan = _normalize_plan(user_text, await plan_query_adaptive(user_text, history))
-
-    if plan["multi_intent"] and plan["subqueries"]:
-        subqueries = list(plan["subqueries"])
-        if any(item["route"] == "OTHER" for item in subqueries):
-            return await _run_other_llm_flow(
-                session_id=session_id,
-                user_text=user_text,
-                history=history,
-            )
-
-        tasks = [
-            _answer_subquery_non_sales(
-                subquery=item["query"],
-                route=item["route"],
-                history=history,
-            )
-            for item in subqueries
-        ]
-        answers = await asyncio.gather(*tasks, return_exceptions=True)
-
-        ordered_lines: List[str] = []
-        for idx, answer in enumerate(answers, start=1):
-            if isinstance(answer, Exception):
-                log.warning("subquery[%s] failed: %s", idx, answer)
-                continue
-            text = str(answer or "").strip()
-            if text:
-                ordered_lines.append(f"{idx}) {text}")
-
-        final_response = "\n\n".join(ordered_lines).strip()
-        if final_response:
-            await _persist_chat_turn(session_id, user_text, final_response)
-            return {
-                "route_category": "MIXED",
-                "final_response": final_response,
-                "next_sales_state": None,
-                "lead_profile": await load_lead_profile(session_id),
-                "missing_slots": None,
-            }
-
-        return await _run_sales_flow(
-            session_id=session_id,
-            user_text=user_text,
-            raw_transcript=raw_transcript,
-        )
-
-    category = str(plan["route"])
-    routed_query = str(plan["refined_query"] or user_text)
-
-    if category == "SEARCH":
-        return await _run_search_flow(
-            session_id=session_id,
-            user_text=user_text,
-            search_query=routed_query or user_text,
-            history=history,
-        )
-    if category == "RAG":
-        return await _run_rag_flow(
-            session_id=session_id,
-            user_text=user_text,
-            rag_query=routed_query or user_text,
-            history=history,
-            raw_transcript=raw_transcript,
-        )
-
-    return await _run_other_llm_flow(
-        session_id=session_id,
-        user_text=user_text,
-        history=history,
+    patched_answer = _apply_customer_pronoun(
+        str(result.get("final_response") or ""),
+        {"lead_profile": lead_profile, "session_context": session_context},
     )
+    result["final_response"] = patched_answer
+    result["lead_profile"] = lead_profile
+
+    await _persist_chat_turn(session_id, user_text, patched_answer)
+    return result
 
 
 @router.post("/chat", response_model=SalesChatResponse)
@@ -466,7 +153,7 @@ async def sales_chat(request: SalesChatRequest):
     await maybe_enrich_identity(request.session_id)
 
     try:
-        result = await _run_sales_or_search(
+        result = await _run_sales_flow(
             session_id=request.session_id,
             user_text=request.message.strip(),
             raw_transcript=request.raw_transcript,
@@ -482,12 +169,15 @@ async def sales_chat(request: SalesChatRequest):
         sales_state=result.get("next_sales_state"),
         lead_profile=result.get("lead_profile"),
         missing_slots=result.get("missing_slots"),
+        knowledge_used=bool(result.get("knowledge_used")),
+        search_used=bool(result.get("search_used")),
+        kb_top_score=result.get("kb_top_score"),
     )
 
 
 @router.post("/chat/stream")
 async def sales_chat_stream(request: SalesChatRequest):
-    """Streaming sales chat with true token streaming when route is RAG."""
+    """Streaming sales chat through the unified chat route."""
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="message cannot be empty")
     await ensure_sales_schema()
@@ -501,6 +191,9 @@ async def sales_chat_stream(request: SalesChatRequest):
             "sales_state": None,
             "missing_slots": None,
             "lead_profile": None,
+            "knowledge_used": False,
+            "search_used": False,
+            "kb_top_score": None,
         }
         yield json.dumps(
             {
@@ -513,118 +206,20 @@ async def sales_chat_stream(request: SalesChatRequest):
         ) + "\n"
 
         try:
-            history = await load_chat_history(request.session_id)
-            plan = _normalize_plan(user_text, await plan_query_adaptive(user_text, history))
-            if plan["multi_intent"] and plan["subqueries"]:
-                if any(item["route"] == "OTHER" for item in plan["subqueries"]):
-                    result = await _run_other_llm_flow(
-                        session_id=request.session_id,
-                        user_text=user_text,
-                        history=history,
-                    )
-                    async for line in _yield_ndjson_response_chunks(
-                        request.session_id,
-                        str(result.get("final_response") or ""),
-                    ):
-                        yield line
-                    final_meta.update(_stream_meta_from_flow_result(result))
-                else:
-                    final_meta["route_category"] = "MIXED"
-                    parts: List[str] = []
-                    for idx, item in enumerate(plan["subqueries"], start=1):
-                        answer = await _answer_subquery_non_sales(
-                            subquery=item["query"],
-                            route=item["route"],
-                            history=history,
-                        )
-                        normalized = str(answer or "").strip()
-                        if not normalized:
-                            continue
-                        numbered = f"{idx}) {normalized}"
-                        parts.append(numbered)
-                        async for line in _yield_ndjson_response_chunks(request.session_id, numbered):
-                            yield line
-
-                    full_answer = "\n\n".join(parts).strip()
-                    if full_answer:
-                        await _persist_chat_turn(request.session_id, user_text, full_answer)
-                        final_meta["lead_profile"] = await load_lead_profile(request.session_id)
-                    else:
-                        result = await _run_sales_flow(
-                            session_id=request.session_id,
-                            user_text=user_text,
-                            raw_transcript=request.raw_transcript,
-                        )
-                        async for line in _yield_ndjson_response_chunks(
-                            request.session_id,
-                            str(result.get("final_response") or ""),
-                        ):
-                            yield line
-                        final_meta.update(_stream_meta_from_flow_result(result))
-            else:
-                category = str(plan["route"])
-                routed_query = str(plan["refined_query"] or user_text)
-                if category == "RAG":
-                    final_meta["route_category"] = "RAG"
-                    fact_context = await build_rag_fact_constraints(routed_query or user_text)
-                    parts: List[str] = []
-                    async for delta in query_rag_stream(
-                        text=routed_query or user_text,
-                        top_k=6,
-                        history=history,
-                        system_context=fact_context,
-                    ):
-                        chunk = str(delta or "")
-                        if not chunk:
-                            continue
-                        parts.append(chunk)
-                        yield _ndjson_response_line(request.session_id, chunk)
-                        await asyncio.sleep(0)
-
-                    full_answer = "".join(parts).strip()
-                    if full_answer:
-                        await _persist_chat_turn(request.session_id, user_text, full_answer)
-                        final_meta["lead_profile"] = await load_lead_profile(request.session_id)
-                    else:
-                        result = await _run_sales_flow(
-                            session_id=request.session_id,
-                            user_text=user_text,
-                            raw_transcript=request.raw_transcript,
-                        )
-                        async for line in _yield_ndjson_response_chunks(
-                            request.session_id,
-                            str(result.get("final_response") or ""),
-                        ):
-                            yield line
-                        final_meta.update(_stream_meta_from_flow_result(result))
-                elif category == "SEARCH":
-                    result = await _run_search_flow(
-                        session_id=request.session_id,
-                        user_text=user_text,
-                        search_query=routed_query or user_text,
-                        history=history,
-                    )
-                    async for line in _yield_ndjson_response_chunks(
-                        request.session_id,
-                        str(result.get("final_response") or ""),
-                    ):
-                        yield line
-                    final_meta.update(_stream_meta_from_flow_result(result))
-                else:
-                    result = await _run_other_llm_flow(
-                        session_id=request.session_id,
-                        user_text=user_text,
-                        history=history,
-                    )
-                    async for line in _yield_ndjson_response_chunks(
-                        request.session_id,
-                        str(result.get("final_response") or ""),
-                    ):
-                        yield line
-                    final_meta.update(_stream_meta_from_flow_result(result))
+            result = await _run_sales_flow(
+                session_id=request.session_id,
+                user_text=user_text,
+                raw_transcript=request.raw_transcript,
+            )
+            async for line in _yield_ndjson_response_chunks(
+                request.session_id,
+                str(result.get("final_response") or ""),
+            ):
+                yield line
+            final_meta.update(_stream_meta_from_flow_result(result))
 
             if not final_meta.get("route_category"):
-                final_meta["route_category"] = "SALES"
+                final_meta["route_category"] = "CHAT"
             if final_meta.get("lead_profile") is None:
                 final_meta["lead_profile"] = await load_lead_profile(request.session_id)
 
@@ -656,6 +251,9 @@ async def sales_chat_stream(request: SalesChatRequest):
                 "sales_state": final_meta.get("sales_state"),
                 "missing_slots": final_meta.get("missing_slots"),
                 "lead_profile": final_meta.get("lead_profile"),
+                "knowledge_used": bool(final_meta.get("knowledge_used")),
+                "search_used": bool(final_meta.get("search_used")),
+                "kb_top_score": final_meta.get("kb_top_score"),
                 "latency_sec": round(time.perf_counter() - t_total, 3),
             },
             ensure_ascii=False,
@@ -726,12 +324,10 @@ async def refresh_recommendations(session_id: str):
     if not profile:
         raise HTTPException(status_code=404, detail="Lead not found")
 
-    history = await load_chat_history(session_id)
     try:
-        result = await _run_other_llm_flow(
+        result = await _run_sales_flow(
             session_id=session_id,
             user_text="Anh/Chị muốn xem lại các sản phẩm phù hợp.",
-            history=history,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Refresh error: {e}")
@@ -752,12 +348,10 @@ async def generate_followup(session_id: str):
     if not profile:
         raise HTTPException(status_code=404, detail="Lead not found")
 
-    history = await load_chat_history(session_id)
     try:
-        result = await _run_other_llm_flow(
+        result = await _run_sales_flow(
             session_id=session_id,
             user_text="Anh/Chị có cần em hỗ trợ thêm thông tin gì không?",
-            history=history,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Follow-up error: {e}")

@@ -12,6 +12,12 @@ class SalesAgentState(TypedDict, total=False):
     lead_profile: Dict[str, Any]
     session_context: Dict[str, Any]
 
+    # Phase 5 knowledge payload context
+    knowledge_payload: Optional[Dict[str, Any]]
+    knowledge_decision_reason: Optional[str]
+    kb_top_score: Optional[float]
+    search_used: Optional[bool]
+
     # Intent classification
     detected_intent: Optional[str]
     objection_type: Optional[str]

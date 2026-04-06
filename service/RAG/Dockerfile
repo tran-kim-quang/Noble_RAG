@@ -2,6 +2,8 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+ARG INSTALL_DEV=false
+
 RUN apt-get update && apt-get install -y \
     build-essential \
     libpq-dev \
@@ -11,6 +13,7 @@ RUN apt-get update && apt-get install -y \
 # Install dependencies trước (cache layer)
 COPY service/RAG/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
+RUN if [ "$INSTALL_DEV" = "true" ]; then pip install --no-cache-dir pytest pytest-asyncio; fi
 
 # Copy toàn bộ package service/RAG vào /app
 # (tất cả subpackage: api, core, sales, memory, models, utils, rag, tools, llm, storage)
