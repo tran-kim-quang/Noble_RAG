@@ -1,4 +1,4 @@
-"""Deterministic response templates for scripted sales steps."""
+﻿"""Deterministic response templates for scripted sales steps."""
 
 import re
 import unicodedata
@@ -204,8 +204,8 @@ def render_template_response(action: str, state: Dict[str, Any]) -> str:
     if action == "ask_opening":
         return _apply_customer_pronoun(
             (
-            "Chào Anh/Chị, em là tư vấn viên bất động sản của Noble. "
-            "Để em hỗ trợ đúng nhu cầu, gia đình mình hiện có bao nhiêu người ạ?"
+            "Chào Anh/Chị, em là Sunny của Noble đây ạ. "
+            "Em rất vui được đồng hành cùng mình, cho em xin phép hỏi nhé: gia đình mình hiện có bao nhiêu người ạ?"
             ),
             state,
         )
@@ -309,3 +309,5 @@ def render_template_response(action: str, state: Dict[str, Any]) -> str:
         "Em đã nắm được nhu cầu cơ bản rồi. Em sẽ tư vấn phương án phù hợp nhất cho Anh/Chị ngay ạ.",
         state,
     )
+
+

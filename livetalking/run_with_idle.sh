@@ -43,7 +43,10 @@ if [[ -f "$env_file" ]]; then
   done < "$env_file"
 fi
 
-avatar_id="half_avatar"
+avatar_id="${LIVETALKING_AVATAR_ID:-half}"
+if [[ "$avatar_id" == "half-avatar" || "$avatar_id" == "half_avatar" ]]; then
+  avatar_id="half"
+fi
 requested_tts="elevenlabs"
 enable_transition="0"
 transition_duration="0.06"

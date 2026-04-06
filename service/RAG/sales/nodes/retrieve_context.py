@@ -81,6 +81,217 @@ def _project_lookup_key(text: str) -> str:
     return clean
 
 
+def _normalize_project_alias(text: str) -> str:
+    return _project_lookup_key(text)
+
+
+def _build_project_registry(project_facts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    registry: List[Dict[str, Any]] = []
+    seen = set()
+    for item in project_facts:
+        project_name = str(item.get("project_name") or "").strip()
+        if not project_name:
+            continue
+        canonical = _clean_project_name(project_name)
+        normalized = _normalize_project_alias(canonical)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        aliases = {
+            canonical,
+            normalized,
+            _normalize_project_alias(str(item.get("source_summary") or "")[:120]),
+        }
+        aliases = {alias for alias in aliases if alias}
+        registry.append(
+            {
+                "project_id": str(item.get("doc_id") or canonical),
+                "canonical_name": canonical,
+                "aliases": sorted(aliases),
+                "doc_ids": [str(item.get("doc_id") or "").strip()] if str(item.get("doc_id") or "").strip() else [],
+                "source_files": [str(item.get("source") or "").strip()] if str(item.get("source") or "").strip() else [],
+                "normalized_name": normalized,
+                "source_summary": str(item.get("source_summary") or "").strip(),
+            }
+        )
+    return registry
+
+
+def _registry_match_source(score: int, exact: bool, alias_match: bool) -> str:
+    if exact:
+        return "registry_exact"
+    if alias_match:
+        return "registry_alias"
+    return "registry_ranked" if score else "unresolved"
+
+
+def _project_resolution_evidence_text(state: Dict[str, Any]) -> str:
+    history = state.get("chat_history") or []
+    pieces = [
+        str(state.get("resolved_project_name") or "").strip(),
+        str(state.get("user_text") or "").strip(),
+    ]
+    pieces.extend(
+        str(item.get("content") or "").strip()
+        for item in history[-4:]
+        if isinstance(item, dict) and str(item.get("content") or "").strip()
+    )
+    return "\n".join(piece for piece in pieces if piece) or "(chưa có)"
+
+
+def _score_project_registry_item(state: Dict[str, Any], item: Dict[str, Any]) -> Dict[str, Any]:
+    evidence = _project_resolution_evidence_text(state)
+    evidence_key = _normalize_project_alias(evidence)
+    canonical = str(item.get("canonical_name") or "").strip()
+    normalized = str(item.get("normalized_name") or "").strip()
+    aliases = [str(alias).strip() for alias in item.get("aliases") or [] if str(alias).strip()]
+    score = 0
+    exact = False
+    alias_match = False
+
+    if normalized and normalized in evidence_key:
+        score = 100
+        exact = True
+    elif any(alias and _normalize_project_alias(alias) == evidence_key for alias in aliases):
+        score = 95
+        alias_match = True
+    elif normalized and evidence_key and normalized == evidence_key:
+        score = 100
+        exact = True
+    elif normalized and evidence_key and (normalized in evidence_key or evidence_key in normalized):
+        score = 85
+    else:
+        evidence_tokens = set(evidence_key.split())
+        name_tokens = set(normalized.split())
+        overlap = len(evidence_tokens & name_tokens)
+        if overlap:
+            score = min(75, overlap * 15)
+        elif canonical and canonical.lower() in evidence.lower():
+            score = 90
+            alias_match = True
+
+    if str(state.get("resolved_project_name") or "").strip() and _same_known_project(str(state.get("resolved_project_name") or ""), canonical):
+        score = max(score, 98)
+        exact = True
+
+    return {
+        **item,
+        "score": score,
+        "match_source": _registry_match_source(score, exact, alias_match),
+    }
+
+
+def _resolve_project_candidates_from_registry(
+    state: Dict[str, Any],
+    registry: List[Dict[str, Any]],
+    max_items: int = 3,
+) -> List[Dict[str, Any]]:
+    if not registry:
+        return []
+    scored = [_score_project_registry_item(state, item) for item in registry]
+    scored = [item for item in scored if int(item.get("score") or 0) > 0]
+    scored.sort(key=lambda item: int(item.get("score") or 0), reverse=True)
+    deduped: List[Dict[str, Any]] = []
+    for item in scored:
+        name = str(item.get("canonical_name") or "").strip()
+        if not name:
+            continue
+        if any(_same_known_project(name, str(existing.get("canonical_name") or "")) for existing in deduped):
+            continue
+        deduped.append(item)
+        if len(deduped) >= max_items:
+            break
+    return deduped
+
+
+def _select_high_confidence_candidate(candidates: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+    if not candidates:
+        return None
+    top = candidates[0]
+    top_score = int(top.get("score") or 0)
+    second_score = int(candidates[1].get("score") or 0) if len(candidates) > 1 else 0
+    if top_score >= 95:
+        return top
+    if top_score >= 85 and top_score - second_score >= 15:
+        return top
+    if len(candidates) == 1 and top_score >= 80:
+        return top
+    return None
+
+
+async def _disambiguate_projects_with_llm(
+    state: Dict[str, Any],
+    candidates: List[Dict[str, Any]],
+    max_items: int = 1,
+) -> List[str]:
+    if not candidates:
+        return []
+    candidate_lines = [
+        {
+            "project_name": str(item.get("canonical_name") or "").strip(),
+            "summary": str(item.get("source_summary") or "").strip()[:220],
+        }
+        for item in candidates[:3]
+        if str(item.get("canonical_name") or "").strip()
+    ]
+    if not candidate_lines:
+        return []
+
+    history = state.get("chat_history") or []
+    history_text = "\n".join(
+        f"{(item.get('role') or 'unknown')}: {(item.get('content') or '').strip()}"
+        for item in history[-4:]
+        if isinstance(item, dict)
+    ) or "(chưa có)"
+    prompt = f"""Bạn là bộ chọn dự án Noble từ danh sách candidate có sẵn.
+Chỉ trả về JSON hợp lệ duy nhất theo schema:
+{{
+  "selected_projects": [],
+  "status": "selected" | "ambiguous" | "none",
+  "confidence": 0.0
+}}
+
+Quy tắc:
+- Chỉ chọn trong candidate list dưới đây.
+- Không được bịa tên dự án mới.
+- Nếu câu hỏi chỉ rõ 1 dự án thì chọn đúng 1 mục.
+- Nếu đang so sánh hoặc cần 2 dự án mà câu chữ đủ rõ thì có thể chọn tối đa {max_items} mục.
+- Nếu vẫn mơ hồ, trả status=ambiguous hoặc none.
+- max_tokens phải nhỏ, chỉ đủ cho JSON.
+
+Candidate list:
+{json.dumps(candidate_lines, ensure_ascii=False)}
+
+History:
+{history_text}
+
+Current user text:
+\"\"\"{state.get("user_text") or ""}\"\"\"
+"""
+    try:
+        raw = await llm_model_func(
+            prompt,
+            enable_cot=False,
+            response_format={"type": "json_object"},
+            max_tokens=80,
+        )
+        payload = extract_first_json_object(str(raw))
+        if not payload:
+            return []
+        data = json.loads(payload)
+    except Exception as e:
+        log.warning("project disambiguation failed: %s", e)
+        return []
+
+    selected: List[str] = []
+    allowed = {str(item.get("project_name") or "").strip() for item in candidate_lines if str(item.get("project_name") or "").strip()}
+    for item in data.get("selected_projects") or []:
+        name = _clean_project_name(str(item))
+        if name and name in allowed and name.lower() not in {x.lower() for x in selected}:
+            selected.append(name)
+    return selected[:max_items]
+
+
 def _project_facts_cache_path() -> str:
     return os.path.join(settings.rag_working_dir, f"project_facts_{settings.rag_workspace}.json")
 
@@ -146,46 +357,26 @@ def _build_retrieval_query_lite(state: Dict[str, Any]) -> str:
     return user_text
 
 
-async def _resolve_project_name_from_user_context(state: Dict[str, Any]) -> str:
-    history = state.get("chat_history") or []
-    history_text = "\n".join(
-        f"{(item.get('role') or 'unknown')}: {(item.get('content') or '').strip()}"
-        for item in history[-8:]
-        if isinstance(item, dict)
-    ) or "(chưa có)"
-    user_text = (state.get("user_text") or "").strip()
-    prompt = f"""Bạn là bộ xác định tên dự án Noble theo lịch sử hội thoại.
-Chỉ trả về JSON hợp lệ duy nhất:
-{{
-  "project_name": null | "<tên dự án Noble cụ thể đang được nhắc tới>"
-}}
+async def _resolve_project_name_from_user_context(state: Dict[str, Any]) -> tuple[str, str, float, bool]:
+    project_facts = await _load_project_facts()
+    registry = _build_project_registry(project_facts)
+    candidates = _resolve_project_candidates_from_registry(state, registry, max_items=3)
+    if not candidates:
+        return "", "unresolved", 0.0, False
 
-Quy tắc:
-- Chỉ trả project_name khi khách đang nói tới một dự án cụ thể.
-- Nếu khách chỉ hỏi chung như "dự án nào", "noble nào", "cho biết sơ qua về dự án", phải trả null.
-- Không tự đoán tên dự án nếu lịch sử chat chưa đủ rõ.
-- Giữ nguyên tên dự án đúng như có thể suy ra từ hội thoại.
-
-Lịch sử gần đây:
-{history_text}
-
-Tin nhắn hiện tại:
-\"\"\"{user_text}\"\"\""""
-    try:
-        raw = await llm_model_func(
-            prompt,
-            enable_cot=False,
-            response_format={"type": "json_object"},
+    high_confidence = _select_high_confidence_candidate(candidates)
+    if high_confidence:
+        return (
+            str(high_confidence.get("canonical_name") or "").strip(),
+            str(high_confidence.get("match_source") or "registry_ranked"),
+            float(high_confidence.get("score") or 0.0) / 100.0,
+            False,
         )
-        payload = extract_first_json_object(str(raw))
-        if not payload:
-            return ""
-        data = json.loads(payload)
-    except Exception as e:
-        log.warning("resolve project name from context failed: %s", e)
-        return ""
 
-    return str(data.get("project_name") or "").strip()
+    selected = await _disambiguate_projects_with_llm(state, candidates, max_items=1)
+    if selected:
+        return selected[0], "llm_disambiguation", 0.72, True
+    return "", "unresolved", 0.0, bool(candidates)
 
 
 def _build_matching_guidance(lead: Dict[str, Any]) -> str:
@@ -529,42 +720,24 @@ def _select_known_projects_from_text(
     return names[:max_items]
 
 
-def _resolve_known_project_names(
+async def _resolve_known_project_names(
     state: Dict[str, Any],
     project_facts: List[Dict[str, Any]],
     max_items: int = 2,
 ) -> List[str]:
-    candidates = [str(item.get("project_name") or "").strip() for item in project_facts if str(item.get("project_name") or "").strip()]
+    registry = _build_project_registry(project_facts)
+    candidates = _resolve_project_candidates_from_registry(state, registry, max_items=max(3, max_items))
     if not candidates:
         return []
 
-    evidence_texts = [
-        str(state.get("resolved_project_name") or "").strip(),
-        str(state.get("user_text") or "").strip(),
-    ]
-    history = state.get("chat_history") or []
-    evidence_texts.extend(
-        str(item.get("content") or "").strip()
-        for item in history[-4:]
-        if isinstance(item, dict) and str(item.get("content") or "").strip()
-    )
+    high_confidence = _select_high_confidence_candidate(candidates)
+    if high_confidence:
+        return [str(high_confidence.get("canonical_name") or "").strip()]
 
-    scores: Dict[str, int] = {name: 0 for name in candidates}
-    for text in evidence_texts:
-        if not text:
-            continue
-        for name in candidates:
-            score = _project_overlap_score(text, name)
-            if score > scores[name]:
-                scores[name] = score
-
-    ranked = [name for name, score in sorted(scores.items(), key=lambda item: item[1], reverse=True) if score >= 20]
-    deduped: List[str] = []
-    for name in ranked:
-        if any(_same_known_project(name, existing) for existing in deduped):
-            continue
-        deduped.append(name)
-    return deduped[:max_items]
+    selected = await _disambiguate_projects_with_llm(state, candidates, max_items=max_items)
+    if selected:
+        return selected[:max_items]
+    return [str(candidates[0].get("canonical_name") or "").strip()]
 
 
 async def _load_chunks_for_doc_ids(doc_ids: List[str], max_chunks_per_doc: int = 4) -> List[Dict[str, Any]]:
@@ -609,6 +782,12 @@ async def _load_chunks_for_doc_ids(doc_ids: List[str], max_chunks_per_doc: int =
 async def retrieve_context(state: SalesAgentState) -> Dict[str, Any]:
     next_st = (state.get("next_sales_state") or "").strip()
     action = (state.get("response_action") or "").strip()
+    project_resolution_source = "unresolved"
+    project_resolution_confidence = 0.0
+    candidate_count_before_llm = 0
+    llm_disambiguation_called = False
+    retrieval_skipped_due_to_unresolved_entity = False
+    full_retrieval_used = False
     if next_st == "greeting" and action not in {"catalog_overview", "project_qa"}:
         log.info("retrieve_context: skip retrieval for greeting")
         return {
@@ -617,6 +796,12 @@ async def retrieve_context(state: SalesAgentState) -> Dict[str, Any]:
             "has_retrieved_context": False,
             "project_qa_blocked": False,
             "resolved_project_name": state.get("resolved_project_name"),
+            "project_resolution_source": project_resolution_source,
+            "project_resolution_confidence": project_resolution_confidence,
+            "candidate_count_before_llm": candidate_count_before_llm,
+            "llm_disambiguation_called": llm_disambiguation_called,
+            "retrieval_skipped_due_to_unresolved_entity": retrieval_skipped_due_to_unresolved_entity,
+            "full_retrieval_used": full_retrieval_used,
             "retrieval_mode": "greeting_skip",
         }
 
@@ -634,19 +819,33 @@ async def retrieve_context(state: SalesAgentState) -> Dict[str, Any]:
             "has_retrieved_context": bool(projects or project_facts),
             "project_qa_blocked": False,
             "resolved_project_name": None,
+            "project_resolution_source": "catalog_overview",
+            "project_resolution_confidence": 1.0,
+            "candidate_count_before_llm": len(projects),
+            "llm_disambiguation_called": False,
+            "retrieval_skipped_due_to_unresolved_entity": False,
+            "full_retrieval_used": False,
             "retrieval_mode": "catalog",
         }
 
     if (state.get("response_action") or "") == "project_qa":
-        resolved_project_name = await _resolve_project_name_from_user_context(state)
+        resolved_project_name, project_resolution_source, project_resolution_confidence, llm_disambiguation_called = await _resolve_project_name_from_user_context(state)
         if not resolved_project_name:
             log.info("retrieve_context: project_qa blocked because project name is unresolved")
+            retrieval_skipped_due_to_unresolved_entity = True
             return {
                 "retrieved_candidates": [],
                 "retrieved_context": [],
                 "has_retrieved_context": False,
                 "project_qa_blocked": True,
                 "resolved_project_name": None,
+                "project_resolution_source": project_resolution_source,
+                "project_resolution_confidence": project_resolution_confidence,
+                "candidate_count_before_llm": candidate_count_before_llm,
+                "llm_disambiguation_called": llm_disambiguation_called,
+                "retrieval_skipped_due_to_unresolved_entity": True,
+                "full_retrieval_used": False,
+                "retrieval_mode": "project_resolution_blocked",
             }
         state = dict(state)
         state["resolved_project_name"] = resolved_project_name
@@ -669,16 +868,42 @@ async def retrieve_context(state: SalesAgentState) -> Dict[str, Any]:
                 "has_retrieved_context": bool(context_items or filtered_facts),
                 "project_qa_blocked": False,
                 "resolved_project_name": state.get("resolved_project_name"),
+                "project_resolution_source": project_resolution_source,
+                "project_resolution_confidence": project_resolution_confidence,
+                "candidate_count_before_llm": candidate_count_before_llm,
+                "llm_disambiguation_called": llm_disambiguation_called,
+                "retrieval_skipped_due_to_unresolved_entity": retrieval_skipped_due_to_unresolved_entity,
+                "full_retrieval_used": False,
                 "retrieval_mode": "project_facts",
             }
 
     if (state.get("next_sales_state") or "") in {"project_qa", "comparison"}:
         project_facts = await _load_project_facts()
-        target_names = _resolve_known_project_names(
+        target_names = await _resolve_known_project_names(
             state,
             project_facts,
             max_items=1 if (state.get("next_sales_state") or "") == "project_qa" else 2,
         )
+        candidate_count_before_llm = len(target_names)
+
+        if not target_names:
+            retrieval_skipped_due_to_unresolved_entity = True
+            log.info("retrieve_context: skipping full retrieval because project entity is unresolved")
+            return {
+                "retrieved_candidates": [],
+                "retrieved_context": [],
+                "project_facts": project_facts,
+                "has_retrieved_context": False,
+                "project_qa_blocked": (state.get("next_sales_state") or "") == "project_qa",
+                "resolved_project_name": state.get("resolved_project_name"),
+                "project_resolution_source": project_resolution_source,
+                "project_resolution_confidence": project_resolution_confidence,
+                "candidate_count_before_llm": candidate_count_before_llm,
+                "llm_disambiguation_called": llm_disambiguation_called,
+                "retrieval_skipped_due_to_unresolved_entity": True,
+                "full_retrieval_used": False,
+                "retrieval_mode": "project_resolution_blocked",
+            }
 
         matched_facts = [
             item for item in project_facts
@@ -701,7 +926,35 @@ async def retrieve_context(state: SalesAgentState) -> Dict[str, Any]:
                 "has_retrieved_context": bool(context_items or matched_facts),
                 "project_qa_blocked": False,
                 "resolved_project_name": state.get("resolved_project_name"),
+                "project_resolution_source": project_resolution_source,
+                "project_resolution_confidence": project_resolution_confidence,
+                "candidate_count_before_llm": candidate_count_before_llm,
+                "llm_disambiguation_called": llm_disambiguation_called,
+                "retrieval_skipped_due_to_unresolved_entity": retrieval_skipped_due_to_unresolved_entity,
+                "full_retrieval_used": False,
                 "retrieval_mode": "project_chunks",
+            }
+
+        if (state.get("next_sales_state") or "") == "comparison" and len(target_names) < 2:
+            retrieval_skipped_due_to_unresolved_entity = True
+            log.info("retrieve_context: comparison blocked because fewer than 2 projects were resolved")
+            return {
+                "retrieved_candidates": [
+                    {"project_name": name, "content": ""}
+                    for name in target_names
+                ],
+                "retrieved_context": [],
+                "project_facts": project_facts,
+                "has_retrieved_context": False,
+                "project_qa_blocked": False,
+                "resolved_project_name": state.get("resolved_project_name"),
+                "project_resolution_source": project_resolution_source,
+                "project_resolution_confidence": project_resolution_confidence,
+                "candidate_count_before_llm": candidate_count_before_llm,
+                "llm_disambiguation_called": llm_disambiguation_called,
+                "retrieval_skipped_due_to_unresolved_entity": True,
+                "full_retrieval_used": False,
+                "retrieval_mode": "project_resolution_blocked",
             }
 
     retrieval_mode = (state.get("retrieval_mode") or "full").lower()
@@ -724,6 +977,7 @@ async def retrieve_context(state: SalesAgentState) -> Dict[str, Any]:
         top_k=top_k,
         history=history,
     )
+    full_retrieval_used = True
 
     context_items: List[Dict[str, Any]] = []
     if raw_answer and raw_answer.strip():
@@ -741,6 +995,12 @@ async def retrieve_context(state: SalesAgentState) -> Dict[str, Any]:
         "has_retrieved_context": bool(context_items),
         "project_qa_blocked": False,
         "resolved_project_name": state.get("resolved_project_name"),
+        "project_resolution_source": project_resolution_source,
+        "project_resolution_confidence": project_resolution_confidence,
+        "candidate_count_before_llm": candidate_count_before_llm,
+        "llm_disambiguation_called": llm_disambiguation_called,
+        "retrieval_skipped_due_to_unresolved_entity": retrieval_skipped_due_to_unresolved_entity,
+        "full_retrieval_used": full_retrieval_used,
         "retrieval_mode": retrieval_mode,
     }
 

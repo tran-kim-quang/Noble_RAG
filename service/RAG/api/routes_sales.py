@@ -40,7 +40,6 @@ from rag.retriever import (
     summarize_search_answer,
 )
 from integrations.machine_b_face_client import notify_machine_b_customer_removed
-from sales.graph import sales_graph
 from sales.session_export import export_session_to_txt
 from sales.response_templates import _apply_customer_pronoun
 from sales.prompt_builder import build_prompt
@@ -145,7 +144,7 @@ async def _run_other_llm_flow(
         "chat_history": history,
         "lead_profile": profile,
         "session_context": context,
-        "next_sales_state": "out_of_scope", # Dùng state này để prompt builder biết là flow tự do
+        "next_sales_state": "natural_consult",
     }
     
     # Lấy system prompt chuẩn từ prompt_builder (có xưng hô Máy B)
@@ -157,6 +156,9 @@ async def _run_other_llm_flow(
 YÊU CẦU BỔ SUNG CHO LUỒNG TỰ DO:
 - Đã tóm tắt lịch sử hội thoại: {history_summary}
 - Luôn trả lời tự nhiên, lịch sự, ngắn gọn, đúng ngữ cảnh.
+- Ưu tiên dùng dữ liệu khách từ vision_context/lead_profile trước khi hỏi thêm.
+- Nếu đã có độ tuổi, tên, mô tả/tính cách thì cá nhân hoá tư vấn và gợi ý sản phẩm phù hợp với hồ sơ đó.
+- Không hỏi theo mẫu cứng kiểu "Gia đình có mấy người?", "Có mấy con nhỏ?".
 - Nếu câu hỏi quá chung chung thì hỏi lại 1 câu làm rõ, không dùng kịch bản sales cứng.
 """.strip()
 
@@ -228,15 +230,12 @@ async def _run_sales_flow(
     user_text: str,
     raw_transcript: Optional[str] = None,
 ) -> Dict[str, Any]:
-    initial_state: Dict[str, Any] = {
-        "session_id": session_id,
-        "user_text": user_text,
-        "raw_transcript": raw_transcript,
-        "errors": [],
-    }
-    result = await sales_graph.ainvoke(initial_state)
-    result["route_category"] = "SALES"
-    return result
+    history = await load_chat_history(session_id)
+    return await _run_other_llm_flow(
+        session_id=session_id,
+        user_text=user_text,
+        history=history,
+    )
 
 
 def _normalize_plan(user_text: str, plan: Dict[str, Any]) -> Dict[str, Any]:
@@ -432,7 +431,7 @@ async def sales_chat(request: SalesChatRequest):
             raw_transcript=request.raw_transcript,
         )
     except Exception as e:
-        log.error("sales_graph.ainvoke error: %s", e)
+        log.error("sales chat pipeline error: %s", e)
         raise HTTPException(status_code=500, detail=f"Sales agent error: {e}")
 
     return SalesChatResponse(
@@ -589,7 +588,7 @@ async def sales_chat_stream(request: SalesChatRequest):
                 final_meta["lead_profile"] = await load_lead_profile(request.session_id)
 
         except Exception as e:
-            log.error("sales_graph.ainvoke(stream) error: %s", e)
+            log.error("sales chat stream pipeline error: %s", e)
             fallback = "Xin lỗi, em gặp lỗi khi xử lý yêu cầu. Anh/Chị thử lại giúp em nhé."
             yield json.dumps(
                 {
@@ -681,18 +680,18 @@ async def get_session_snapshot(session_id: str):
 
 @router.post("/recommendations/refresh")
 async def refresh_recommendations(session_id: str):
-    """Trigger a product_matching cycle for the session."""
+    """Generate refreshed recommendations using natural LLM consulting."""
     profile = await load_lead_profile(session_id)
     if not profile:
         raise HTTPException(status_code=404, detail="Lead not found")
 
-    initial_state: Dict[str, Any] = {
-        "session_id": session_id,
-        "user_text": "Anh/Chị muốn xem lại các sản phẩm phù hợp.",
-        "errors": [],
-    }
+    history = await load_chat_history(session_id)
     try:
-        result = await sales_graph.ainvoke(initial_state)
+        result = await _run_other_llm_flow(
+            session_id=session_id,
+            user_text="Anh/Chị muốn xem lại các sản phẩm phù hợp.",
+            history=history,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Refresh error: {e}")
 
@@ -707,18 +706,18 @@ async def refresh_recommendations(session_id: str):
 
 @router.post("/followup/generate")
 async def generate_followup(session_id: str):
-    """Generate a follow-up message for a lead."""
+    """Generate a follow-up message using natural LLM consulting."""
     profile = await load_lead_profile(session_id)
     if not profile:
         raise HTTPException(status_code=404, detail="Lead not found")
 
-    initial_state: Dict[str, Any] = {
-        "session_id": session_id,
-        "user_text": "Anh/Chị có cần em hỗ trợ thêm thông tin gì không?",
-        "errors": [],
-    }
+    history = await load_chat_history(session_id)
     try:
-        result = await sales_graph.ainvoke(initial_state)
+        result = await _run_other_llm_flow(
+            session_id=session_id,
+            user_text="Anh/Chị có cần em hỗ trợ thêm thông tin gì không?",
+            history=history,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Follow-up error: {e}")
 
@@ -814,7 +813,7 @@ async def purge_all_chat_history_endpoint(
     """Xóa sạch phiên sales: Redis, Postgres (`lead_profiles` + `customer_sessions` và CASCADE),
     toàn bộ file trong `live_snapshots/*.txt` (không chỉ xóa chat trong file).
 
-    Gộp với nhu cầu \"quên phiên\": không chỉ xóa tin nhắn mà xóa luôn context/lead cache Redis
+    Gộp với nhu cầu "quên phiên": không chỉ xóa tin nhắn mà xóa luôn context/lead cache Redis
     để lần sau không đọc nhầm `customer_id` cũ.
 
     Response gồm `postgres_*_deleted`, `redis_session_context_keys_deleted`, `live_snapshot_files_deleted`,
@@ -856,4 +855,3 @@ async def get_chat_history(session_id: str):
             "history": formatted_history
         }
     )
-

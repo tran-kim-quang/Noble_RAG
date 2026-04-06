@@ -12,29 +12,21 @@ _VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
 SYSTEM_PROMPT = """Bạn là Sunny, trợ lý bất động sản cho dự án Noble Place Tây Thăng Long.
 
-Vai trò:
-- Tư vấn rõ ràng, trung thực, bám sát dữ liệu đã truy xuất từ RAG.
+Mục tiêu trả lời:
+- Ngắn gọn, đúng trọng tâm, không lan man.
+- Tối đa 3 câu hoặc 80 từ cho mỗi lượt.
+- Ưu tiên trả lời thẳng câu hỏi hiện tại trước.
+- Nếu thiếu dữ liệu thì nói rõ là chưa đủ thông tin; không bịa.
 - Không tự bịa thông tin pháp lý, giá, tiến độ, số lượng sản phẩm.
-- Thiếu dữ kiện trong ngữ cảnh thì nói rõ và đề nghị bước tiếp theo.
 
-Quy tắc nội dung:
-1. Chỉ dùng dữ liệu trong hồ sơ khách, khối NHẬN DIỆN KHÁCH (MÁY B), ngữ cảnh RAG và kết quả công cụ.
-2. Không cam kết lợi nhuận; không gây áp lực chốt sale.
-3. Trả lời ngắn gọn, đúng trọng tâm câu hỏi hiện tại trước.
-4. Nhiều ý trong một câu: ưu tiên các ý quan trọng nhất.
+Xưng hô theo Máy B (ưu tiên tuyệt đối):
+- Nếu xác định NAM: dùng "anh"/"Anh", không dùng "Anh/Chị".
+- Nếu xác định NỮ: dùng "chị"/"Chị", không dùng "Anh/Chị".
+- Chỉ khi chưa rõ giới mới dùng "Anh/Chị" trung tính.
 
-Xưng hô và lời chào — ưu tiên dữ liệu Máy B (camera / nhận diện khuôn mặt):
-- Nguồn chuẩn: khối "NHẬN DIỆN KHÁCH (MÁY B)" trong prompt và dòng "Xưng hô bắt buộc" ngay dưới YÊU CẦU TRẢ LỜI. Hai nguồn này phải được tuân thủ; không được bỏ qua hoặc ghi đè bằng suy đoán.
-- Đã xác định NAM (ví dụ gender_guess=male, gioi_tinh/nam, hoặc mã 1): suốt hội thoại gọi khách là "anh" (đầu câu viết "Anh"). Lời chào mở đầu phải là kiểu "Chào anh," — tuyệt đối không dùng "Anh/Chị", "anh/chị", "Chào anh/chị".
-- Đã xác định NỮ (female, nữ, hoặc mã 2): gọi "chị"/"Chị"; chào "Chào chị," — không dùng dạng song song Anh/Chị.
-- Chưa xác định giới (unknown, thiếu khối Máy B hoặc không có tín hiệu rõ): mới được dùng "Anh/Chị" hoặc "anh/chị" trung tính.
-- Không xen kẽ "anh" và "chị" với "Anh/Chị" trong cùng lượt khi giới đã rõ.
-
-Trạng thái GREETING (lời mở đầu):
-- Tối đa 2 câu, 1 câu hỏi mở. Câu chào đầu tiên bắt buộc khớp giới từ Máy B như trên; giới thiệu Sunny ngắn gọn, sau đó hỏi nhu cầu.
-
-Khi khách chỉ mở lời tư vấn chung, chưa hỏi chi tiết dự án:
-- Không trình bày brochure dạng danh sách/bullet dài; ưu tiên chào ngắn (đúng giới) và một câu hỏi làm rõ nhu cầu.
+GREETING:
+- Tối đa 2 câu, chỉ 1 câu hỏi mở.
+- Câu đầu phải chào đúng giới theo Máy B.
 """
 
 _STATE_PROMPTS: Dict[str, str] = {
@@ -78,6 +70,11 @@ NHIỆM VỤ:
     "follow_up": """TRẠNG THÁI: FOLLOW_UP
 NHIỆM VỤ:
 - Nhắc lại nhu cầu chính và kéo hội thoại quay lại đúng mục tiêu.""",
+    "natural_consult": """TRẠNG THÁI: NATURAL_CONSULT
+NHIỆM VỤ:
+- Tư vấn tự nhiên theo câu hỏi hiện tại, không dùng kịch bản cứng.
+- Ưu tiên tận dụng dữ liệu `vision_context` / `customer_profile` đã có.
+- Nếu thiếu dữ liệu, chỉ hỏi 1 câu làm rõ sắc nét nhất.""",
     "out_of_scope": """TRẠNG THÁI: OUT_OF_SCOPE
 NHIỆM VỤ:
 - Từ chối lịch sự các yêu cầu ngoài phạm vi và điều hướng lại.""",
@@ -119,6 +116,7 @@ def build_prompt(state: Dict[str, Any]) -> str:
     output_rules = _build_output_rules(next_state, has_context)
     pronoun_rules = _build_pronoun_rules(lead_profile, session_context)
     vision_machine_b_block = _format_vision_machine_b_block(session_context)
+    personalization_block = _build_customer_personalization_block(lead_profile, session_context)
 
     return (
         f"{SYSTEM_PROMPT}\n"
@@ -128,6 +126,7 @@ def build_prompt(state: Dict[str, Any]) -> str:
         f"RESPONSE ACTION: {response_action}\n\n"
         f"HỒ SƠ KHÁCH HÀNG:\n{lead_summary}\n\n"
         f"{vision_machine_b_block}"
+        f"{personalization_block}"
         f"THÔNG TIN CÒN THIẾU:\n{missing_slots_text}"
         f"{discovery_guidance}"
         f"{context_block}\n\n"
@@ -185,6 +184,23 @@ _VISION_MACHINE_B_PROMPT_KEYS: tuple[str, ...] = (
     "age_band",
     "nhom_tuoi",
     "age_group_estimate",
+    "name",
+    "full_name",
+    "display_name",
+    "description",
+    "mo_ta",
+    "personality",
+    "tinh_cach",
+    "persona",
+    "lifestyle",
+    "occupation",
+    "job_title",
+    "interests",
+    "interest_summary",
+    "danh_xung",
+    "mo_ta_so_thich",
+    "properties_owned",
+    "rag_customer_profile",
 )
 
 
@@ -214,6 +230,96 @@ def _format_vision_machine_b_block(session_context: Dict[str, Any]) -> str:
         "NHẬN DIỆN KHÁCH (MÁY B) — chỉ dùng các khóa sau cho xưng hô và gợi ý độ tuổi, không bịa thêm:\n"
         f"{blob}\n\n"
     )
+
+
+def _pick_non_empty_text(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text.lower() not in {"unknown", "null", "none", "n/a"}:
+            return text
+    return ""
+
+
+def _pick_non_empty_list(*values: Any) -> List[str]:
+    for value in values:
+        if not isinstance(value, list):
+            continue
+        cleaned = [str(item).strip() for item in value if str(item).strip()]
+        if cleaned:
+            return cleaned
+    return []
+
+
+def _build_customer_personalization_block(lead_profile: Dict[str, Any], session_context: Dict[str, Any]) -> str:
+    context_json = session_context.get("context_json") if isinstance(session_context, dict) else {}
+    if not isinstance(context_json, dict):
+        context_json = {}
+    vision_context = context_json.get("vision_context") if isinstance(context_json, dict) else {}
+    if not isinstance(vision_context, dict):
+        vision_context = {}
+    rag_profile = vision_context.get("rag_customer_profile")
+    if not isinstance(rag_profile, dict):
+        rag_profile = {}
+
+    full_name = _pick_non_empty_text(
+        lead_profile.get("full_name"),
+        lead_profile.get("name"),
+        lead_profile.get("display_name"),
+        vision_context.get("full_name"),
+        vision_context.get("name"),
+        vision_context.get("display_name"),
+        rag_profile.get("full_name"),
+    )
+    danh_xung = _pick_non_empty_text(
+        lead_profile.get("danh_xung"),
+        vision_context.get("danh_xung"),
+        rag_profile.get("danh_xung"),
+    )
+    preference_desc = _pick_non_empty_text(
+        lead_profile.get("mo_ta_so_thich"),
+        lead_profile.get("interest_summary"),
+        lead_profile.get("description"),
+        lead_profile.get("mo_ta"),
+        lead_profile.get("personality"),
+        lead_profile.get("tinh_cach"),
+        vision_context.get("mo_ta_so_thich"),
+        vision_context.get("interest_summary"),
+        vision_context.get("description"),
+        vision_context.get("mo_ta"),
+        vision_context.get("personality"),
+        vision_context.get("tinh_cach"),
+        rag_profile.get("mo_ta_so_thich"),
+    )
+    properties_owned = _pick_non_empty_list(
+        lead_profile.get("properties_owned"),
+        vision_context.get("properties_owned"),
+        rag_profile.get("properties_owned"),
+    )
+
+    if not (full_name or danh_xung or preference_desc or properties_owned):
+        return ""
+
+    lines: List[str] = ["CA NHAN HOA TU VAN (VISION/RAG PROFILE):"]
+    if full_name:
+        lines.append(f"- full_name: {full_name}")
+    if danh_xung:
+        lines.append(f"- danh_xung: {danh_xung}")
+    if preference_desc:
+        lines.append(f"- mo_ta_so_thich: {preference_desc}")
+    if properties_owned:
+        lines.append(f"- properties_owned: {json.dumps(properties_owned, ensure_ascii=False)}")
+
+    if full_name:
+        lines.append("- Neu co full_name: xem la khach cu, mo dau chao hoi dang hoang co ten.")
+    if full_name and danh_xung:
+        lines.append("- Uu tien cach goi: <danh_xung> <full_name> neu tu nhien.")
+    if preference_desc:
+        lines.append("- Goi y san pham theo mo ta/so thich va follow-up dung gu do.")
+    if properties_owned:
+        lines.append("- Tranh goi y trung cac san pham da so huu; dung lam ngu canh nang cap tu van.")
+    return "\n".join(lines) + "\n\n"
 
 
 def _build_pronoun_rules(lead_profile: Dict[str, Any], session_context: Dict[str, Any]) -> str:
@@ -296,6 +402,12 @@ def _build_discovery_guidance(next_state: str, lead_profile: Dict[str, Any], mis
 def _build_output_rules(next_state: str, has_context: bool) -> str:
     grounded_states = {"project_qa", "product_matching", "comparison", "objection_handling", "closing_next_step"}
     rules = ["RÀNG BUỘC HÌNH THỨC:"]
+    rules.extend(
+        [
+            "- Tối đa 3 câu hoặc 80 từ.",
+            "- Ưu tiên trả lời thẳng vào câu hỏi hiện tại trước.",
+        ]
+    )
 
     if next_state == "greeting":
         rules.extend(
@@ -314,6 +426,16 @@ def _build_output_rules(next_state: str, has_context: bool) -> str:
             ]
         )
 
+    if next_state == "natural_consult":
+        rules.extend(
+            [
+                "- Ưu tiên đưa gợi ý phù hợp thay vì hỏi form cứng.",
+                "- Chỉ hỏi 1 câu làm rõ khi thông tin hiện có chưa đủ để tư vấn.",
+                "- Nếu có full_name: chào hỏi lịch sự có tên, xem như khách hàng cũ.",
+                "- Nếu có mô tả/sở thích: cá nhân hoá đề xuất và follow-up theo sở thích đó.",
+            ]
+        )
+
     if next_state in grounded_states:
         rules.append("- Chỉ sử dụng dữ liệu trong NGỮ CẢNH RAG.")
         if not has_context:
@@ -328,6 +450,11 @@ def _format_lead_profile(profile: Dict[str, Any]) -> str:
     relevant_keys = [
         "customer_id",
         "full_name",
+        "name",
+        "display_name",
+        "danh_xung",
+        "mo_ta_so_thich",
+        "properties_owned",
         "family_member_count",
         "children_count",
         "purpose",
@@ -347,6 +474,17 @@ def _format_lead_profile(profile: Dict[str, Any]) -> str:
         "age_group_estimate",
         "age_band",
         "nhom_tuoi",
+        "description",
+        "mo_ta",
+        "personality",
+        "tinh_cach",
+        "persona",
+        "lifestyle",
+        "occupation",
+        "job_title",
+        "interests",
+        "interest_summary",
+        "rag_customer_profile",
         "identity_status",
         "face_match_score",
     ]

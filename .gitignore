@@ -33,6 +33,7 @@ test/
 
 # Local runtime artifacts (do not commit)
 tmp/
+/tmp_*
 livetalking/venv/
 livetalking/models/
 livetalking/data/avatars/
@@ -49,3 +50,4 @@ logs/
 *.pid
 _backup_avatars/
 _temp_unzip/
+.github/copilot-instructions.md

@@ -12,11 +12,15 @@ def route_after_fast_parse(state: Dict[str, Any]) -> str:
     """Route to fallback reasoning only when fast parse is uncertain."""
     lane = state.get("fast_lane") or "lane_c"
     confidence = float(state.get("fast_path_confidence") or 0.0)
+    semantic_done = bool(state.get("semantic_parse_done"))
+    semantic_confidence = float(state.get("semantic_parse_confidence") or 0.0)
     if state.get("turn_role") == "answer_previous_question" and (state.get("extracted_slots") or {}):
         return "update_lead_profile"
     if lane != "lane_c":
         return "update_lead_profile"
     if confidence < 0.55:
+        if semantic_done and semantic_confidence >= 0.45:
+            return "update_lead_profile"
         return "classify_and_extract"
     return "update_lead_profile"
 

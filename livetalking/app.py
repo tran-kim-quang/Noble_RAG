@@ -104,6 +104,89 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _apply_video_bitrate_to_sdp(
+    sdp: str,
+    max_kbps: int,
+    start_kbps: int,
+) -> str:
+    if not sdp:
+        return sdp
+
+    max_kbps = max(0, int(max_kbps or 0))
+    start_kbps = max(0, int(start_kbps or 0))
+    if max_kbps <= 0:
+        return sdp
+    if start_kbps <= 0:
+        start_kbps = max(1, min(2500, max_kbps))
+
+    lines = sdp.split("\r\n")
+    h264_pts: set[str] = set()
+    in_video = False
+
+    for line in lines:
+        if line.startswith("m="):
+            in_video = line.startswith("m=video ")
+            continue
+        if not in_video:
+            continue
+        match = re.match(r"^a=rtpmap:(\d+)\s+H264(?:/|$)", line, flags=re.IGNORECASE)
+        if match:
+            h264_pts.add(match.group(1))
+
+    rewritten: list[str] = []
+    in_video = False
+    inserted_bandwidth = False
+
+    for line in lines:
+        if line.startswith("m="):
+            if in_video and not inserted_bandwidth:
+                rewritten.append(f"b=AS:{max_kbps}")
+                rewritten.append(f"b=TIAS:{max_kbps * 1000}")
+            in_video = line.startswith("m=video ")
+            inserted_bandwidth = False
+            rewritten.append(line)
+            continue
+
+        if in_video and line.startswith("b="):
+            continue
+
+        if in_video and not inserted_bandwidth and line.startswith("c="):
+            rewritten.append(line)
+            rewritten.append(f"b=AS:{max_kbps}")
+            rewritten.append(f"b=TIAS:{max_kbps * 1000}")
+            inserted_bandwidth = True
+            continue
+
+        if in_video and line.startswith("a=fmtp:"):
+            match = re.match(r"^a=fmtp:(\d+)\s+(.+)$", line)
+            if match and match.group(1) in h264_pts:
+                payload_type = match.group(1)
+                params = match.group(2)
+                if "x-google-start-bitrate=" not in params:
+                    params += f";x-google-start-bitrate={start_kbps}"
+                if "x-google-max-bitrate=" not in params:
+                    params += f";x-google-max-bitrate={max_kbps}"
+                line = f"a=fmtp:{payload_type} {params}"
+
+        rewritten.append(line)
+
+    if in_video and not inserted_bandwidth:
+        rewritten.append(f"b=AS:{max_kbps}")
+        rewritten.append(f"b=TIAS:{max_kbps * 1000}")
+
+    return "\r\n".join(rewritten)
+
+
 def _get_camera_capture_lock() -> asyncio.Lock:
     global camera_capture_lock
     if camera_capture_lock is None:
@@ -418,6 +501,23 @@ async def offer(request):
         await pc.setRemoteDescription(offer)
 
         answer = await pc.createAnswer()
+        max_video_kbps = _env_int("NOBLE_WEBRTC_VIDEO_MAX_KBPS", 4500)
+        start_video_kbps = _env_int(
+            "NOBLE_WEBRTC_VIDEO_START_KBPS",
+            max(1, min(2500, max_video_kbps)),
+        )
+        tuned_sdp = _apply_video_bitrate_to_sdp(
+            answer.sdp,
+            max_kbps=max_video_kbps,
+            start_kbps=start_video_kbps,
+        )
+        if tuned_sdp != answer.sdp:
+            logger.info(
+                "WebRTC video bitrate tuned: start=%skbps, max=%skbps",
+                start_video_kbps,
+                max_video_kbps,
+            )
+            answer = RTCSessionDescription(sdp=tuned_sdp, type=answer.type)
         await pc.setLocalDescription(answer)
 
         #return jsonify({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
@@ -928,7 +1028,7 @@ if __name__ == '__main__':
     parser.add_argument('--H', type=int, default=450, help="GUI height")
 
     #musetalk opt
-    parser.add_argument('--avatar_id', type=str, default='half-avatar', help="define which avatar in data/avatars")
+    parser.add_argument('--avatar_id', type=str, default='half', help="define which avatar in data/avatars")
     #parser.add_argument('--bbox_shift', type=int, default=5)
     parser.add_argument('--batch_size', type=int, default=16, help="infer batch")
 

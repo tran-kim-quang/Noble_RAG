@@ -26,6 +26,8 @@ class SalesAgentState(TypedDict, total=False):
     fast_lane: Optional[str]
     retrieval_mode: Optional[str]
     fast_ack_response: Optional[str]
+    semantic_parse_done: Optional[bool]
+    semantic_parse_confidence: Optional[float]
 
     # State machine
     current_sales_state: Optional[str]
@@ -43,6 +45,12 @@ class SalesAgentState(TypedDict, total=False):
     has_retrieved_context: bool
     project_qa_blocked: bool
     resolved_project_name: Optional[str]
+    project_resolution_source: Optional[str]
+    project_resolution_confidence: Optional[float]
+    candidate_count_before_llm: Optional[int]
+    llm_disambiguation_called: Optional[bool]
+    retrieval_skipped_due_to_unresolved_entity: Optional[bool]
+    full_retrieval_used: Optional[bool]
 
     # Response
     draft_response: Optional[str]

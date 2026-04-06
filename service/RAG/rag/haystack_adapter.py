@@ -274,8 +274,9 @@ class HaystackRAGAdapter:
     def _build_rag_prompt(*, search_query: str, context_blocks: List[str], top_k: int) -> str:
         return (
             "Bạn là trợ lý tư vấn bất động sản của Noble. "
-            "Dựa trên ngữ cảnh truy xuất dưới đây để trả lời ngắn gọn, đúng trọng tâm. "
-            "Nếu thiếu dữ liệu thì nói rõ là chưa đủ thông tin.\n\n"
+            "Trả lời ngắn gọn, đúng trọng tâm, không lan man. "
+            "Tối đa 3 câu hoặc 80 từ. "
+            "Chỉ dùng dữ liệu trong Retrieved Context; thiếu dữ liệu thì nói rõ chưa đủ thông tin.\n\n"
             f"Question:\n{search_query}\n\n"
             "Retrieved Context:\n"
             + "\n\n---\n\n".join(context_blocks[:top_k])

@@ -33,14 +33,15 @@ def _runtime_system_prompt() -> str:
     now = datetime.now(_VN_TZ)
     timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
     return (
-        "Bạn tên là Sunny, trợ lý bất động sản cho Noble Place Tây Thăng Long. "
-        "Luôn trả lời rõ ràng, đúng trọng tâm, lịch sự, tiếng Việt tự nhiên.\n"
-        "Khi tin nhắn người dùng có khối nhận diện từ Máy B và phần xưng hô bắt buộc, "
-        "bạn phải chào và xưng hô đúng giới (chỉ anh hoặc chỉ chị), "
-        'không được dùng "Anh/Chị" hay "Chào anh/chị" nếu giới đã rõ.\n'
+        "Bạn là Sunny, trợ lý bất động sản của Noble Place Tây Thăng Long.\n"
+        "Nguyên tắc trả lời: ngắn gọn, đúng trọng tâm, không lan man.\n"
+        "Độ dài tối đa: 3 câu hoặc 80 từ.\n"
+        "Ưu tiên trả lời thẳng câu hỏi hiện tại; nếu thiếu dữ liệu thì nói rõ là chưa đủ thông tin.\n"
+        "Không tự bịa thông tin pháp lý, giá, tiến độ, số lượng sản phẩm.\n"
+        "Nếu có yêu cầu xưng hô từ Máy B thì phải tuân thủ đúng giới (anh hoặc chị), không dùng Anh/Chị khi giới đã rõ.\n"
+        "Nếu có full_name/danh_xưng/mô_tả_sở_thích từ Máy B thì chào theo tên và cá nhân hóa tư vấn theo sở thích.\n"
         f"Thời gian hệ thống hiện tại (Asia/Ho_Chi_Minh): {timestamp}."
     )
-
 
 def _openai_client(base_url: str | None = None) -> AsyncOpenAI:
     return AsyncOpenAI(
@@ -54,14 +55,18 @@ def _build_chat_messages(
     prompt: str,
     system_prompt: str | None = None,
     history_messages: list[dict[str, Any]] | None = None,
+    include_runtime_system_prompt: bool = True,
 ) -> List[dict[str, str]]:
     history = history_messages or []
     messages: List[dict[str, str]] = []
-    base_system_prompt = _runtime_system_prompt()
-    if system_prompt:
-        messages.append({"role": "system", "content": f"{base_system_prompt}\n\n{system_prompt}"})
-    else:
-        messages.append({"role": "system", "content": base_system_prompt})
+    if include_runtime_system_prompt:
+        base_system_prompt = _runtime_system_prompt()
+        if system_prompt:
+            messages.append({"role": "system", "content": f"{base_system_prompt}\n\n{system_prompt}"})
+        else:
+            messages.append({"role": "system", "content": base_system_prompt})
+    elif system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
     for item in history[-8:]:
         role = str(item.get("role") or "user")
         content = str(item.get("content") or "").strip()
@@ -83,26 +88,36 @@ async def llm_model_func(
     response_format = kwargs.pop("response_format", None)
     kwargs.pop("keyword_extraction", None)
     kwargs.pop("enable_cot", None)
+    max_tokens = kwargs.pop("max_tokens", None)
     provider = settings.llm_provider.lower().strip()
+    is_json_mode = isinstance(response_format, dict) and response_format.get("type") == "json_object"
+    effective_system_prompt = system_prompt
+    if is_json_mode and not effective_system_prompt:
+        effective_system_prompt = (
+            "Bạn là bộ xử lý cấu trúc dữ liệu. "
+            "Chỉ trả về một JSON object hợp lệ duy nhất. "
+            "Không markdown, không giải thích thêm."
+        )
 
     messages = _build_chat_messages(
         prompt=prompt,
-        system_prompt=system_prompt,
+        system_prompt=effective_system_prompt,
         history_messages=history_messages,
+        include_runtime_system_prompt=not is_json_mode,
     )
 
     if provider == "ollama":
         ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
         try:
+            payload = {
+                "model": settings.llm_model,
+                "messages": messages,
+                "stream": False,
+            }
+            if max_tokens is not None:
+                payload["options"] = {"num_predict": int(max_tokens)}
             async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.post(
-                    f"{ollama_host}/api/chat",
-                    json={
-                        "model": settings.llm_model,
-                        "messages": messages,
-                        "stream": False,
-                    },
-                )
+                resp = await client.post(f"{ollama_host}/api/chat", json=payload)
             resp.raise_for_status()
             payload = resp.json()
             return str((payload.get("message") or {}).get("content") or "")
@@ -115,7 +130,9 @@ async def llm_model_func(
         "messages": messages,
         "temperature": kwargs.pop("temperature", 0.2),
     }
-    if isinstance(response_format, dict) and response_format.get("type") == "json_object":
+    if max_tokens is not None:
+        payload["max_tokens"] = int(max_tokens)
+    if is_json_mode:
         payload["response_format"] = {"type": "json_object"}
 
     client = _openai_client()
@@ -138,6 +155,7 @@ async def llm_model_stream_func(
     kwargs.pop("response_format", None)
     kwargs.pop("keyword_extraction", None)
     kwargs.pop("enable_cot", None)
+    max_tokens = kwargs.pop("max_tokens", None)
     provider = settings.llm_provider.lower().strip()
     messages = _build_chat_messages(
         prompt=prompt,
@@ -152,6 +170,8 @@ async def llm_model_stream_func(
             "messages": messages,
             "stream": True,
         }
+        if max_tokens is not None:
+            payload["options"] = {"num_predict": int(max_tokens)}
         async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream("POST", f"{ollama_host}/api/chat", json=payload) as resp:
                 resp.raise_for_status()
@@ -174,6 +194,8 @@ async def llm_model_stream_func(
         "temperature": kwargs.pop("temperature", 0.2),
         "stream": True,
     }
+    if max_tokens is not None:
+        payload["max_tokens"] = int(max_tokens)
     client = _openai_client()
     stream = await client.chat.completions.create(**payload)
     async for chunk in stream:

@@ -182,6 +182,7 @@ class ElevenLabsTTS(BaseTTS):
 
         stability = (os.getenv("ELEVEN_STABILITY") or "").strip()
         similarity_boost = (os.getenv("ELEVEN_SIMILARITY_BOOST") or "").strip()
+        speed = (os.getenv("ELEVEN_SPEED") or os.getenv("ELEVEN_SPEAKING_RATE") or "").strip()
         use_speaker_boost = (os.getenv("ELEVEN_USE_SPEAKER_BOOST") or "").strip().lower()
 
         self.voice_settings = {}
@@ -195,6 +196,14 @@ class ElevenLabsTTS(BaseTTS):
                 self.voice_settings["similarity_boost"] = float(similarity_boost)
             except ValueError:
                 logger.warning("Invalid ELEVEN_SIMILARITY_BOOST=%s, ignoring.", similarity_boost)
+        if speed:
+            try:
+                speed_value = float(speed)
+                if speed_value <= 0:
+                    raise ValueError("speed must be > 0")
+                self.voice_settings["speed"] = speed_value
+            except ValueError:
+                logger.warning("Invalid ELEVEN_SPEED=%s, ignoring.", speed)
         if use_speaker_boost:
             self.voice_settings["use_speaker_boost"] = use_speaker_boost in {"1", "true", "yes", "on"}
 

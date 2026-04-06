@@ -267,35 +267,209 @@ def _vision_context_from_machine_b_register(payload: Dict[str, Any]) -> Dict[str
     Thêm các scalar hữu ích (match_score, …) nếu có — xem docs/LAN_MACHINE_B_INTEGRATION.md.
     """
     merged: Dict[str, Any] = dict(_default_vision_summary(payload))
-    passthrough_keys = (
-        "match_score",
-        "matched",
-        "is_existing_customer",
-        "is_new_customer",
-        "similarity",
-        "confidence",
-        "quality_score",
-        "face_score",
-        "co_nguoi",
-        "face_detected",
-        "status",
-        "message",
-        "error_code",
-    )
-    for key in passthrough_keys:
-        if key not in payload:
+
+    # Keep a full snapshot from Machine B so Machine A can consume any new fields
+    # without requiring hard-coded key updates on each schema change.
+    merged["machine_b_raw_payload"] = payload
+
+    core_fields = {
+        "age_range",
+        "age_band",
+        "nhom_tuoi",
+        "gender_guess",
+        "gioi_tinh",
+        "emotion",
+        "dress_style",
+        "visible_attributes",
+        "scene_context",
+    }
+
+    def _is_empty_value(value: Any) -> bool:
+        if value in (None, "", [], {}):
+            return True
+        if isinstance(value, str) and value.strip().lower() in {
+            "unknown",
+            "unk",
+            "null",
+            "none",
+            "n/a",
+            "khong xac dinh",
+            "chua ro",
+        }:
+            return True
+        return False
+
+    # Pass through every top-level key from Machine B to avoid hard-coded schema loss.
+    for key, value in payload.items():
+        if value is None:
             continue
-        val = payload[key]
-        if val is None:
+        if key in core_fields:
+            if _is_empty_value(merged.get(key)) and not _is_empty_value(value):
+                merged[key] = value
             continue
-        if isinstance(val, (dict, list)) and key != "detail":
-            continue
-        merged[key] = val
-    for nested_key in ("user_demographics", "demographics", "attributes", "vision", "vision_summary", "meta", "metadata"):
+        merged[key] = value
+
+    # Preserve known nested objects explicitly for convenience access patterns.
+    for nested_key in (
+        "user_demographics",
+        "demographics",
+        "attributes",
+        "vision",
+        "vision_summary",
+        "meta",
+        "metadata",
+        "detail",
+    ):
         sub = payload.get(nested_key)
         if isinstance(sub, dict) and sub:
             merged[nested_key] = sub
     return merged
+
+
+def _extract_customer_profile_from_vision_summary(vision_summary: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract customer-profile fields from Machine B payload/summary."""
+    if not isinstance(vision_summary, dict):
+        return {}
+
+    raw_payload = vision_summary.get("machine_b_raw_payload")
+    if not isinstance(raw_payload, dict):
+        raw_payload = {}
+    nested_vision = vision_summary.get("vision")
+    if not isinstance(nested_vision, dict):
+        nested_vision = {}
+    nested_detail = nested_vision.get("detail")
+    if not isinstance(nested_detail, dict):
+        nested_detail = {}
+    top_detail = vision_summary.get("detail")
+    if not isinstance(top_detail, dict):
+        top_detail = {}
+    inner_summary = vision_summary.get("vision_summary")
+    if not isinstance(inner_summary, dict):
+        inner_summary = {}
+    meta = vision_summary.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+    metadata = vision_summary.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    rag_profile = vision_summary.get("rag_customer_profile")
+    if not isinstance(rag_profile, dict):
+        rag_profile = raw_payload.get("rag_customer_profile")
+    if not isinstance(rag_profile, dict):
+        rag_profile = inner_summary.get("rag_customer_profile")
+    if not isinstance(rag_profile, dict):
+        rag_profile = {}
+
+    def _pick_text(*values: Any) -> str:
+        for value in values:
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text and text.lower() not in {"unknown", "null", "none", "n/a"}:
+                return text
+        return ""
+
+    def _pick_list(*values: Any) -> list[str]:
+        for value in values:
+            if not isinstance(value, list):
+                continue
+            cleaned = [str(item).strip() for item in value if str(item).strip()]
+            if cleaned:
+                return cleaned
+        return []
+
+    extracted: Dict[str, Any] = {}
+    full_name = _pick_text(
+        vision_summary.get("full_name"),
+        vision_summary.get("name"),
+        vision_summary.get("display_name"),
+        raw_payload.get("full_name"),
+        raw_payload.get("name"),
+        raw_payload.get("display_name"),
+        inner_summary.get("full_name"),
+        inner_summary.get("name"),
+        inner_summary.get("display_name"),
+        nested_vision.get("full_name"),
+        top_detail.get("full_name"),
+        nested_detail.get("full_name"),
+        meta.get("full_name"),
+        metadata.get("full_name"),
+        rag_profile.get("full_name"),
+    )
+    if full_name:
+        extracted["full_name"] = full_name
+
+    danh_xung = _pick_text(
+        vision_summary.get("danh_xung"),
+        raw_payload.get("danh_xung"),
+        inner_summary.get("danh_xung"),
+        nested_vision.get("danh_xung"),
+        top_detail.get("danh_xung"),
+        nested_detail.get("danh_xung"),
+        meta.get("danh_xung"),
+        metadata.get("danh_xung"),
+        rag_profile.get("danh_xung"),
+    )
+    if danh_xung:
+        extracted["danh_xung"] = danh_xung
+
+    mo_ta_so_thich = _pick_text(
+        vision_summary.get("mo_ta_so_thich"),
+        vision_summary.get("description"),
+        vision_summary.get("mo_ta"),
+        vision_summary.get("interest_summary"),
+        raw_payload.get("mo_ta_so_thich"),
+        raw_payload.get("description"),
+        raw_payload.get("mo_ta"),
+        raw_payload.get("interest_summary"),
+        inner_summary.get("mo_ta_so_thich"),
+        inner_summary.get("description"),
+        inner_summary.get("mo_ta"),
+        inner_summary.get("interest_summary"),
+        nested_vision.get("mo_ta_so_thich"),
+        top_detail.get("mo_ta_so_thich"),
+        nested_detail.get("mo_ta_so_thich"),
+        meta.get("mo_ta_so_thich"),
+        metadata.get("mo_ta_so_thich"),
+        rag_profile.get("mo_ta_so_thich"),
+    )
+    if mo_ta_so_thich:
+        extracted["mo_ta_so_thich"] = mo_ta_so_thich
+        extracted.setdefault("description", mo_ta_so_thich)
+        extracted.setdefault("interest_summary", mo_ta_so_thich)
+
+    properties_owned = _pick_list(
+        vision_summary.get("properties_owned"),
+        raw_payload.get("properties_owned"),
+        inner_summary.get("properties_owned"),
+        nested_vision.get("properties_owned"),
+        top_detail.get("properties_owned"),
+        nested_detail.get("properties_owned"),
+        meta.get("properties_owned"),
+        metadata.get("properties_owned"),
+        rag_profile.get("properties_owned"),
+    )
+    if properties_owned:
+        extracted["properties_owned"] = properties_owned
+
+    is_existing = vision_summary.get("is_existing_customer")
+    if is_existing is None:
+        is_existing = raw_payload.get("is_existing_customer")
+    if is_existing is None:
+        is_existing = vision_summary.get("matched")
+    if is_existing is None:
+        is_existing = raw_payload.get("matched_existing_customer")
+    if is_existing is not None:
+        extracted["identity_status"] = "matched" if bool(is_existing) else "new"
+    elif full_name:
+        # Business rule requested: if payload has a customer name, treat as existing customer.
+        extracted["identity_status"] = "matched"
+
+    if rag_profile:
+        extracted["rag_customer_profile"] = rag_profile
+
+    return extracted
 
 
 def _extract_detail(response: httpx.Response) -> str:
@@ -495,6 +669,7 @@ async def _open_or_resume_session(
         lead_profile.update(customer_profile)
     lead_profile["customer_id"] = cid
     if isinstance(vision_summary, dict):
+        lead_profile.update(_extract_customer_profile_from_vision_summary(vision_summary))
         gender_guess = str(
             vision_summary.get("gender_guess")
             or vision_summary.get("gender_estimate")
@@ -756,6 +931,7 @@ async def vision_identify_and_context_v1(
     }
     lead_profile["customer_id"] = customer_id
     if isinstance(vision_summary, dict):
+        lead_profile.update(_extract_customer_profile_from_vision_summary(vision_summary))
         gender_guess = str(
             vision_summary.get("gender_guess")
             or vision_summary.get("gender_estimate")

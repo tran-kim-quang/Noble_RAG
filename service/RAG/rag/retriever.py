@@ -119,7 +119,7 @@ async def route_query(
     query: str,
     history: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[str, Optional[str]]:
-    """LLM-based router only (RAG/SEARCH/OTHER)."""
+    """LLM-based router only (SALES/RAG/SEARCH/OTHER)."""
     if history is None:
         history = []
 
@@ -138,13 +138,14 @@ async def route_query(
     prompt = f"""
 Bạn là bộ định tuyến truy vấn cho trợ lý bất động sản.
 Chọn đúng 1 route:
+- SALES: câu hội thoại tư vấn/mở nhu cầu/khám phá nhu cầu, cần vào sales flow theo trạng thái hội thoại.
 - RAG: câu hỏi cần tri thức nội bộ dự án/sản phẩm/chính sách trong kho dữ liệu.
 - SEARCH: câu hỏi cần thông tin realtime ngoài hệ thống (thời tiết, tin tức, tỷ giá, giá vàng, giờ theo địa điểm...).
 - OTHER: chào hỏi, xã giao, hoặc câu không cần RAG/SEARCH.
 
 Trả về JSON duy nhất:
 {{
-  "route": "RAG|SEARCH|OTHER",
+  "route": "SALES|RAG|SEARCH|OTHER",
   "refined_query": "<chuẩn hóa query ngắn gọn, giữ nguyên ý>"
 }}
 
@@ -165,8 +166,8 @@ User query:
         route = str(data.get("route") or "").upper().strip()
         refined = re.sub(r"\s+", " ", str(data.get("refined_query") or text)).strip()
 
-        if route not in {"RAG", "SEARCH", "OTHER"}:
-            route = "RAG"
+        if route not in {"SALES", "RAG", "SEARCH", "OTHER"}:
+            route = "SALES"
 
         if route == "SEARCH":
             refined = _normalize_search_query(text, refined)
@@ -176,8 +177,8 @@ User query:
         log.info("Router (LLM): %s", route)
         return route, refined
     except Exception as e:
-        log.warning("route_query failed, fallback RAG: %s", e)
-        return "RAG", text
+        log.warning("route_query failed, fallback SALES: %s", e)
+        return "SALES", text
 
 
 async def plan_query_adaptive(
@@ -209,13 +210,14 @@ async def plan_query_adaptive(
 You are a query planner for a real-estate assistant.
 
 Allowed routes:
+- SALES: conversation/discovery/consulting intent that should follow sales state machine.
 - RAG: answer from internal project knowledge base.
 - SEARCH: answer requires external realtime/public information.
 - OTHER: social/small talk or generic conversation.
 
 Return JSON only:
 {{
-  "route": "RAG|SEARCH|OTHER",
+  "route": "SALES|RAG|SEARCH|OTHER",
   "refined_query": "short rewritten query with same meaning",
   "multi_intent": true|false,
   "subqueries": [
@@ -224,6 +226,12 @@ Return JSON only:
 }}
 
 Rules:
+- If user says they want consultation/advice without a specific fact request,
+  prefer route=SALES.
+- Prefer SALES for discovery turns such as "tôi muốn được tư vấn", "giúp mình chọn",
+  "em tư vấn giúp", "nên mua loại nào", even when domain is real-estate.
+- Use RAG when user asks concrete internal facts (pháp lý, giá, tiến độ, số căn, diện tích...)
+  and does not need sales-state progression.
 - Use decomposition only when the user has 2 independent intents.
 - If not needed, set multi_intent=false and subqueries=[].
 - Max 2 subqueries.
@@ -260,8 +268,8 @@ User query:
         }
 
     route = str(data.get("route") or "").upper().strip()
-    if route not in {"RAG", "SEARCH", "OTHER"}:
-        route = "RAG"
+    if route not in {"SALES", "RAG", "SEARCH", "OTHER"}:
+        route = "SALES"
 
     refined = re.sub(r"\s+", " ", str(data.get("refined_query") or text)).strip() or text
     if route == "SEARCH":
@@ -278,7 +286,7 @@ User query:
             if not sq_query:
                 continue
             if sq_route not in {"RAG", "SEARCH", "OTHER"}:
-                sq_route = route
+                sq_route = route if route in {"RAG", "SEARCH", "OTHER"} else "RAG"
             if sq_route == "SEARCH":
                 sq_query = _normalize_search_query(sq_query, sq_query)
             planned_subqueries.append({"query": sq_query, "route": sq_route})

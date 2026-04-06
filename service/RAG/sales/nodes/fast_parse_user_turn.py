@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+import unicodedata
 from typing import Any, Dict, Optional
 
 from core.dependencies import llm_model_func
@@ -74,6 +75,91 @@ _SLOT_FIELDS = {
 
 def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _fold_text(text: str) -> str:
+    raw = _normalize_text(text).lower()
+    folded = unicodedata.normalize("NFD", raw)
+    folded = "".join(ch for ch in folded if unicodedata.category(ch) != "Mn")
+    return folded.replace("đ", "d")
+
+
+def _quick_opening_route(
+    *,
+    text: str,
+    current_state: str,
+    slots: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if slots:
+        return None
+    if current_state not in {"greeting", "need_discovery"}:
+        return None
+
+    folded = _fold_text(text)
+    if not folded:
+        return None
+    words = [token for token in folded.split(" ") if token]
+    if not words:
+        return None
+
+    greeting_patterns = (
+        "xin chao",
+        "chao",
+        "hello",
+        "hi",
+    )
+    advisory_patterns = (
+        "tu van",
+        "ho tro",
+        "gioi thieu",
+        "tim hieu",
+        "giup minh chon",
+        "nen mua",
+        "muon mua",
+    )
+    fact_markers = (
+        "phap ly",
+        "gia",
+        "bao nhieu",
+        "may can",
+        "so can",
+        "tien do",
+        "dien tich",
+        "chinh sach",
+        "thanh toan",
+    )
+
+    if len(words) <= 6 and any(folded == p or folded.startswith(p + " ") for p in greeting_patterns):
+        return {
+            "detected_intent": "greeting",
+            "turn_role": "greeting",
+            "should_retrieve": False,
+            "retrieval_goal": "none",
+            "buy_signal": False,
+            "objection_type": None,
+            "fast_path_confidence": 0.9,
+            "fast_lane": "lane_a",
+            "retrieval_mode": "lite",
+            "semantic_parse_done": False,
+            "semantic_parse_confidence": 0.0,
+        }
+
+    if any(pattern in folded for pattern in advisory_patterns) and not any(marker in folded for marker in fact_markers):
+        return {
+            "detected_intent": "ask_recommendation",
+            "turn_role": "ask_recommendation",
+            "should_retrieve": False,
+            "retrieval_goal": "none",
+            "buy_signal": False,
+            "objection_type": None,
+            "fast_path_confidence": 0.78,
+            "fast_lane": "lane_a",
+            "retrieval_mode": "lite",
+            "semantic_parse_done": False,
+            "semantic_parse_confidence": 0.0,
+        }
+
+    return None
 
 
 def _extract_project_name(text: str) -> Optional[str]:
@@ -251,14 +337,12 @@ def _infer_turn_from_slots(state: SalesAgentState, slots: Dict[str, Any]) -> Opt
             "objection_type": None,
         }
     if current_state == "need_discovery":
-        missing_slots = set(state.get("missing_slots") or [])
-        should_retrieve = bool(missing_slots) and set(slots).issuperset(missing_slots)
         return {
             "turn_role": "answer_previous_question",
-            "intent": "follow_up",
+            "intent": "other",
             "confidence": 0.6,
-            "should_retrieve": should_retrieve,
-            "retrieval_goal": "shortlist" if should_retrieve else "none",
+            "should_retrieve": False,
+            "retrieval_goal": "none",
             "buy_signal": False,
             "objection_type": None,
         }
@@ -381,7 +465,7 @@ Tin nhắn khách:
             "semantic_move": "other",
             "intent": "other",
             "confidence": 0.2,
-            "should_escalate": True,
+            "should_escalate": False,
             "should_retrieve": False,
             "retrieval_goal": "none",
             "buy_signal": False,
@@ -594,6 +678,38 @@ def _route_lane(state: SalesAgentState, intent: str, slots: Dict[str, Any], conf
     return "lane_c"
 
 
+def _rule_only_context(
+    state: SalesAgentState,
+    fallback: Dict[str, Any],
+    slots: Dict[str, Any],
+    project_name: Optional[str],
+) -> Dict[str, Any]:
+    intent = str(fallback.get("intent") or "other")
+    semantic_move = "answer_slot" if slots else "general_follow_up"
+    retrieval_goal = "none"
+    should_retrieve = False
+    confidence = _estimate_confidence(
+        text=str(state.get("user_text") or ""),
+        intent=intent,
+        slots=slots,
+        project_name=project_name,
+        llm_confidence=float(fallback.get("confidence") or 0.55),
+    )
+    return {
+        "turn_role": fallback.get("turn_role") or "answer_previous_question",
+        "semantic_move": semantic_move,
+        "intent": intent,
+        "confidence": confidence,
+        "should_escalate": False,
+        "should_retrieve": should_retrieve,
+        "retrieval_goal": retrieval_goal,
+        "buy_signal": bool(fallback.get("buy_signal")),
+        "objection_type": fallback.get("objection_type"),
+        "resolved_project_name": project_name,
+        "slot_updates": dict(slots),
+    }
+
+
 async def fast_parse_user_turn(state: SalesAgentState) -> Dict[str, Any]:
     text = _normalize_text(state.get("user_text") or "")
 
@@ -604,6 +720,33 @@ async def fast_parse_user_turn(state: SalesAgentState) -> Dict[str, Any]:
     slots.update(_parse_contextual_slot_reply(text, state))
 
     project_name = _extract_project_name(text)
+    quick_route = _quick_opening_route(
+        text=text,
+        current_state=state.get("current_sales_state") or "greeting",
+        slots=slots,
+    )
+    if quick_route:
+        log.info(
+            "fast_parse_user_turn: quick route applied intent=%s state=%s",
+            quick_route["detected_intent"],
+            state.get("current_sales_state") or "greeting",
+        )
+        return {
+            "user_text": text,
+            "detected_intent": quick_route["detected_intent"],
+            "extracted_slots": slots,
+            "resolved_project_name": project_name,
+            "objection_type": quick_route["objection_type"],
+            "buy_signal": quick_route["buy_signal"],
+            "turn_role": quick_route["turn_role"],
+            "should_retrieve": quick_route["should_retrieve"],
+            "retrieval_goal": quick_route["retrieval_goal"],
+            "fast_path_confidence": quick_route["fast_path_confidence"],
+            "fast_lane": quick_route["fast_lane"],
+            "retrieval_mode": quick_route["retrieval_mode"],
+            "semantic_parse_done": quick_route["semantic_parse_done"],
+            "semantic_parse_confidence": quick_route["semantic_parse_confidence"],
+        }
     fallback = _infer_turn_from_slots(state, slots) or {
         "turn_role": "other",
         "intent": "other",
@@ -617,13 +760,29 @@ async def fast_parse_user_turn(state: SalesAgentState) -> Dict[str, Any]:
     }
     state_for_llm = dict(state)
     state_for_llm["_slot_hints"] = dict(slots)
-    micro = await _micro_understand_turn_with_llm(text=text, state=state_for_llm)
-    slots.update(micro.get("slot_updates") or {})
-    contextual = micro
-    if bool(micro.get("should_escalate")):
-        deep = await _deep_understand_turn_with_llm(text=text, state=state_for_llm)
-        contextual = deep
-        slots.update(deep.get("slot_updates") or {})
+    semantic_parse_done = False
+    semantic_parse_confidence = 0.0
+    skip_micro = state.get("current_sales_state") == "need_discovery" and _is_short_slot_reply(
+        text,
+        slots,
+        str(fallback.get("intent") or "other"),
+    )
+    if skip_micro:
+        micro = {"should_escalate": False}
+        contextual = _rule_only_context(state, fallback, slots, project_name)
+    else:
+        micro = await _micro_understand_turn_with_llm(text=text, state=state_for_llm)
+        slots.update(micro.get("slot_updates") or {})
+        contextual = micro
+        if bool(micro.get("should_escalate")):
+            deep = await _deep_understand_turn_with_llm(text=text, state=state_for_llm)
+            contextual = deep
+            slots.update(deep.get("slot_updates") or {})
+            semantic_parse_done = True
+            try:
+                semantic_parse_confidence = float(deep.get("confidence") or 0.0)
+            except Exception:
+                semantic_parse_confidence = 0.0
     semantic_move = contextual.get("semantic_move") or "other"
 
     intent_result = {
@@ -644,10 +803,6 @@ async def fast_parse_user_turn(state: SalesAgentState) -> Dict[str, Any]:
     turn_role = contextual.get("turn_role") or fallback["turn_role"]
     if turn_role == "ask_catalog_overview":
         intent = "ask_recommendation"
-    current_state = state.get("current_sales_state") or "greeting"
-    if current_state == "project_qa" and slots and not (contextual.get("resolved_project_name") or fallback.get("resolved_project_name") or project_name):
-        if intent in {"other", "project_info"}:
-            intent = "follow_up"
     retrieval_goal = contextual.get("retrieval_goal") or fallback["retrieval_goal"]
     should_retrieve = bool(contextual.get("should_retrieve", fallback["should_retrieve"]))
     if retrieval_goal == "shortlist" and intent in {"other", "follow_up"}:
@@ -674,11 +829,10 @@ async def fast_parse_user_turn(state: SalesAgentState) -> Dict[str, Any]:
         should_retrieve = True
         if retrieval_goal == "none":
             retrieval_goal = "closing_next_step"
-    if semantic_move == "answer_slot" and slots and intent in {"other", "project_info"}:
-        intent = "follow_up"
+    if semantic_move == "answer_slot" and slots:
+        should_retrieve = False
         if retrieval_goal == "project_qa":
             retrieval_goal = "none"
-            should_retrieve = False
 
     confidence = _estimate_confidence(
         text=text,
@@ -695,12 +849,14 @@ async def fast_parse_user_turn(state: SalesAgentState) -> Dict[str, Any]:
     retrieval_mode = "lite" if lane == "lane_b" else "full"
 
     log.info(
-        "fast_parse_user_turn: lane=%s intent=%s confidence=%.2f slots=%d escalated=%s",
+        "fast_parse_user_turn: lane=%s intent=%s confidence=%.2f slots=%d escalated=%s rule_only=%s semantic_done=%s",
         lane,
         intent,
         confidence,
         len(slots),
         bool(micro.get("should_escalate")),
+        skip_micro,
+        semantic_parse_done,
     )
 
     return {
@@ -716,4 +872,6 @@ async def fast_parse_user_turn(state: SalesAgentState) -> Dict[str, Any]:
         "fast_path_confidence": confidence,
         "fast_lane": lane,
         "retrieval_mode": retrieval_mode,
+        "semantic_parse_done": semantic_parse_done,
+        "semantic_parse_confidence": semantic_parse_confidence,
     }
