@@ -15,7 +15,7 @@ import httpx
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
-from api.routes_sales import _run_sales_or_search
+from api.routes_sales import _run_sales_flow
 from core.config import get_settings
 
 log = logging.getLogger("rag-service")
@@ -48,6 +48,7 @@ from models.api_models import (
     VisionIdentifyAndContextResponse,
 )
 from sales.nodes.retrieve_context import refresh_retrieval_caches
+from utils.text import normalize_user_text
 
 router = APIRouter(prefix="/api/v1", tags=["pipeline-v1"])
 settings = get_settings()
@@ -1003,6 +1004,7 @@ async def sales_chat_v1(request: SalesChatV1Request):
 
     if request.stream:
         raise HTTPException(status_code=400, detail="stream=true is not supported on /api/v1/sales/chat")
+    request.message = normalize_user_text(request.message)
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="message cannot be empty")
 
@@ -1017,9 +1019,9 @@ async def sales_chat_v1(request: SalesChatV1Request):
         created_from_vision=False,
     )
 
-    result = await _run_sales_or_search(
+    result = await _run_sales_flow(
         session_id=request.session_id,
-        user_text=request.message.strip(),
+        user_text=normalize_user_text(request.message.strip()),
         raw_transcript=None,
     )
 
@@ -1106,7 +1108,7 @@ async def sales_chat_with_camera_v1(
     await ensure_sales_schema()
     await ensure_pipeline_schema()
 
-    user_text = (message or "").strip()
+    user_text = normalize_user_text((message or "").strip())
     if not user_text:
         raise HTTPException(status_code=400, detail="message cannot be empty")
 
@@ -1196,7 +1198,7 @@ async def sales_chat_with_camera_v1(
     active_session_id = str(open_result["session_id"]).strip()
     active_customer_id = str(open_result["customer_id"]).strip()
 
-    result = await _run_sales_or_search(
+    result = await _run_sales_flow(
         session_id=active_session_id,
         user_text=user_text,
         raw_transcript=None,

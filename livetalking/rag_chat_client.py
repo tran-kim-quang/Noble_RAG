@@ -94,6 +94,8 @@ def get_noble_runtime_config() -> Dict[str, str]:
         "vision_base_url": _service_base_url("NOBLE_VISION_API_URL", 8020),
         "whisper_base_url": _service_base_url("NOBLE_WHISPER_API_URL", 8001),
         "vision_source": (os.getenv("NOBLE_VISION_SOURCE") or "browser").strip() or "browser",
+        "presence_camera": (os.getenv("NOBLE_PRESENCE_CAMERA") or "cam01").strip() or "cam01",
+        "presence_stale_sec": (os.getenv("NOBLE_PRESENCE_STALE_SEC") or "4.0").strip() or "4.0",
     }
 
 

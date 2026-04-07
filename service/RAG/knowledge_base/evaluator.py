@@ -61,7 +61,8 @@ def is_project_specific_query(text: str, history: Optional[List[Dict[str, Any]]]
     if not corpus:
         return False
 
-    if any(keyword in corpus for keyword in ("thi truong", "market", "ben ngoai", "du lieu ngoai")):
+    # Scope exclusion should only use the current user query, not history.
+    if any(keyword in folded for keyword in ("thi truong", "market", "ben ngoai", "du lieu ngoai")):
         return False
 
     project_markers = (

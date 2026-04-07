@@ -1,9 +1,11 @@
 """Sales agent API endpoints."""
 
 import asyncio
+import ast
 import json
 import logging
 import random
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -11,9 +13,11 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from chat.service import run_chat_route
+from core.dependencies import llm_model_func
 from integrations.camera_identity import maybe_enrich_identity
 from knowledge_base.service import resolve_knowledge
 from models.api_models import LeadUpdateRequest, SalesChatRequest, SalesChatResponse
+from utils.json_extract import extract_first_json_object
 from core.config import get_settings
 from memory.chat_history_store import (
     append_turn,
@@ -36,10 +40,224 @@ from memory.session_store import delete_session_context, load_session_context
 from integrations.machine_b_face_client import notify_machine_b_customer_removed
 from sales.session_export import export_session_to_txt
 from sales.response_templates import _apply_customer_pronoun
-from utils.text import iter_stream_chunks
+from utils.text import iter_stream_chunks, normalize_user_text
 
 router = APIRouter(prefix="/sales", tags=["sales"])
 log = logging.getLogger("rag-service")
+
+_SEARCH_APPROVAL_PROMPT_VI = "có muốn em thực hiện tìm kiếm thông tin bên ngoài"
+
+
+async def _classify_turn_route(user_text: str, history: List[Dict[str, Any]]) -> str:
+    text = (user_text or "").strip()
+    if not text:
+        return "PROJECT"
+
+    history_lines: List[str] = []
+    for item in (history or [])[-6:]:
+        role = str(item.get("role") or "user").strip().lower()
+        content = str(item.get("content") or "").strip()
+        if content:
+            history_lines.append(f"{role}: {content}")
+    history_text = "\n".join(history_lines) if history_lines else "(empty)"
+
+    prompt = f"""
+Bạn là bộ phân loại route cho trợ lý bất động sản.
+Hãy phân loại user turn thành đúng 1 loại:
+- SMALLTALK: xã giao/chat vui (chào hỏi, cảm ơn, tạm biệt, phản hồi lịch sự, nói chuyện nhẹ nhàng), không cần truy xuất tri thức dự án.
+- PROJECT: có ý định hỏi thông tin dự án/sản phẩm/chính sách/so sánh/pháp lý/giá/tiến độ hoặc cần tư vấn bất động sản cụ thể.
+
+Chỉ trả về JSON object duy nhất:
+{{"route": "SMALLTALK|PROJECT"}}
+
+Quy tắc:
+- Nếu mơ hồ, chọn PROJECT (an toàn).
+- Không giải thích thêm.
+
+Ví dụ bắt buộc:
+- "xin chào" -> SMALLTALK
+- "xin chào và hẹn gặp lại" -> SMALLTALK
+- "cảm ơn em nhé" -> SMALLTALK
+- "cho anh bảng giá dự án" -> PROJECT
+- "pháp lý dự án thế nào" -> PROJECT
+
+History:
+{history_text}
+
+User:
+{text}
+""".strip()
+
+    try:
+        raw = await llm_model_func(
+            prompt,
+            enable_cot=False,
+            response_format={"type": "json_object"},
+            temperature=0.0,
+            max_tokens=40,
+        )
+        route = ""
+        if isinstance(raw, dict):
+            route = str(raw.get("route") or "").strip().upper()
+        else:
+            raw_text = str(raw or "")
+            payload = extract_first_json_object(raw_text)
+            if payload:
+                try:
+                    data = json.loads(payload)
+                    if isinstance(data, dict):
+                        route = str(data.get("route") or "").strip().upper()
+                except Exception:
+                    try:
+                        data = ast.literal_eval(payload)
+                        if isinstance(data, dict):
+                            route = str(data.get("route") or "").strip().upper()
+                    except Exception:
+                        route = ""
+            if not route:
+                upper = raw_text.strip().upper()
+                if "SMALLTALK" in upper:
+                    route = "SMALLTALK"
+                elif "PROJECT" in upper:
+                    route = "PROJECT"
+        if route in {"SMALLTALK", "PROJECT"}:
+            log.info("turn_route classifier: route=%s user_text=%r", route, text)
+            return route
+
+        try:
+            normalize_prompt = f"""
+Phân loại câu user sau thành đúng 1 nhãn và CHỈ trả về một từ duy nhất:
+- SMALLTALK: chat xã giao, không cần tri thức dự án.
+- PROJECT: có ý định hỏi/tư vấn thông tin dự án bất động sản.
+
+User: {text}
+""".strip()
+            normalized = await llm_model_func(
+                normalize_prompt,
+                enable_cot=False,
+                temperature=0.0,
+                max_tokens=8,
+            )
+            label = str(normalized or "").strip().upper()
+            if label.startswith("SMALLTALK"):
+                log.info("turn_route classifier normalized: route=SMALLTALK user_text=%r", text)
+                return "SMALLTALK"
+            if label.startswith("PROJECT"):
+                log.info("turn_route classifier normalized: route=PROJECT user_text=%r", text)
+                return "PROJECT"
+        except Exception as exc:
+            log.warning("turn_route normalize failed, fallback PROJECT: %s", exc)
+    except Exception as exc:
+        log.warning("turn_route classifier failed, fallback PROJECT: %s", exc)
+
+    log.info("turn_route classifier fallback: route=PROJECT user_text=%r", text)
+    return "PROJECT"
+
+
+def _parse_boolean_json(raw: str, key: str) -> Optional[bool]:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    candidate = extract_first_json_object(text) or text
+    try:
+        payload = json.loads(candidate)
+    except Exception:
+        return None
+    value = payload.get(key) if isinstance(payload, dict) else None
+    return value if isinstance(value, bool) else None
+
+
+def _is_external_search_approval_fallback(user_text: str) -> bool:
+    text = (user_text or "").strip().lower()
+    if not text:
+        return False
+    deny_patterns = [
+        r"\b(khong|không|ko)\b",
+        r"\b(khong can|không cần|khong dong y|không đồng ý)\b",
+        r"\b(khoi|khỏi)\b",
+    ]
+    if any(re.search(pattern, text) for pattern in deny_patterns):
+        return False
+
+    approve_patterns = [
+        r"\b(dong y|đồng ý|ok|oke|yes|duoc|được)\b",
+        r"\b(tim ngoai|tìm ngoài|search)\b",
+        r"\b(cu tra|cứ tra|tra giup|tra giúp|nho ban tra|nhờ bạn tra)\b",
+    ]
+    return any(re.search(pattern, text) for pattern in approve_patterns)
+
+
+async def _is_external_search_approval(user_text: str, history: List[Dict[str, Any]]) -> bool:
+    text = (user_text or "").strip()
+    if not text:
+        return False
+
+    last_assistant = ""
+    for item in reversed(history):
+        if str(item.get("role") or "").strip().lower() != "assistant":
+            continue
+        candidate = str(item.get("content") or "").strip()
+        if candidate:
+            last_assistant = candidate
+            break
+
+    prompt = f"""
+Bạn là bộ phân loại intent trong hội thoại sales.
+Nhiệm vụ: xác định câu người dùng có phải là ĐỒNG Ý cho phép trợ lý tìm kiếm thông tin bên ngoài hay không.
+
+Chỉ trả về JSON object duy nhất:
+{{"approve_external_search": true|false}}
+
+Quy tắc:
+- true nếu người dùng thể hiện đồng ý/cho phép tiếp tục tìm kiếm ngoài.
+- false nếu người dùng từ chối, phủ định, hoặc câu không rõ là chấp thuận.
+- Nếu mơ hồ, trả về false.
+
+Assistant previous message: {last_assistant}
+User message: {text}
+""".strip()
+
+    try:
+        raw = await llm_model_func(
+            prompt,
+            enable_cot=False,
+            response_format={"type": "json_object"},
+            temperature=0.0,
+            max_tokens=60,
+        )
+        parsed = _parse_boolean_json(str(raw), "approve_external_search")
+        if parsed is not None:
+            log.info("external_search_approval classifier: parsed=%s user_text=%r", parsed, text)
+            return parsed
+    except Exception as exc:
+        log.warning("external search approval classifier failed, using fallback: %s", exc)
+
+    fallback = _is_external_search_approval_fallback(text)
+    log.info("external_search_approval classifier fallback: parsed=%s user_text=%r", fallback, text)
+    return fallback
+
+
+def _assistant_requested_external_search(history: List[Dict[str, Any]]) -> bool:
+    if not history:
+        return False
+    for item in reversed(history):
+        if str(item.get("role") or "").strip().lower() != "assistant":
+            continue
+        content = str(item.get("content") or "").strip().lower()
+        if _SEARCH_APPROVAL_PROMPT_VI in content:
+            return True
+        return False
+    return False
+
+
+def _last_user_query_before_current_turn(history: List[Dict[str, Any]]) -> str:
+    for item in reversed(history):
+        if str(item.get("role") or "").strip().lower() != "user":
+            continue
+        content = str(item.get("content") or "").strip()
+        if content:
+            return content
+    return ""
 
 
 def _require_chat_purge_token(x_chat_history_purge_token: Optional[str]) -> None:
@@ -109,26 +327,95 @@ async def _run_sales_flow(
     session_id: str,
     user_text: str,
     raw_transcript: Optional[str] = None,
+    stream_callback=None,
+    stage_timings_ms: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
-    history = await load_chat_history(session_id)
-    session_context = await load_session_context(session_id)
-    lead_profile = await load_lead_profile(session_id)
+    t_flow_start = time.perf_counter()
+    timings: Dict[str, int] = {}
 
+    user_text = normalize_user_text(user_text)
+
+    t0 = time.perf_counter()
+    history, session_context, lead_profile = await asyncio.gather(
+        load_chat_history(session_id),
+        load_session_context(session_id),
+        load_lead_profile(session_id),
+    )
+    timings["load_context"] = int((time.perf_counter() - t0) * 1000)
+
+    t0 = time.perf_counter()
+    turn_route = await _classify_turn_route(user_text, history)
+    timings["route_classify"] = int((time.perf_counter() - t0) * 1000)
+    if turn_route == "SMALLTALK":
+        log.info("smalltalk_bypass: session=%s user_text=%r", session_id, user_text)
+        t0 = time.perf_counter()
+        result = await run_chat_route(
+            session_id=session_id,
+            message=user_text,
+            history=history,
+            lead_profile=lead_profile or {},
+            session_context=session_context or {},
+            knowledge_payload=None,
+            raw_transcript=raw_transcript,
+            stream_callback=stream_callback,
+        )
+        timings["chat_generation"] = int((time.perf_counter() - t0) * 1000)
+
+        patched_answer = _apply_customer_pronoun(
+            str(result.get("final_response") or ""),
+            {"lead_profile": lead_profile, "session_context": session_context},
+        )
+        result["final_response"] = patched_answer
+        result["lead_profile"] = lead_profile
+
+        t0 = time.perf_counter()
+        await _persist_chat_turn(session_id, user_text, patched_answer)
+        timings["persist_turn"] = int((time.perf_counter() - t0) * 1000)
+        timings["total"] = int((time.perf_counter() - t_flow_start) * 1000)
+        if stage_timings_ms is not None:
+            stage_timings_ms.update(timings)
+        log.info("sales_flow_timing session=%s route=%s timings_ms=%s", session_id, turn_route, timings)
+        return result
+
+    settings = get_settings()
+    force_external_search = False
+    effective_query = user_text
+
+    if settings.enable_human_loop_search_approval:
+        if _assistant_requested_external_search(history) and await _is_external_search_approval(user_text, history):
+            previous_query = _last_user_query_before_current_turn(history)
+            if previous_query:
+                effective_query = previous_query
+                force_external_search = True
+                log.info(
+                    "human_loop_search: approval detected session=%s using_previous_query=%r",
+                    session_id,
+                    effective_query,
+                )
+
+    t0 = time.perf_counter()
     knowledge_payload = await resolve_knowledge(
-        query=user_text,
+        query=effective_query,
         history=history,
         session_context=session_context,
         top_k=6,
+        force_external_search=force_external_search,
+        human_loop_threshold=settings.human_loop_search_cosine_threshold,
     )
+    timings["resolve_knowledge"] = int((time.perf_counter() - t0) * 1000)
+
+    t0 = time.perf_counter()
     result = await run_chat_route(
         session_id=session_id,
-        message=user_text,
+        message=effective_query if force_external_search else user_text,
         history=history,
         lead_profile=lead_profile or {},
         session_context=session_context or {},
         knowledge_payload=knowledge_payload,
         raw_transcript=raw_transcript,
+        stream_callback=stream_callback,
     )
+    timings["chat_generation"] = int((time.perf_counter() - t0) * 1000)
 
     patched_answer = _apply_customer_pronoun(
         str(result.get("final_response") or ""),
@@ -137,7 +424,13 @@ async def _run_sales_flow(
     result["final_response"] = patched_answer
     result["lead_profile"] = lead_profile
 
+    t0 = time.perf_counter()
     await _persist_chat_turn(session_id, user_text, patched_answer)
+    timings["persist_turn"] = int((time.perf_counter() - t0) * 1000)
+    timings["total"] = int((time.perf_counter() - t_flow_start) * 1000)
+    if stage_timings_ms is not None:
+        stage_timings_ms.update(timings)
+    log.info("sales_flow_timing session=%s route=%s timings_ms=%s", session_id, turn_route, timings)
     return result
 
 
@@ -206,17 +499,35 @@ async def sales_chat_stream(request: SalesChatRequest):
         ) + "\n"
 
         try:
-            result = await _run_sales_flow(
-                session_id=request.session_id,
-                user_text=user_text,
-                raw_transcript=request.raw_transcript,
+            stage_timings_ms: Dict[str, int] = {}
+            stream_queue: "asyncio.Queue[str]" = asyncio.Queue()
+
+            async def _on_stream_delta(delta: str) -> None:
+                await stream_queue.put(delta)
+
+            flow_task = asyncio.create_task(
+                _run_sales_flow(
+                    session_id=request.session_id,
+                    user_text=user_text,
+                    raw_transcript=request.raw_transcript,
+                    stream_callback=_on_stream_delta,
+                    stage_timings_ms=stage_timings_ms,
+                )
             )
-            async for line in _yield_ndjson_response_chunks(
-                request.session_id,
-                str(result.get("final_response") or ""),
-            ):
-                yield line
+
+            while True:
+                if flow_task.done() and stream_queue.empty():
+                    break
+                try:
+                    delta = await asyncio.wait_for(stream_queue.get(), timeout=0.15)
+                except asyncio.TimeoutError:
+                    continue
+                if delta:
+                    yield _ndjson_response_line(request.session_id, delta)
+
+            result = await flow_task
             final_meta.update(_stream_meta_from_flow_result(result))
+            final_meta["stage_timings_ms"] = stage_timings_ms
 
             if not final_meta.get("route_category"):
                 final_meta["route_category"] = "CHAT"
@@ -254,6 +565,7 @@ async def sales_chat_stream(request: SalesChatRequest):
                 "knowledge_used": bool(final_meta.get("knowledge_used")),
                 "search_used": bool(final_meta.get("search_used")),
                 "kb_top_score": final_meta.get("kb_top_score"),
+                "stage_timings_ms": final_meta.get("stage_timings_ms") or {},
                 "latency_sec": round(time.perf_counter() - t_total, 3),
             },
             ensure_ascii=False,

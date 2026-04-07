@@ -66,11 +66,26 @@ class KnowledgeEvidenceItem(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class KnowledgeSubqueryResult(BaseModel):
+    """Result from resolving a single subquery in multi-intent mode."""
+    query: str
+    intent_hint: Optional[str] = None
+    source_preference: Optional[str] = None
+    top_score: Optional[float] = None
+    threshold: Optional[float] = None
+    should_search: bool = False
+    decision_reason: Optional[str] = None
+    kb_evidence: List[KnowledgeEvidenceItem] = Field(default_factory=list)
+    search_evidence: List[KnowledgeEvidenceItem] = Field(default_factory=list)
+    unresolved: bool = False
+
+
 class KnowledgeDecisionPayload(BaseModel):
     original_query: str
     rewritten_query: str
     multi_intent: bool = False
     subqueries: List[Dict[str, Any]] = Field(default_factory=list)
+    subquery_results: List[KnowledgeSubqueryResult] = Field(default_factory=list)
     top_score: Optional[float] = None
     threshold: Optional[float] = None
     should_search: bool = False

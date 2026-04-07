@@ -46,6 +46,7 @@ import random
 import shutil
 import asyncio
 import os
+import time
 from contextlib import suppress
 from typing import Dict, Optional, Tuple
 from uuid import uuid4
@@ -358,8 +359,12 @@ async def run_rag_chat(
     try:
         nerfreal = nerfreals[sessionid]
         use_camera_route = _env_flag("NOBLE_USE_CAMERA_CHAT_ENDPOINT", True)
+        followup_no_camera = _env_flag("NOBLE_FOLLOWUP_NO_CAMERA", True)
         strict_camera_route = _env_flag("NOBLE_CAMERA_CHAT_STRICT", False)
-        if use_camera_route:
+        is_followup_turn = bool(rag_session_confirmed.get(sessionid)) or bool(camera_customer_hints.get(sessionid))
+        camera_route_enabled_for_turn = use_camera_route and not (followup_no_camera and is_followup_turn)
+
+        if camera_route_enabled_for_turn:
             if image_bytes is None:
                 cached = camera_frame_cache.get(sessionid)
                 if cached and cached[0]:
@@ -421,6 +426,12 @@ async def run_rag_chat(
                     "Em chưa chụp được ảnh camera cho lượt này. Anh/Chị bật camera browser rồi thử lại giúp em nhé."
                 )
                 return
+        elif use_camera_route and followup_no_camera and is_followup_turn:
+            logger.info(
+                "Follow-up turn uses standard chat (camera skipped) session=%s rag_session_id=%s",
+                sessionid,
+                rag_session_id,
+            )
 
         await relay_rag_chat_to_avatar(
             message=message,
@@ -477,7 +488,7 @@ async def offer(request):
                 rag_session_confirmed.pop(sessionid, None)
                 camera_customer_hints.pop(sessionid, None)
                 camera_frame_cache.pop(sessionid, None)
-                del nerfreals[sessionid]
+                nerfreals.pop(sessionid, None)
             if pc.connectionState == "closed":
                 await cancel_chat_task(sessionid)
                 pcs.discard(pc)
@@ -485,7 +496,7 @@ async def offer(request):
                 rag_session_confirmed.pop(sessionid, None)
                 camera_customer_hints.pop(sessionid, None)
                 camera_frame_cache.pop(sessionid, None)
-                del nerfreals[sessionid]
+                nerfreals.pop(sessionid, None)
                 # gc.collect()
 
         player = HumanPlayer(nerfreals[sessionid])
@@ -660,6 +671,7 @@ async def local_whisper_transcribe(request):
             raise ValueError("audio is empty")
 
         language = (form.get("language") or os.getenv("NOBLE_WHISPER_LANGUAGE") or "vi").strip()
+        whisper_vad_filter = (os.getenv("NOBLE_WHISPER_VAD_FILTER") or "false").strip().lower()
         filename = fileobj.filename or "mic.webm"
 
         cfg = get_noble_runtime_config()
@@ -683,6 +695,7 @@ async def local_whisper_transcribe(request):
             )
             payload.add_field("language", language)
             payload.add_field("word_timestamps", "false")
+            payload.add_field("vad_filter", whisper_vad_filter)
             return payload
 
         last_error = ""
@@ -709,8 +722,26 @@ async def local_whisper_transcribe(request):
                         or data.get("full_text")
                         or ""
                     ).strip()
+                    if not text:
+                        segments = data.get("segments")
+                        if isinstance(segments, list):
+                            text = " ".join(
+                                str(seg.get("text") or "").strip()
+                                for seg in segments
+                                if isinstance(seg, dict)
+                            ).strip()
                     if not text and body and not body.lstrip().startswith("{"):
                         text = body.strip()
+                    duration = data.get("duration")
+                    language_probability = data.get("language_probability")
+                    logger.info(
+                        "whisper proxy: bytes=%s lang=%s lp=%s duration=%s text=%r",
+                        len(filebytes),
+                        data.get("language") or language,
+                        language_probability,
+                        duration,
+                        text[:120],
+                    )
                     return web.json_response({"text": text, "language": language})
         raise RuntimeError(last_error or "whisper-service returned empty response")
     except Exception as e:
@@ -861,6 +892,101 @@ async def proxy_vision_session(request):
                 )
     except Exception as e:
         logger.exception('vision session proxy exception:')
+        return web.Response(
+            status=502,
+            content_type="application/json",
+            text=json.dumps({"detail": str(e)}),
+        )
+
+
+async def proxy_vision_presence_latest(request):
+    cfg = get_noble_runtime_config()
+    camera = (request.query.get("camera") or os.getenv("NOBLE_PRESENCE_CAMERA") or "cam01").strip() or "cam01"
+    stale_sec = max(0.5, float((os.getenv("NOBLE_PRESENCE_STALE_SEC") or "4.0").strip() or "4.0"))
+    try:
+        url = f"{cfg['rag_base_url']}/api/v1/vision/presence/history"
+        params = {
+            "camera": camera,
+            "limit": "1",
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as response:
+                response_text = await response.text()
+                if response.status >= 400:
+                    return web.Response(
+                        status=response.status,
+                        content_type="application/json",
+                        text=response_text or json.dumps({"detail": "presence API failed"}),
+                    )
+
+        payload = json.loads(response_text) if response_text else {}
+        events = payload.get("events") if isinstance(payload, dict) else None
+        latest = events[0] if isinstance(events, list) and events else {}
+        now_ts = time.time()
+        event_ts_raw = latest.get("ts_unix") if isinstance(latest, dict) else None
+        received_at_raw = latest.get("received_at") if isinstance(latest, dict) else None
+        event_ts = None
+        received_at_ts = None
+        if event_ts_raw is not None:
+            try:
+                event_ts = float(event_ts_raw)
+                # Support timestamps accidentally sent in milliseconds.
+                if event_ts > 10_000_000_000:
+                    event_ts = event_ts / 1000.0
+            except Exception:
+                event_ts = None
+        if received_at_raw is not None:
+            try:
+                received_at_ts = float(received_at_raw)
+                if received_at_ts > 10_000_000_000:
+                    received_at_ts = received_at_ts / 1000.0
+            except Exception:
+                received_at_ts = None
+
+        freshness_ts = received_at_ts if received_at_ts is not None else event_ts
+        age_sec = None if freshness_ts is None else max(0.0, now_ts - freshness_ts)
+        future_skew_sec = None if event_ts is None else max(0.0, event_ts - now_ts)
+        if received_at_ts is not None:
+            stale = bool(age_sec is None or age_sec > stale_sec)
+        else:
+            stale = bool(
+                age_sec is None
+                or age_sec > stale_sec
+                or (future_skew_sec is not None and future_skew_sec > stale_sec)
+            )
+        raw_has_person = bool(latest.get("co_nguoi")) if isinstance(latest, dict) else False
+        raw_looking_at_camera = bool(latest.get("looking_at_camera")) if isinstance(latest, dict) else False
+        has_person = bool(raw_has_person and raw_looking_at_camera and not stale)
+        if stale:
+            decision_reason = "stale_or_missing_signal"
+        elif raw_has_person and raw_looking_at_camera:
+            decision_reason = "presence_true"
+        elif raw_has_person and not raw_looking_at_camera:
+            decision_reason = "person_not_looking_at_camera"
+        else:
+            decision_reason = "presence_false"
+
+        return web.json_response(
+            {
+                "camera": camera,
+                "has_person": has_person,
+                "co_nguoi": has_person,
+                "raw_co_nguoi": raw_has_person,
+                "raw_looking_at_camera": raw_looking_at_camera,
+                "looking_at_camera": raw_looking_at_camera,
+                "stale": stale,
+                "age_sec": age_sec,
+                "future_skew_sec": future_skew_sec,
+                "received_at": received_at_ts,
+                "now_ts": now_ts,
+                "stale_after_sec": stale_sec,
+                "decision_reason": decision_reason,
+                "ts_unix": event_ts,
+                "event": latest if isinstance(latest, dict) else {},
+            }
+        )
+    except Exception as e:
+        logger.exception('vision presence latest proxy exception:')
         return web.Response(
             status=502,
             content_type="application/json",
@@ -1134,6 +1260,7 @@ if __name__ == '__main__':
     appasync.router.add_post("/noble/whisper/transcribe", local_whisper_transcribe)
     appasync.router.add_post("/noble/vision/identify", proxy_vision_identify)
     appasync.router.add_get("/noble/vision/session/{session_id}", proxy_vision_session)
+    appasync.router.add_get("/noble/vision/presence/latest", proxy_vision_presence_latest)
     appasync.router.add_static('/',path='web')
 
     # Configure default CORS settings.

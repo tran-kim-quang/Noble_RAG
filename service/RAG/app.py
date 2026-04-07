@@ -28,12 +28,18 @@ from core.logging import setup_logging, get_logger
 from memory.lead_profile_store import ensure_sales_schema
 from api.routes_health import router as health_router
 from api.routes_documents import router as documents_router
-from api.routes_lan_bridge import router as lan_bridge_router
+from api.routes_lan_bridge import (
+    router as lan_bridge_router,
+    vision_router,
+    start_machine_b_presence_poller,
+    stop_machine_b_presence_poller,
+)
 from api.routes_pipeline_v1 import router as pipeline_v1_router
 from api.routes_query import router as query_router
 from api.routes_sales import router as sales_router
 from memory.pipeline_store import ensure_pipeline_schema
 from sales.nodes.retrieve_context import warm_retrieval_caches
+from rag.retriever import prewarm_reranker
 
 setup_logging()
 log = get_logger("rag-service")
@@ -68,10 +74,22 @@ async def startup_event():
     await ensure_pipeline_schema()
     import asyncio
     asyncio.create_task(warm_retrieval_caches())
+
+    async def _prewarm_reranker_task():
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, prewarm_reranker)
+            log.info("Reranker prewarm done.")
+        except Exception as exc:
+            log.warning("Reranker prewarm failed: %s", exc)
+
+    asyncio.create_task(_prewarm_reranker_task())
+    start_machine_b_presence_poller()
     log.info("Haystack storages initialised.")
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    await stop_machine_b_presence_poller()
     log.info("Đã đóng các kết nối và dọn dẹp ứng dụng.")
 
 
@@ -81,6 +99,7 @@ app.include_router(query_router)
 app.include_router(sales_router)
 app.include_router(pipeline_v1_router)
 app.include_router(lan_bridge_router)
+app.include_router(vision_router)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,9 @@
 import asyncio
 import json
 import logging
+import os
 import re
+import threading
 import unicodedata
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -22,6 +24,123 @@ from utils.time import now_vietnam_str
 
 settings = get_settings()
 log = logging.getLogger("rag-service")
+
+_reranker_model = None
+_reranker_lock = threading.Lock()
+
+
+def _excluded_source_keywords() -> List[str]:
+    raw = str(os.getenv("KB_EXCLUDED_SOURCE_KEYWORDS") or "").strip()
+    if not raw:
+        return []
+    return [token.strip().lower() for token in raw.split(",") if token.strip()]
+
+
+def _is_excluded_source(source: str) -> bool:
+    src = str(source or "").strip().lower()
+    if not src:
+        return False
+    for token in _excluded_source_keywords():
+        if token in src:
+            return True
+    return False
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = str(os.getenv(name, str(default))).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _get_reranker_model():
+    global _reranker_model
+    if _reranker_model is not None:
+        return _reranker_model
+
+    with _reranker_lock:
+        if _reranker_model is not None:
+            return _reranker_model
+        from sentence_transformers import CrossEncoder
+
+        model_name = os.getenv("RERANKER_MODEL", settings.reranker_model)
+        device = os.getenv("RERANKER_DEVICE", settings.reranker_device)
+        _reranker_model = CrossEncoder(model_name, device=device)
+        log.info("Reranker initialized: model=%s device=%s", model_name, device)
+        return _reranker_model
+
+
+def prewarm_reranker() -> None:
+    if not _env_bool("ENABLE_RERANKER", settings.enable_reranker):
+        log.info("Reranker prewarm skipped: disabled")
+        return
+    _get_reranker_model()
+
+
+def _minmax(values: List[float]) -> List[float]:
+    if not values:
+        return []
+    lo = min(values)
+    hi = max(values)
+    if hi - lo < 1e-9:
+        return [1.0 for _ in values]
+    return [(v - lo) / (hi - lo) for v in values]
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _fusion_weights_for_profile(rerank_profile: Optional[str]) -> tuple[float, float]:
+    default_rr = float(os.getenv("RERANKER_WEIGHT_DEFAULT", str(settings.reranker_weight_default)))
+    compare_rr = float(
+        os.getenv(
+            "RERANKER_WEIGHT_COMPARE_QUANT",
+            str(settings.reranker_weight_compare_quant),
+        )
+    )
+    profile = str(rerank_profile or "").strip().lower()
+    rr_weight = compare_rr if profile in {"comparison", "compare", "quant", "quantitative"} else default_rr
+    rr_weight = _clamp01(rr_weight)
+    vec_weight = 1.0 - rr_weight
+    return vec_weight, rr_weight
+
+
+def _apply_rerank(
+    query: str,
+    candidates: List[Dict[str, Any]],
+    *,
+    rerank_profile: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if not candidates:
+        return candidates
+    if not _env_bool("ENABLE_RERANKER", settings.enable_reranker):
+        return candidates
+
+    candidate_limit = max(1, int(os.getenv("RERANKER_CANDIDATE_LIMIT", str(settings.reranker_candidate_limit))))
+    target = candidates[:candidate_limit]
+
+    try:
+        reranker = _get_reranker_model()
+        pairs = [[query, str(item.get("content") or "")[:2000]] for item in target]
+        raw_scores = reranker.predict(pairs, show_progress_bar=False)
+        rerank_scores = [float(x) for x in list(raw_scores)]
+
+        vector_scores = [float(item.get("score") or 0.0) for item in target]
+        vec_norm = _minmax(vector_scores)
+        rr_norm = _minmax(rerank_scores)
+        vec_weight, rr_weight = _fusion_weights_for_profile(rerank_profile)
+
+        for idx, item in enumerate(target):
+            item["rerank_score"] = rerank_scores[idx]
+            item["_rank_score"] = vec_weight * vec_norm[idx] + rr_weight * rr_norm[idx]
+
+        target.sort(key=lambda x: float(x.get("_rank_score") or 0.0), reverse=True)
+        for item in target:
+            item.pop("_rank_score", None)
+
+        return target + candidates[candidate_limit:]
+    except Exception as exc:
+        log.warning("Reranker unavailable, fallback to vector ranking: %s", exc)
+        return candidates
 
 
 def _fold_vn(text: str) -> str:
@@ -265,6 +384,8 @@ Trả lời:"""
 async def retrieve_kb_candidates(
     query: str,
     top_k: int = 6,
+    *,
+    rerank_profile: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Low-level KB retrieval with raw similarity scores for confidence evaluation."""
     search_query = re.sub(r"\s+", " ", (query or "")).strip()
@@ -298,6 +419,8 @@ async def retrieve_kb_candidates(
         if not content:
             continue
         source = str(payload.get("file_path") or payload.get("document_id") or "unknown")
+        if _is_excluded_source(source):
+            continue
         metadata = {
             key: value
             for key, value in payload.items()
@@ -316,7 +439,7 @@ async def retrieve_kb_candidates(
                 "metadata": metadata,
             }
         )
-    return candidates
+    return _apply_rerank(search_query, candidates, rerank_profile=rerank_profile)
 
 
 async def query_rag(

@@ -229,7 +229,7 @@
             display: flex;
             justify-content: center;
             align-items: center;
-            cursor: pointer;
+            cursor: default;
             transition: all 0.2s ease;
             box-shadow: 0 2px 5px rgba(0,0,0,0.2);
             margin: 0 auto;
@@ -368,7 +368,7 @@
                             <!-- ÃƒÂ¥Ã‚Â¯Ã‚Â¹ÃƒÂ¨Ã‚Â¯Ã‚ÂÃƒÂ¦Ã‚Â¨Ã‚Â¡ÃƒÂ¥Ã‚Â¼Ã‚Â -->
                             <div class="tab-pane fade show active" id="chat" role="tabpanel" aria-labelledby="chat-tab">
                                 <div class="asr-container mb-3" id="chat-messages">
-                                    <div class="asr-text system-message">Hệ thống: Chọn "Bắt đầu kết nối", sau đó bạn có thể chat hoặc giữ nút mic để nói.</div>
+                                    <div class="asr-text system-message">Hệ thống: Chọn "Bắt đầu kết nối". Mic sẽ tự bật/tắt theo presence từ Máy B.</div>
                                 </div>
                                 
                                 <form id="chat-form">
@@ -384,7 +384,7 @@
                                 <div class="voice-record-btn" id="voice-record-btn">
                                     <i class="bi bi-mic-fill"></i>
                                 </div>
-                                <div class="voice-record-label">Giữ để nói, thả để gửi</div>
+                                <div class="voice-record-label">Mic tự động theo presence từ Máy B (<span id="presence-state">chưa có tín hiệu</span>)</div>
                             </div>
                             
                             <!-- ÃƒÂ¦Ã…â€œÃ¢â‚¬â€ÃƒÂ¨Ã‚Â¯Ã‚Â»ÃƒÂ¦Ã‚Â¨Ã‚Â¡ÃƒÂ¥Ã‚Â¼Ã‚Â -->
@@ -416,7 +416,7 @@
                         <div class="mb-3">
                             <label class="form-label">Camera (tự động)</label>
                             <video id="vision-preview" class="w-100 rounded border" autoplay playsinline muted style="display: none;"></video>
-                            <div id="vision-placeholder" class="border rounded p-3 text-muted small">Camera bật tự động sau khi tải trang. Giữ mic: chụp khung hình và gửi tới Vision/Máy B ngay khi nhấn.</div>
+                            <div id="vision-placeholder" class="border rounded p-3 text-muted small">Camera bật tự động sau khi tải trang. Khi phát hiện có người, hệ thống sẽ tự chụp khung hình và gửi tới Vision/Máy B.</div>
                             <div class="d-flex gap-2 mt-2">
                                 <button class="btn btn-outline-secondary" id="btn_stop_camera" type="button" disabled>Tắt camera</button>
                             </div>
@@ -448,6 +448,8 @@
             let nobleConfig = null;
             let ragSessionId = '';
             let visionStream = null;
+            let presenceCameraId = 'cam01';
+            let presenceStaleSec = 4.0;
 
             function localizeUiText() {
                 document.title = 'LiveTalking - Trợ lý hội thoại';
@@ -462,17 +464,17 @@
                 $('label[for=\"use-stun\"]').text('Sử dụng STUN');
                 $('#chat-tab').text('Chat');
                 $('#tts-tab').text('TTS');
-                $('#chat-messages .system-message').first().text('Hệ thống: Chọn "Bắt đầu kết nối", sau đó bạn có thể chat hoặc giữ nút mic để nói.');
+                $('#chat-messages .system-message').first().text('Hệ thống: Chọn "Bắt đầu kết nối". Mic sẽ tự bật/tắt theo presence từ Máy B.');
                 $('#chat-message').attr('placeholder', 'Nhập nội dung bạn muốn hỏi...');
                 $('#chat-form button[type=\"submit\"]').html('<i class=\"bi bi-send\"></i> Gửi');
-                $('.voice-record-label').text('Giữ để nói, thả để gửi');
+                $('.voice-record-label').html('Mic tự động theo presence từ Máy B (<span id="presence-state">chưa có tín hiệu</span>)');
                 $('label[for=\"message\"]').text('Nhập nội dung muốn đọc');
                 $('#message').attr('placeholder', 'Nhập nội dung để avatar đọc...');
                 $('#echo-form button[type=\"submit\"]').html('<i class=\"bi bi-volume-up\"></i> Phát TTS');
                 $('.card-header:contains(\"Noble RAG Workflow\")').text('Noble RAG Workflow');
                 $('#rag-session-label').text('Đang khởi tạo...');
                 $('label.form-label:contains(\"Camera\")').text('Camera (tự động)');
-                $('#vision-placeholder').text('Camera bật tự động sau khi tải trang. Giữ mic: chụp khung hình và gửi tới Vision/Máy B ngay khi nhấn.');
+                $('#vision-placeholder').text('Camera bật tự động sau khi tải trang. Khi phát hiện có người, hệ thống sẽ tự chụp khung hình và gửi tới Vision/Máy B.');
                 $('#btn_stop_camera').text('Tắt camera');
                 $('#vision-status').text('Đang khởi tạo camera…');
             }
@@ -503,6 +505,11 @@
                     throw new Error('Không đọc được cấu hình Noble RAG.');
                 }
                 nobleConfig = await configResponse.json();
+                presenceCameraId = String((nobleConfig && nobleConfig.presence_camera) || 'cam01').trim() || 'cam01';
+                const parsedPresenceStaleSec = Number((nobleConfig && nobleConfig.presence_stale_sec) || 4.0);
+                if (Number.isFinite(parsedPresenceStaleSec) && parsedPresenceStaleSec > 0) {
+                    presenceStaleSec = parsedPresenceStaleSec;
+                }
 
                 const sessionResponse = await fetch('/noble/session', { method: 'POST' });
                 if (!sessionResponse.ok) {
@@ -512,7 +519,7 @@
                 const sessionData = await sessionResponse.json();
                 ragSessionId = sessionData.session_id || '';
                 renderRagSessionId();
-                setVisionStatus('Đã sẵn sàng. Camera sẽ bật tự động; khi giữ mic, ảnh gửi Vision/Máy B ngay.');
+                setVisionStatus('Đã sẵn sàng. Mic sẽ tự động bật/tắt theo presence từ Máy B.');
             }
 
             function ensureRagSessionId() {
@@ -707,7 +714,7 @@
                 preview.style.display = 'block';
                 $('#vision-placeholder').hide();
                 $('#btn_stop_camera').prop('disabled', false);
-                setVisionStatus('Camera đã bật. Giữ mic để gửi ảnh tới Vision/Máy B ngay lúc nhấn.');
+                setVisionStatus('Camera đã bật. Đang chờ tín hiệu presence từ Máy B để tự bật mic.');
             }
 
             function stopVisionCamera() {
@@ -724,6 +731,10 @@
             }
 
             window.addEventListener('beforeunload', function() {
+                if (autoMicPollTimer) {
+                    clearInterval(autoMicPollTimer);
+                    autoMicPollTimer = null;
+                }
                 stopVisionCamera();
             });
 
@@ -946,11 +957,332 @@
             let mediaRecorder;
             let audioChunks = [];
             let isRecording = false;
+            let isStartingRecording = false;
+            let autoMicPollTimer = null;
+            let lastPresenceSignal = null;
+            let presenceStableCount = 0;
+            let presenceErrorCount = 0;
             let pendingMicImageBase64 = '';
             let pendingVisionIdentifyPromise = null;
             let recordingStartedAtMs = 0;
             let stopRetryTimer = null;
-            const MIN_RECORD_MS = 500;
+            let autoSegmentStopTimer = null;
+            let micAudioContext = null;
+            let micAnalyser = null;
+            let micSourceNode = null;
+            let micMonitorRaf = null;
+            let micSilenceSinceMs = 0;
+            let micQuerySending = false;
+            let micSpeechActive = false;
+            let micSpeechStartedAtMs = 0;
+            let micLastSpeechAtMs = 0;
+            let micNoiseFloor = 0.008;
+            const MIN_RECORD_MS = 900;
+            const PRESENCE_POLL_MS = 3000;
+            const PRESENCE_STABLE_REQUIRED = 2;
+            const PRESENCE_STALE_HARD_STOP_SEC = 20;
+            const PRESENCE_ERROR_HARD_STOP_COUNT = 5;
+            const MIC_SILENCE_STOP_MS = 1500;
+            const MIC_SPEECH_RMS_THRESHOLD = 0.02;
+            const MIC_DYNAMIC_MARGIN = 0.012;
+            const MIC_NOISE_FLOOR_ALPHA = 0.05;
+            const MIC_MIN_SPEECH_MS = 300;
+            const MIC_MIN_AUDIO_BLOB_BYTES = 1400;
+            const MIC_GREETING_TEXT = 'Sunny xin chào ạ';
+
+            function getCurrentSessionId() {
+                return parseInt(document.getElementById('sessionid').value, 10);
+            }
+
+            function sendMicActivatedGreeting() {
+                fetch('/human', {
+                    body: JSON.stringify({
+                        text: MIC_GREETING_TEXT,
+                        type: 'echo',
+                        interrupt: true,
+                        sessionid: getCurrentSessionId(),
+                    }),
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    method: 'POST'
+                }).catch(function(error) {
+                    console.warn('Mic greeting failed:', error);
+                });
+
+                addChatMessage(MIC_GREETING_TEXT, 'system');
+            }
+
+            async function processRecognizedQueryText(recognizedText) {
+                $('#chat-message').val(recognizedText);
+                const imageForThisTurn = pendingMicImageBase64;
+                pendingMicImageBase64 = '';
+                sendChatMessage(
+                    recognizedText,
+                    recognizedText,
+                    {
+                        imageBase64: imageForThisTurn,
+                        autoCapture: !imageForThisTurn,
+                    }
+                ).catch(function(error) {
+                    console.error(error);
+                    addChatMessage('Không gửi được transcript: thiếu khung hình camera browser hoặc chưa cấp quyền camera.', 'system');
+                });
+                addChatMessage(recognizedText, 'user');
+                $('#chat-message').val('');
+            }
+
+            async function flushAudioBufferToLLM(reason) {
+                if (micQuerySending) {
+                    return;
+                }
+                if (!audioChunks.length) {
+                    return;
+                }
+
+                micQuerySending = true;
+                try {
+                    if (mediaRecorder && mediaRecorder.state === 'recording') {
+                        try {
+                            mediaRecorder.requestData();
+                        } catch (e) {
+                            console.warn('requestData failed before flush:', e);
+                        }
+                        await delay(120);
+                    }
+
+                    const chunksToProcess = audioChunks.slice();
+                    audioChunks = [];
+                    if (!chunksToProcess.length) {
+                        return;
+                    }
+
+                    const audioBlob = new Blob(chunksToProcess, { type: (mediaRecorder && mediaRecorder.mimeType) || 'audio/webm' });
+                    if (audioBlob.size < MIC_MIN_AUDIO_BLOB_BYTES) {
+                        return;
+                    }
+
+                    if (pendingVisionIdentifyPromise) {
+                        try {
+                            await pendingVisionIdentifyPromise;
+                        } catch (e) {
+                            console.warn('Vision identify await:', e);
+                        }
+                        pendingVisionIdentifyPromise = null;
+                    }
+
+                    const recognizedText = await transcribeWithWhisperService(audioBlob);
+                    if (!recognizedText) {
+                        console.debug('Flush skipped empty transcript:', reason);
+                        return;
+                    }
+                    await processRecognizedQueryText(recognizedText);
+                } catch (error) {
+                    console.error('Whisper/LLM flush error:', error);
+                    addChatMessage('Không nhận diện được giọng nói bằng Whisper service.', 'system');
+                } finally {
+                    micQuerySending = false;
+                }
+            }
+
+            function teardownMicLevelMonitor() {
+                if (micMonitorRaf) {
+                    cancelAnimationFrame(micMonitorRaf);
+                    micMonitorRaf = null;
+                }
+                if (micSourceNode) {
+                    try {
+                        micSourceNode.disconnect();
+                    } catch (e) {
+                        console.warn('micSourceNode.disconnect failed:', e);
+                    }
+                    micSourceNode = null;
+                }
+                micAnalyser = null;
+                micSilenceSinceMs = 0;
+                micSpeechActive = false;
+                micSpeechStartedAtMs = 0;
+                micLastSpeechAtMs = 0;
+                micNoiseFloor = 0.008;
+                if (micAudioContext) {
+                    try {
+                        micAudioContext.close();
+                    } catch (e) {
+                        console.warn('micAudioContext.close failed:', e);
+                    }
+                    micAudioContext = null;
+                }
+            }
+
+            function startMicSilenceMonitor(stream, source) {
+                if (!String(source || '').startsWith('presence')) {
+                    return;
+                }
+                const AudioCtx = window.AudioContext || window.webkitAudioContext;
+                if (!AudioCtx) {
+                    return;
+                }
+                try {
+                    micAudioContext = new AudioCtx();
+                    micAnalyser = micAudioContext.createAnalyser();
+                    micAnalyser.fftSize = 2048;
+                    micSourceNode = micAudioContext.createMediaStreamSource(stream);
+                    micSourceNode.connect(micAnalyser);
+
+                    const data = new Uint8Array(micAnalyser.fftSize);
+                    const tick = function() {
+                        if (!isRecording || !mediaRecorder || mediaRecorder.state !== 'recording') {
+                            return;
+                        }
+                        micAnalyser.getByteTimeDomainData(data);
+                        let sumSq = 0;
+                        for (let i = 0; i < data.length; i += 1) {
+                            const v = (data[i] - 128) / 128;
+                            sumSq += v * v;
+                        }
+                        const rms = Math.sqrt(sumSq / data.length);
+                        const now = Date.now();
+
+                        const floorCandidate = Math.min(rms, micNoiseFloor + 0.01);
+                        micNoiseFloor =
+                            (1 - MIC_NOISE_FLOOR_ALPHA) * micNoiseFloor +
+                            MIC_NOISE_FLOOR_ALPHA * floorCandidate;
+                        const dynamicThreshold = Math.max(
+                            MIC_SPEECH_RMS_THRESHOLD,
+                            micNoiseFloor + MIC_DYNAMIC_MARGIN
+                        );
+                        const isSpeaking = rms >= dynamicThreshold;
+
+                        if (isSpeaking) {
+                            if (!micSpeechActive) {
+                                micSpeechActive = true;
+                                micSpeechStartedAtMs = now;
+                            }
+                            micLastSpeechAtMs = now;
+                            micSilenceSinceMs = 0;
+                        } else if (!micSilenceSinceMs) {
+                            micSilenceSinceMs = now;
+                        } else if (
+                            micSpeechActive &&
+                            now - micSilenceSinceMs >= MIC_SILENCE_STOP_MS &&
+                            micLastSpeechAtMs > 0 &&
+                            micLastSpeechAtMs - micSpeechStartedAtMs >= MIC_MIN_SPEECH_MS
+                        ) {
+                            micSpeechActive = false;
+                            micSpeechStartedAtMs = 0;
+                            micLastSpeechAtMs = 0;
+                            flushAudioBufferToLLM('presence-idle-silence').catch(function(e) {
+                                console.warn('flushAudioBufferToLLM failed:', e);
+                            });
+                        }
+                        micMonitorRaf = requestAnimationFrame(tick);
+                    };
+
+                    micMonitorRaf = requestAnimationFrame(tick);
+                } catch (error) {
+                    console.warn('Unable to start mic silence monitor:', error);
+                    teardownMicLevelMonitor();
+                }
+            }
+
+            function updatePresenceStateLabel(hasPerson, options = {}) {
+                const stale = Boolean(options.stale);
+                const disconnected = Boolean(options.disconnected);
+                const notLooking = Boolean(options.notLooking);
+                const label = $('#presence-state');
+                if (!label.length) {
+                    return;
+                }
+                if (disconnected) {
+                    label.text('mất kết nối');
+                    return;
+                }
+                if (stale) {
+                    label.text('không có tín hiệu mới');
+                    return;
+                }
+                if (notLooking) {
+                    label.text('có người nhưng chưa nhìn camera');
+                    return;
+                }
+                label.text(hasPerson ? 'có người' : 'không có người');
+            }
+
+            async function fetchLatestPresence() {
+                const response = await fetch(`/noble/vision/presence/latest?camera=${encodeURIComponent(presenceCameraId)}`, {
+                    method: 'GET',
+                    cache: 'no-store',
+                });
+                const payload = await response.json();
+                if (!response.ok) {
+                    throw new Error(payload.detail || 'Không đọc được presence từ Máy B.');
+                }
+                return payload;
+            }
+
+            function applyPresenceToAutoMic(hasPerson) {
+                if (lastPresenceSignal === hasPerson) {
+                    presenceStableCount += 1;
+                } else {
+                    lastPresenceSignal = hasPerson;
+                    presenceStableCount = 1;
+                }
+
+                if (presenceStableCount < PRESENCE_STABLE_REQUIRED) {
+                    return;
+                }
+
+                if (hasPerson) {
+                    if (!isRecording && !isStartingRecording) {
+                        startRecording('presence');
+                    }
+                    return;
+                }
+
+                if (isRecording) {
+                    stopRecording('presence');
+                }
+            }
+
+            function startPresenceAutoMicPolling() {
+                if (autoMicPollTimer) {
+                    return;
+                }
+
+                const tick = async function() {
+                    try {
+                        const payload = await fetchLatestPresence();
+                        presenceErrorCount = 0;
+                        console.debug('presence payload', payload);
+                        const staleByServer = Boolean(payload.stale);
+                        const ageSec = Number(payload.age_sec);
+                        const staleByAge = Number.isFinite(ageSec) ? ageSec > presenceStaleSec : true;
+                        const stale = staleByServer || staleByAge;
+                        const notLooking = String(payload.decision_reason || '') === 'person_not_looking_at_camera';
+                        const hasPerson = !stale && Boolean(payload.has_person || payload.co_nguoi);
+
+                        updatePresenceStateLabel(hasPerson, { stale: stale, disconnected: false, notLooking: notLooking });
+                        if (stale) {
+                            if (isRecording && Number.isFinite(ageSec) && ageSec > PRESENCE_STALE_HARD_STOP_SEC) {
+                                stopRecording('presence-timeout');
+                            }
+                            return;
+                        }
+
+                        applyPresenceToAutoMic(hasPerson);
+                    } catch (error) {
+                        presenceErrorCount += 1;
+                        console.warn('Presence polling error:', error);
+                        updatePresenceStateLabel(false, { stale: false, disconnected: true });
+                        if (isRecording && presenceErrorCount >= PRESENCE_ERROR_HARD_STOP_COUNT) {
+                            stopRecording('presence-error');
+                        }
+                    }
+                };
+
+                tick();
+                autoMicPollTimer = setInterval(tick, PRESENCE_POLL_MS);
+            }
 
             async function transcribeWithWhisperService(audioBlob) {
                 const formData = new FormData();
@@ -977,19 +1309,16 @@
                 throw new Error(lastDetail || 'Whisper service transcribe failed');
             }
 
-            $('#voice-record-btn').on('mousedown touchstart', function(e) {
-                e.preventDefault();
-                startRecording();
-            }).on('mouseup mouseleave touchend', function() {
-                if (isRecording) {
-                    stopRecording();
-                }
-            });
-
-            function startRecording() {
-                if (isRecording) return;
+            function startRecording(source) {
+                if (isRecording || isStartingRecording) return;
+                isStartingRecording = true;
                 pendingMicImageBase64 = '';
                 pendingVisionIdentifyPromise = null;
+                teardownMicLevelMonitor();
+                if (autoSegmentStopTimer) {
+                    clearTimeout(autoSegmentStopTimer);
+                    autoSegmentStopTimer = null;
+                }
                 if (stopRetryTimer) {
                     clearTimeout(stopRetryTimer);
                     stopRetryTimer = null;
@@ -1024,7 +1353,14 @@
                     }
                 })();
 
-                navigator.mediaDevices.getUserMedia({ audio: true })
+                navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        channelCount: 1,
+                        noiseSuppression: true,
+                        echoCancellation: true,
+                        autoGainControl: true,
+                    }
+                })
                     .then(function(stream) {
                         audioChunks = [];
                         const preferredMime = (
@@ -1042,66 +1378,33 @@
                         };
 
                         mediaRecorder.onstop = async function() {
-                            try {
-                                if (!audioChunks.length) {
-                                    return;
-                                }
-                                const audioBlob = new Blob(audioChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
-                                if (audioBlob.size < 1024) {
-                                    addChatMessage('Đoạn ghi âm quá ngắn, bạn giữ mic lâu hơn giúp mình nhé.', 'system');
-                                    return;
-                                }
-                                if (pendingVisionIdentifyPromise) {
-                                    try {
-                                        await pendingVisionIdentifyPromise;
-                                    } catch (e) {
-                                        console.warn('Vision identify await:', e);
-                                    }
-                                    pendingVisionIdentifyPromise = null;
-                                }
-                                const recognizedText = await transcribeWithWhisperService(audioBlob);
-                                if (!recognizedText) {
-                                    addChatMessage('Whisper service không nhận được nội dung, bạn nói chậm và rõ hơn giúp mình nhé.', 'system');
-                                    return;
-                                }
-
-                                $('#chat-message').val(recognizedText);
-                                const imageForThisTurn = pendingMicImageBase64;
-                                pendingMicImageBase64 = '';
-                                sendChatMessage(
-                                    recognizedText,
-                                    recognizedText,
-                                    {
-                                        imageBase64: imageForThisTurn,
-                                        autoCapture: !imageForThisTurn,
-                                    }
-                                ).catch(function(error) {
-                                    console.error(error);
-                                    addChatMessage('Không gửi được transcript: thiếu khung hình camera browser hoặc chưa cấp quyền camera.', 'system');
-                                });
-                                addChatMessage(recognizedText, 'user');
-                                $('#chat-message').val('');
-                            } catch (error) {
-                                console.error('Whisper service transcribe error:', error);
-                                addChatMessage('Không nhận diện được giọng nói bằng Whisper service.', 'system');
-                            }
+                            await flushAudioBufferToLLM('recorder-stop');
                         };
 
                         mediaRecorder.start(250);
                         isRecording = true;
+                        isStartingRecording = false;
                         recordingStartedAtMs = Date.now();
+                        sendMicActivatedGreeting();
+                        startMicSilenceMonitor(stream, source);
 
                         $('#voice-record-btn').addClass('recording-pulse');
                         $('#voice-record-btn').css('background-color', '#dc3545');
                     })
                     .catch(function(error) {
+                        isStartingRecording = false;
                         console.error('Unable to access microphone:', error);
                         alert('Không thể truy cập microphone. Vui lòng kiểm tra quyền trình duyệt.');
                     });
             }
 
-            function stopRecording() {
+            function stopRecording(source) {
                 if (!isRecording) return;
+                if (autoSegmentStopTimer) {
+                    clearTimeout(autoSegmentStopTimer);
+                    autoSegmentStopTimer = null;
+                }
+                teardownMicLevelMonitor();
                 const elapsed = Date.now() - recordingStartedAtMs;
                 if (elapsed < MIN_RECORD_MS) {
                     if (stopRetryTimer) {
@@ -1177,6 +1480,8 @@
                     console.error('WebRTCÃƒÂ¦Ã¢â‚¬â„¢Ã‚Â­ÃƒÂ¦Ã¢â‚¬ÂÃ‚Â¾ÃƒÂ¥Ã‚Â¤Ã‚Â±ÃƒÂ¨Ã‚Â´Ã‚Â¥:', reason);
                 });
             }
+
+            startPresenceAutoMicPolling();
         });
     </script>
 </body>

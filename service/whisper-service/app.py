@@ -1,52 +1,45 @@
-"""
-Faster-Whisper HTTP API Service
---------------------------------
-Endpoints:
-  POST /transcribe   - Upload audio file, receive full transcript
-  POST /transcribe/stream - Upload audio, receive SSE stream of segments
-  GET  /health       - Health check
-  GET  /models       - List available model sizes
-"""
+"""Faster-Whisper STT HTTP API Service."""
 
-import io
-import os
-import time
+import json
 import logging
+import os
+import subprocess
 import tempfile
-from typing import Optional, Generator
+import threading
+import time
+from typing import Generator, Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
+from faster_whisper import WhisperModel
 from pydantic import BaseModel
 
-from faster_whisper import WhisperModel
 
-# ── Config via env vars ────────────────────────────────────────────────
-MODEL_SIZE   = os.getenv("WHISPER_MODEL",    "base")   # tiny/base/small/medium/large-v3
-DEVICE       = os.getenv("WHISPER_DEVICE",   "cpu")    # cpu / cuda
-COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE",  "int8")   # int8 / float16 / float32
-BEAM_SIZE    = int(os.getenv("WHISPER_BEAM", "5"))
-LOG_LEVEL    = os.getenv("LOG_LEVEL",        "INFO")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+STT_PROVIDER = os.getenv("STT_PROVIDER", "whisper")
+WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "large-v3")
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
+WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE", "float16")
+WHISPER_BEAM = int(os.getenv("WHISPER_BEAM", "5"))
 
-# ── Logging ───────────────────────────────────────────────────────────
+MODEL_SIZE = WHISPER_MODEL_NAME
+DEVICE = WHISPER_DEVICE
+COMPUTE_TYPE = WHISPER_COMPUTE
+
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("whisper-service")
 
-# ── Load model once at startup ─────────────────────────────────────────
-log.info(f"Loading model '{MODEL_SIZE}' on device='{DEVICE}' compute='{COMPUTE_TYPE}' ...")
-_model_load_start = time.perf_counter()
-model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
-_model_load_time = time.perf_counter() - _model_load_start
-log.info(f"Model loaded in {_model_load_time:.2f}s")
+_app_start = time.perf_counter()
+_model: Optional[WhisperModel] = None
+_model_lock = threading.Lock()
 
-# ── FastAPI app ────────────────────────────────────────────────────────
 app = FastAPI(
-    title="Faster-Whisper API",
+    title="Faster-Whisper STT API",
     description="Speech-to-text service powered by faster-whisper",
-    version="1.0.0",
+    version="2.2.0",
 )
 
 ALLOWED_EXTENSIONS = {
@@ -54,10 +47,7 @@ ALLOWED_EXTENSIONS = {
     ".webm", ".mkv", ".opus", ".aac",
 }
 
-AVAILABLE_MODELS = ["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3"]
 
-
-# ── Response schemas ───────────────────────────────────────────────────
 class WordToken(BaseModel):
     word: str
     start: float
@@ -74,6 +64,7 @@ class Segment(BaseModel):
 
 
 class TranscribeResponse(BaseModel):
+    text: str
     language: str
     language_probability: float
     duration: float
@@ -83,10 +74,29 @@ class TranscribeResponse(BaseModel):
     elapsed_seconds: float
 
 
-# ── Helpers ────────────────────────────────────────────────────────────
+def _get_model() -> WhisperModel:
+    global _model
+    if _model is not None:
+        return _model
+
+    with _model_lock:
+        if _model is not None:
+            return _model
+        log.info(
+            "Loading faster-whisper model=%s device=%s compute_type=%s",
+            WHISPER_MODEL_NAME,
+            WHISPER_DEVICE,
+            WHISPER_COMPUTE,
+        )
+        _model = WhisperModel(
+            WHISPER_MODEL_NAME,
+            device=WHISPER_DEVICE,
+            compute_type=WHISPER_COMPUTE,
+        )
+        return _model
+
 
 def _save_upload(upload: UploadFile) -> str:
-    """Save uploaded file to a temp path and return the path."""
     suffix = os.path.splitext(upload.filename or "audio")[1].lower() or ".wav"
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(
@@ -103,59 +113,102 @@ def _save_upload(upload: UploadFile) -> str:
         tmp.close()
 
 
-def _transcribe(
+def _audio_duration_seconds(path: str) -> float:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8", errors="ignore").strip()
+        return round(float(out), 3) if out else 0.0
+    except Exception:
+        return 0.0
+
+
+def _normalize_transcript_text(text: str) -> str:
+    raw = str(text or "")
+    if not raw:
+        return ""
+    raw = raw.replace("\ufffd", "")
+    raw = " ".join(raw.split())
+    return raw
+
+
+def _run_whisper_transcribe(
     audio_path: str,
     language: Optional[str],
     word_timestamps: bool,
-) -> tuple:
-    """Run faster-whisper transcription and return (segments_list, info)."""
+    vad_filter: Optional[bool],
+) -> tuple[list[Segment], str, float, str, float]:
+    model = _get_model()
     segments_iter, info = model.transcribe(
-        audio_path,
-        language=language or None,
-        beam_size=BEAM_SIZE,
-        word_timestamps=word_timestamps,
+        audio=audio_path,
+        language=(language or None),
+        beam_size=max(1, WHISPER_BEAM),
+        word_timestamps=bool(word_timestamps),
+        vad_filter=(False if vad_filter is None else bool(vad_filter)),
     )
-    segments = []
-    for i, seg in enumerate(segments_iter):
+
+    segments: list[Segment] = []
+    full_text_parts: list[str] = []
+
+    for idx, seg in enumerate(segments_iter):
+        txt = _normalize_transcript_text(seg.text)
+        if txt:
+            full_text_parts.append(txt)
         words = None
-        if word_timestamps and seg.words:
+        if word_timestamps and getattr(seg, "words", None):
             words = [
                 WordToken(
-                    word=w.word,
-                    start=round(w.start, 3),
-                    end=round(w.end, 3),
-                    probability=round(w.probability, 4),
+                    word=str(w.word or ""),
+                    start=float(w.start or 0.0),
+                    end=float(w.end or 0.0),
+                    probability=float(w.probability or 0.0),
                 )
                 for w in seg.words
             ]
+
         segments.append(
             Segment(
-                id=i,
-                start=round(seg.start, 3),
-                end=round(seg.end, 3),
-                text=seg.text.strip(),
+                id=idx,
+                start=float(seg.start or 0.0),
+                end=float(seg.end or 0.0),
+                text=txt,
                 words=words,
             )
         )
-    return segments, info
 
+    transcript = _normalize_transcript_text(" ".join(full_text_parts))
+    language_detected = str(getattr(info, "language", "") or language or "auto")
+    language_prob = float(getattr(info, "language_probability", 0.0) or 0.0)
+    return segments, transcript, language_prob, language_detected, float(getattr(info, "duration", 0.0) or 0.0)
 
-# ── Routes ─────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
     return {
         "status": "ok",
-        "model": MODEL_SIZE,
+        "provider": STT_PROVIDER,
+        "model": WHISPER_MODEL_NAME,
         "device": DEVICE,
         "compute_type": COMPUTE_TYPE,
-        "model_load_seconds": round(_model_load_time, 2),
+        "uptime_seconds": round(time.perf_counter() - _app_start, 2),
     }
 
 
 @app.get("/models")
 async def list_models():
-    return {"available": AVAILABLE_MODELS, "loaded": MODEL_SIZE}
+    return {
+        "provider": STT_PROVIDER,
+        "loaded": WHISPER_MODEL_NAME,
+        "available": [WHISPER_MODEL_NAME],
+    }
 
 
 @app.post("/transcribe", response_model=TranscribeResponse)
@@ -163,29 +216,35 @@ async def transcribe(
     file: UploadFile = File(...),
     language: Optional[str] = Form(None),
     word_timestamps: bool = Form(False),
+    vad_filter: Optional[bool] = Form(None),
 ):
-    """
-    Upload an audio file and receive the full transcription as JSON.
-
-    - **file**: Audio file (wav, mp3, m4a, flac, ogg, webm…)
-    - **language**: Force language code e.g. `vi`, `en`. Leave empty for auto-detect.
-    - **word_timestamps**: Include per-word timestamps when `true`.
-    """
     tmp_path = _save_upload(file)
     try:
+        duration = _audio_duration_seconds(tmp_path)
         t0 = time.perf_counter()
-        segments, info = _transcribe(tmp_path, language, word_timestamps)
+        segments, transcript, lang_prob, language_detected, inferred_duration = _run_whisper_transcribe(
+            tmp_path,
+            language,
+            word_timestamps,
+            vad_filter,
+        )
         elapsed = time.perf_counter() - t0
+        final_duration = duration if duration > 0 else round(inferred_duration, 3)
 
         log.info(
-            f"Transcribed '{file.filename}' lang={info.language} "
-            f"({info.duration:.1f}s audio) in {elapsed:.2f}s"
+            "Transcribed '%s' model=%s duration=%.2fs in %.2fs text=%r",
+            file.filename,
+            WHISPER_MODEL_NAME,
+            final_duration,
+            elapsed,
+            transcript[:120],
         )
 
         return TranscribeResponse(
-            language=info.language,
-            language_probability=round(info.language_probability, 4),
-            duration=round(info.duration, 3),
+            text=transcript,
+            language=language_detected,
+            language_probability=lang_prob,
+            duration=final_duration,
             model=MODEL_SIZE,
             device=DEVICE,
             segments=segments,
@@ -208,54 +267,45 @@ async def transcribe_stream(
     file: UploadFile = File(...),
     language: Optional[str] = Form(None),
     word_timestamps: bool = Form(False),
+    vad_filter: Optional[bool] = Form(None),
 ):
-    """
-    Same as /transcribe but streams segments as Server-Sent Events (SSE).
-
-    Each event is a JSON object for one segment so you can display partial
-    results while the audio is still being processed.
-    """
     tmp_path = _save_upload(file)
 
     def generate() -> Generator[str, None, None]:
         try:
-            segments_iter, info = model.transcribe(
+            duration = _audio_duration_seconds(tmp_path)
+            segments, transcript, lang_prob, language_detected, inferred_duration = _run_whisper_transcribe(
                 tmp_path,
-                language=language or None,
-                beam_size=BEAM_SIZE,
-                word_timestamps=word_timestamps,
+                language,
+                word_timestamps,
+                vad_filter,
             )
-            # Send metadata first
-            import json
-            meta = json.dumps({
-                "event": "meta",
-                "language": info.language,
-                "language_probability": round(info.language_probability, 4),
-                "duration": round(info.duration, 3),
-            })
+
+            meta = json.dumps(
+                {
+                    "event": "meta",
+                    "language": language_detected,
+                    "language_probability": lang_prob,
+                    "duration": duration if duration > 0 else inferred_duration,
+                    "model": WHISPER_MODEL_NAME,
+                }
+            )
             yield f"data: {meta}\n\n"
 
-            for i, seg in enumerate(segments_iter):
-                words = None
-                if word_timestamps and seg.words:
-                    words = [
-                        {"word": w.word, "start": round(w.start, 3),
-                         "end": round(w.end, 3), "probability": round(w.probability, 4)}
-                        for w in seg.words
-                    ]
-                payload = json.dumps({
+            for seg in segments:
+                payload = {
                     "event": "segment",
-                    "id": i,
-                    "start": round(seg.start, 3),
-                    "end": round(seg.end, 3),
-                    "text": seg.text.strip(),
-                    "words": words,
-                })
-                yield f"data: {payload}\n\n"
+                    "id": seg.id,
+                    "start": seg.start,
+                    "end": seg.end,
+                    "text": seg.text,
+                    "words": [w.model_dump(mode="python") for w in seg.words] if seg.words else None,
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
 
-            yield 'data: {"event": "done"}\n\n'
+            done = json.dumps({"event": "done", "text": transcript})
+            yield f"data: {done}\n\n"
         except Exception as exc:
-            import json
             yield f'data: {json.dumps({"event": "error", "detail": str(exc)})}\n\n'
         finally:
             try:

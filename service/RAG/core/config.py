@@ -61,6 +61,14 @@ class Settings(BaseSettings):
     search_fallback_on_empty_rag: bool = True
     enable_kb_chat_refactor: bool = False
     enable_cosine_search_fallback: bool = True
+    enable_human_loop_search_approval: bool = True
+    human_loop_search_cosine_threshold: float = 0.4
+    enable_reranker: bool = True
+    reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    reranker_device: str = "cpu"
+    reranker_candidate_limit: int = 20
+    reranker_weight_default: float = 0.35
+    reranker_weight_compare_quant: float = 0.60
     enable_unified_chat_response: bool = False
     enable_legacy_router: bool = True
     kb_search_score_threshold: float = 0.5
@@ -86,6 +94,13 @@ class Settings(BaseSettings):
     machine_b_base_url: str = ""
     machine_b_timeout_sec: float = 8.0
     machine_b_api_key: str = ""
+    machine_b_force_update: bool = True
+    machine_b_presence_latest_path: str = "/api/v1/vision/presence/{camera}"
+    machine_b_presence_status_path: str = "/api/v1/vision/status"
+    machine_b_presence_camera_path: str = "/api/v1/vision/presence/{camera}"
+    machine_b_presence_camera: str = "cam01"
+    machine_b_presence_poll_interval_sec: float = 2.0
+    machine_a_ingest_secret: str = ""
     vision_face_delete_token: str = ""
     chat_history_purge_token: str = ""
     # Khi false: purge-all chỉ xóa Redis/snapshot, không gọi Máy B xóa embedding (ghi đè query notify_machine_b).

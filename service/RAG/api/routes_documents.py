@@ -1,6 +1,10 @@
 import json
+import os
+import re
 import time
+import uuid
 from typing import Optional
+import logging
 
 import asyncpg
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -8,11 +12,32 @@ from fastapi.responses import JSONResponse
 
 from core.config import get_settings
 from core.dependencies import rag
+from memory.pipeline_store import ensure_pipeline_schema, upsert_document_metadata
 from models.api_models import StorageType, UploadDocumentResponse
 from sales.nodes.retrieve_context import refresh_retrieval_caches
 
 router = APIRouter(tags=["documents"])
 settings = get_settings()
+log = logging.getLogger("rag-service")
+
+
+def _slugify_filename(name: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "_", name or "upload.bin").strip("._")
+    return cleaned or "upload.bin"
+
+
+def _extract_ingest_metadata(raw_metadata: Optional[str]) -> dict:
+    metadata: dict = {}
+    if not raw_metadata:
+        return metadata
+    try:
+        parsed = json.loads(raw_metadata)
+    except json.JSONDecodeError as exc:
+        log.warning("upload_document: invalid metadata JSON ignored: %s", exc)
+        return metadata
+    if isinstance(parsed, dict):
+        metadata.update(parsed)
+    return metadata
 
 
 @router.post("/upload-document", response_model=UploadDocumentResponse)
@@ -23,6 +48,7 @@ async def upload_document(
 ):
     start = time.perf_counter()
     try:
+        await ensure_pipeline_schema()
         content = await file.read()
         try:
             text_content = content.decode("utf-8")
@@ -32,21 +58,36 @@ async def upload_document(
         if not text_content.strip():
             raise HTTPException(status_code=400, detail="File is empty")
 
-        doc_metadata: dict = {}
-        if metadata:
-            try:
-                parsed = json.loads(metadata)
-                if isinstance(parsed, dict):
-                    doc_metadata.update(parsed)
-            except json.JSONDecodeError:
-                raise HTTPException(status_code=400, detail="Invalid JSON metadata")
+        doc_metadata = _extract_ingest_metadata(metadata)
 
         doc_metadata["filename"] = file.filename
         doc_metadata["upload_timestamp"] = time.time()
 
-        document_id = await rag.ainsert(text_content, file_paths=file.filename)
+        project_id = str(doc_metadata.get("project_id") or "default_project").strip()
+        collection = str(doc_metadata.get("collection") or settings.knowledge_collection_name).strip()
+        document_type = str(doc_metadata.get("document_type") or "general").strip()
+        source_name = str(doc_metadata.get("source_name") or file.filename or "").strip() or None
+
+        cleaned_name = _slugify_filename(file.filename or f"upload_{uuid.uuid4().hex[:10]}.txt")
+        document_id = await rag.ainsert(text_content, file_paths=cleaned_name)
+        storage_path = os.path.join(settings.rag_working_dir, "assets", "knowledge", f"{document_id}_{cleaned_name}")
+        os.makedirs(os.path.dirname(storage_path), exist_ok=True)
+        with open(storage_path, "wb") as fh:
+            fh.write(content)
+
         await refresh_retrieval_caches()
         chunks_count = max(1, len(text_content) // settings.chunk_size)
+        await upsert_document_metadata(
+            document_id=document_id,
+            collection_name=collection,
+            project_id=project_id,
+            document_type=document_type,
+            file_name=source_name or cleaned_name,
+            storage_url=storage_path,
+            chunk_count=chunks_count,
+            ingest_status="indexed",
+        )
+
         elapsed = time.perf_counter() - start
 
         return UploadDocumentResponse(
