@@ -81,6 +81,8 @@ class Settings(BaseSettings):
 
     # Tools
     tavily_api_key: str = ""
+    tavily_allowed_domains: str = "https://cafef.vn/,https://batdongsan.com.vn/"
+    tavily_max_sources: int = 2
 
     # App
     log_level: str = "INFO"

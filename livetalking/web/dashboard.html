@@ -368,7 +368,7 @@
                             <!-- ÃƒÂ¥Ã‚Â¯Ã‚Â¹ÃƒÂ¨Ã‚Â¯Ã‚ÂÃƒÂ¦Ã‚Â¨Ã‚Â¡ÃƒÂ¥Ã‚Â¼Ã‚Â -->
                             <div class="tab-pane fade show active" id="chat" role="tabpanel" aria-labelledby="chat-tab">
                                 <div class="asr-container mb-3" id="chat-messages">
-                                    <div class="asr-text system-message">Hệ thống: Chọn "Bắt đầu kết nối". Mic sẽ tự bật/tắt theo presence từ Máy B.</div>
+                                    <div class="asr-text system-message">Hệ thống: Chọn "Bắt đầu kết nối", sau đó bấm giữ nút mic để nói và thả ra để gửi.</div>
                                 </div>
                                 
                                 <form id="chat-form">
@@ -384,7 +384,7 @@
                                 <div class="voice-record-btn" id="voice-record-btn">
                                     <i class="bi bi-mic-fill"></i>
                                 </div>
-                                <div class="voice-record-label">Mic tự động theo presence từ Máy B (<span id="presence-state">chưa có tín hiệu</span>)</div>
+                                <div class="voice-record-label">Bấm giữ nút mic để nói, thả ra để gửi query.</div>
                             </div>
                             
                             <!-- ÃƒÂ¦Ã…â€œÃ¢â‚¬â€ÃƒÂ¨Ã‚Â¯Ã‚Â»ÃƒÂ¦Ã‚Â¨Ã‚Â¡ÃƒÂ¥Ã‚Â¼Ã‚Â -->
@@ -464,10 +464,10 @@
                 $('label[for=\"use-stun\"]').text('Sử dụng STUN');
                 $('#chat-tab').text('Chat');
                 $('#tts-tab').text('TTS');
-                $('#chat-messages .system-message').first().text('Hệ thống: Chọn "Bắt đầu kết nối". Mic sẽ tự bật/tắt theo presence từ Máy B.');
+                $('#chat-messages .system-message').first().text('Hệ thống: Chọn "Bắt đầu kết nối", sau đó bấm giữ nút mic để nói và thả ra để gửi.');
                 $('#chat-message').attr('placeholder', 'Nhập nội dung bạn muốn hỏi...');
                 $('#chat-form button[type=\"submit\"]').html('<i class=\"bi bi-send\"></i> Gửi');
-                $('.voice-record-label').html('Mic tự động theo presence từ Máy B (<span id="presence-state">chưa có tín hiệu</span>)');
+                $('.voice-record-label').text('Bấm giữ nút mic để nói, thả ra để gửi query.');
                 $('label[for=\"message\"]').text('Nhập nội dung muốn đọc');
                 $('#message').attr('placeholder', 'Nhập nội dung để avatar đọc...');
                 $('#echo-form button[type=\"submit\"]').html('<i class=\"bi bi-volume-up\"></i> Phát TTS');
@@ -519,7 +519,7 @@
                 const sessionData = await sessionResponse.json();
                 ragSessionId = sessionData.session_id || '';
                 renderRagSessionId();
-                setVisionStatus('Đã sẵn sàng. Mic sẽ tự động bật/tắt theo presence từ Máy B.');
+                setVisionStatus('Đã sẵn sàng. Dùng nút mic theo chế độ bấm giữ để nói.');
             }
 
             function ensureRagSessionId() {
@@ -714,7 +714,7 @@
                 preview.style.display = 'block';
                 $('#vision-placeholder').hide();
                 $('#btn_stop_camera').prop('disabled', false);
-                setVisionStatus('Camera đã bật. Đang chờ tín hiệu presence từ Máy B để tự bật mic.');
+                setVisionStatus('Camera đã bật. Sẵn sàng nhận diện và chat voice theo chế độ bấm giữ.');
             }
 
             function stopVisionCamera() {
@@ -763,6 +763,7 @@
                 const customerType = result.is_existing_customer ? 'khách cũ' : 'khách mới';
                 const matchScore = result.match_score == null ? 'n/a' : result.match_score;
                 setVisionStatus(`Vision/Máy B: ${customerType}. customer_id=${customerId}, match_score=${matchScore}`);
+                maybeSendSchemaGreeting(result);
                 return result;
             }
 
@@ -977,6 +978,8 @@
             let micSpeechStartedAtMs = 0;
             let micLastSpeechAtMs = 0;
             let micNoiseFloor = 0.008;
+            let hasSchemaGreetingPlayed = false;
+            let schemaGreetingInFlight = null;
             const MIN_RECORD_MS = 900;
             const PRESENCE_POLL_MS = 3000;
             const PRESENCE_STABLE_REQUIRED = 2;
@@ -1011,6 +1014,75 @@
                 });
 
                 addChatMessage(MIC_GREETING_TEXT, 'system');
+            }
+
+            function hasReasonableMachineBSchema(result) {
+                const context = result && typeof result === 'object' ? result.customer_context : null;
+                if (!context || typeof context !== 'object') {
+                    return false;
+                }
+
+                const leadProfile = context.lead_profile;
+                if (!leadProfile || typeof leadProfile !== 'object') {
+                    return false;
+                }
+
+                const preferredKeys = [
+                    'ho_ten',
+                    'full_name',
+                    'name',
+                    'ten',
+                    'phone',
+                    'email',
+                    'nhu_cau',
+                    'interest_summary',
+                    'budget',
+                    'customer_code',
+                    'customer_id',
+                ];
+
+                const hasPreferredValue = preferredKeys.some(function(key) {
+                    const value = leadProfile[key];
+                    if (typeof value === 'string') {
+                        return value.trim().length > 0;
+                    }
+                    if (Array.isArray(value)) {
+                        return value.length > 0;
+                    }
+                    if (value && typeof value === 'object') {
+                        return Object.keys(value).length > 0;
+                    }
+                    return value !== null && value !== undefined;
+                });
+                if (hasPreferredValue) {
+                    return true;
+                }
+
+                const nonEmptyKeys = Object.keys(leadProfile).filter(function(key) {
+                    const value = leadProfile[key];
+                    if (typeof value === 'string') {
+                        return value.trim().length > 0;
+                    }
+                    if (Array.isArray(value)) {
+                        return value.length > 0;
+                    }
+                    if (value && typeof value === 'object') {
+                        return Object.keys(value).length > 0;
+                    }
+                    return value !== null && value !== undefined;
+                });
+                return nonEmptyKeys.length >= 3;
+            }
+
+            function maybeSendSchemaGreeting(visionResult) {
+                if (hasSchemaGreetingPlayed) {
+                    return;
+                }
+                if (!hasReasonableMachineBSchema(visionResult)) {
+                    return;
+                }
+                hasSchemaGreetingPlayed = true;
+                sendMicActivatedGreeting();
             }
 
             async function processRecognizedQueryText(recognizedText) {
@@ -1233,14 +1305,26 @@
                 }
 
                 if (hasPerson) {
-                    if (!isRecording && !isStartingRecording) {
-                        startRecording('presence');
+                    if (!schemaGreetingInFlight && !hasSchemaGreetingPlayed) {
+                        schemaGreetingInFlight = (async function() {
+                            try {
+                                const imageBlob = await captureChatFrameBlob({
+                                    autoStart: true,
+                                    quality: 0.9,
+                                    previewTimeoutMs: 5000,
+                                });
+                                if (!imageBlob) {
+                                    return;
+                                }
+                                await sendVisionIdentifyWithBlob(imageBlob);
+                            } catch (error) {
+                                console.warn('Presence schema check failed:', error);
+                            } finally {
+                                schemaGreetingInFlight = null;
+                            }
+                        })();
                     }
                     return;
-                }
-
-                if (isRecording) {
-                    stopRecording('presence');
                 }
             }
 
@@ -1263,9 +1347,6 @@
 
                         updatePresenceStateLabel(hasPerson, { stale: stale, disconnected: false, notLooking: notLooking });
                         if (stale) {
-                            if (isRecording && Number.isFinite(ageSec) && ageSec > PRESENCE_STALE_HARD_STOP_SEC) {
-                                stopRecording('presence-timeout');
-                            }
                             return;
                         }
 
@@ -1274,9 +1355,6 @@
                         presenceErrorCount += 1;
                         console.warn('Presence polling error:', error);
                         updatePresenceStateLabel(false, { stale: false, disconnected: true });
-                        if (isRecording && presenceErrorCount >= PRESENCE_ERROR_HARD_STOP_COUNT) {
-                            stopRecording('presence-error');
-                        }
                     }
                 };
 
@@ -1385,7 +1463,6 @@
                         isRecording = true;
                         isStartingRecording = false;
                         recordingStartedAtMs = Date.now();
-                        sendMicActivatedGreeting();
                         startMicSilenceMonitor(stream, source);
 
                         $('#voice-record-btn').addClass('recording-pulse');
@@ -1432,6 +1509,24 @@
                 $('#voice-record-btn').removeClass('recording-pulse');
                 $('#voice-record-btn').css('background-color', '');
             }
+
+            $('#voice-record-btn').on('pointerdown', function(e) {
+                if (e.pointerType === 'mouse' && e.button !== 0) {
+                    return;
+                }
+                e.preventDefault();
+                startRecording('manual-hold');
+            });
+
+            $('#voice-record-btn').on('pointerup pointercancel pointerleave', function() {
+                stopRecording('manual-hold');
+            });
+
+            $(document).on('pointerup', function() {
+                if (isRecording) {
+                    stopRecording('manual-hold-document');
+                }
+            });
             // WebRTC ÃƒÂ§Ã¢â‚¬ÂºÃ‚Â¸ÃƒÂ¥Ã¢â‚¬Â¦Ã‚Â³ÃƒÂ¥Ã…Â Ã…Â¸ÃƒÂ¨Ã†â€™Ã‚Â½
             if (typeof window.onWebRTCConnected === 'function') {
                 const originalOnConnected = window.onWebRTCConnected;

@@ -4,9 +4,12 @@ import asyncio
 import ast
 import json
 import logging
+import os
 import random
 import re
 import time
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query
@@ -278,6 +281,169 @@ _THINKING_ACK_MESSAGES = [
 ]
 
 
+def _normalize_phone(value: str) -> str:
+    digits = re.sub(r"\D+", "", value or "")
+    if digits.startswith("84") and len(digits) >= 10:
+        digits = "0" + digits[2:]
+    return digits
+
+
+def _extract_name(text: str) -> str:
+    patterns = [
+        r"(?:m(?:i|ì|ình)nh|tôi|toi|em|anh|chị|chi)\s+t(?:ê|e)n\s+l(?:à|a)\s+([A-Za-zÀ-ỹ\s]{2,60})",
+        r"t(?:ê|e)n\s+c(?:ủa|ua)\s+(?:m(?:i|ì|ình)nh|tôi|toi)\s+l(?:à|a)\s+([A-Za-zÀ-ỹ\s]{2,60})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        name = re.sub(r"\s+", " ", match.group(1)).strip(" .,:;-")
+        if len(name) >= 2:
+            return name
+    return ""
+
+
+def _extract_location_preference(text: str) -> str:
+    patterns = [
+        r"(?:ở|o|khu vực|khu v(?:ự|u)c|muốn ở|muon o)\s+([A-Za-zÀ-ỹ0-9\s,./-]{3,90})",
+        r"(?:quận|quan|huyện|huyen|phường|phuong|tỉnh|tinh|thành phố|thanh pho)\s+([A-Za-zÀ-ỹ0-9\s,./-]{2,80})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        value = re.sub(r"\s+", " ", match.group(1)).strip(" .,:;-")
+        if len(value) >= 3:
+            return value
+    return ""
+
+
+def _extract_apartment_preference(text: str) -> str:
+    match = re.search(r"(?:gu\s*căn hộ|gu\s*can\s*ho)\s*:?\s*([^\n]{2,120})", text, flags=re.IGNORECASE)
+    if match:
+        return re.sub(r"\s+", " ", match.group(1)).strip(" .,:;-")
+
+    if re.search(r"(căn hộ|can ho|chung cư|chung cu|studio|penthouse|2pn|3pn|1pn)", text, flags=re.IGNORECASE):
+        return re.sub(r"\s+", " ", text).strip()[:140]
+    return ""
+
+
+def _extract_customer_profile_updates(user_text: str) -> Dict[str, Any]:
+    text = (user_text or "").strip()
+    updates: Dict[str, Any] = {}
+    if not text:
+        return updates
+
+    phone_match = re.search(r"(?:(?:\+84|84|0)(?:[\s.\-]?\d){8,10})", text)
+    if phone_match:
+        normalized_phone = _normalize_phone(phone_match.group(0))
+        if 9 <= len(normalized_phone) <= 11:
+            updates["phone_number"] = normalized_phone
+
+    name = _extract_name(text)
+    if name:
+        updates["customer_name"] = name
+
+    location = _extract_location_preference(text)
+    if location:
+        updates["location_preference"] = location
+
+    apartment_pref = _extract_apartment_preference(text)
+    if apartment_pref:
+        updates["apartment_preference"] = apartment_pref
+        updates["gu_can_ho"] = apartment_pref
+    elif location:
+        # "Gu hoặc nơi ở" được quy chiếu về một tiêu chí gu căn hộ.
+        updates["apartment_preference"] = location
+        updates["gu_can_ho"] = location
+
+    return updates
+
+
+def _desktop_customer_profile_dir() -> Path:
+    desktop = Path(os.path.expanduser("~")) / "Desktop"
+    target = desktop / "Noble_RAG_customer_profiles"
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _save_customer_profile_to_desktop(session_id: str, profile: Dict[str, Any]) -> None:
+    sid = (session_id or "unknown").strip() or "unknown"
+    safe_sid = re.sub(r"[^A-Za-z0-9_.-]+", "_", sid)
+    now = datetime.now().strftime("%Y%m%d_%H%M%S")
+    customer_name = str(profile.get("customer_name") or "").strip()
+    phone_number = str(profile.get("phone_number") or "").strip()
+    gu_can_ho = str(profile.get("gu_can_ho") or profile.get("apartment_preference") or "").strip()
+
+    payload = {
+        "session_id": sid,
+        "saved_at": now,
+        "customer_name": customer_name,
+        "phone_number": phone_number,
+        "gu_can_ho": gu_can_ho,
+        "raw_profile": profile,
+    }
+
+    base_dir = _desktop_customer_profile_dir()
+    json_path = base_dir / f"{safe_sid}_latest.json"
+    txt_path = base_dir / f"{safe_sid}_latest.txt"
+
+    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    txt_path.write_text(
+        (
+            "Tên khách hàng:\n"
+            f"{customer_name}\n"
+            "Số điện thoại:\n"
+            f"{phone_number}\n"
+            "Gu căn hộ:\n"
+            f"{gu_can_ho}\n"
+        ),
+        encoding="utf-8",
+    )
+
+
+def _build_sunny_follow_up(lead_profile: Dict[str, Any]) -> str:
+    profile = lead_profile or {}
+    has_pref = bool(
+        str(
+            profile.get("gu_can_ho")
+            or profile.get("apartment_preference")
+            or profile.get("location_preference")
+            or ""
+        ).strip()
+    )
+    has_name = bool(str(profile.get("customer_name") or "").strip())
+    has_phone = bool(str(profile.get("phone_number") or "").strip())
+    criteria = {
+        "Tên khách hàng": has_name,
+        "Số điện thoại": has_phone,
+        "Gu căn hộ": has_pref,
+    }
+    missing = [key for key, ok in criteria.items() if not ok]
+
+    if not missing:
+        return (
+            "Sunny đã lưu thông tin của bạn rồi nè. "
+            "Mình cùng khám phá thêm các điểm thú vị của Noble Palace Tây Thăng Long nhé, còn nhiều điều hay lắm."
+        )
+
+    random.shuffle(missing)
+    missing_block = "\n".join(f"{field}:" for field in missing)
+    return f"Sunny cần thêm một vài thông tin để lưu danh sách khách hàng nhé:\n{missing_block}"
+
+
+def _append_follow_up_if_missing(base_answer: str, follow_up: str) -> str:
+    answer = (base_answer or "").strip()
+    hint = (follow_up or "").strip()
+    if not hint:
+        return answer
+    if hint.lower() in answer.lower():
+        return answer
+    if not answer:
+        return hint
+    return f"{answer}\n\n{hint}"
+
+
 async def _persist_chat_turn(session_id: str, user_text: str, assistant_text: str) -> None:
     user = (user_text or "").strip()
     assistant = (assistant_text or "").strip()
@@ -341,6 +507,15 @@ async def _run_sales_flow(
         load_session_context(session_id),
         load_lead_profile(session_id),
     )
+    lead_profile = lead_profile or {"lead_id": session_id}
+    profile_updates = _extract_customer_profile_updates(user_text)
+    if profile_updates:
+        lead_profile.update(profile_updates)
+        try:
+            await save_lead_profile(session_id, lead_profile)
+            _save_customer_profile_to_desktop(session_id, lead_profile)
+        except Exception as exc:
+            log.warning("save_lead_profile pre-chat failed: session=%s err=%s", session_id, exc)
     timings["load_context"] = int((time.perf_counter() - t0) * 1000)
 
     t0 = time.perf_counter()
@@ -364,6 +539,10 @@ async def _run_sales_flow(
         patched_answer = _apply_customer_pronoun(
             str(result.get("final_response") or ""),
             {"lead_profile": lead_profile, "session_context": session_context},
+        )
+        patched_answer = _append_follow_up_if_missing(
+            patched_answer,
+            _build_sunny_follow_up(lead_profile),
         )
         result["final_response"] = patched_answer
         result["lead_profile"] = lead_profile
@@ -420,6 +599,10 @@ async def _run_sales_flow(
     patched_answer = _apply_customer_pronoun(
         str(result.get("final_response") or ""),
         {"lead_profile": lead_profile, "session_context": session_context},
+    )
+    patched_answer = _append_follow_up_if_missing(
+        patched_answer,
+        _build_sunny_follow_up(lead_profile),
     )
     result["final_response"] = patched_answer
     result["lead_profile"] = lead_profile
