@@ -53,6 +53,7 @@ def _llm_generation_available() -> bool:
         (os.getenv("OPENAI_API_KEY") or "").strip()
         or (os.getenv("LLM_API_KEY") or "").strip()
         or (os.getenv("LLM_GEMINI_API_KEY") or "").strip()
+        or (os.getenv("LLM_KIMI_API_KEY") or "").strip()
     )
 
 

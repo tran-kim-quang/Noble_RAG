@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import unicodedata
+import asyncio
 from typing import Any, Dict, List
 
 import asyncpg
@@ -422,11 +423,25 @@ async def _load_project_facts() -> List[Dict[str, Any]]:
     return list(_PROJECT_FACTS_CACHE)
 
 
-async def warm_retrieval_caches() -> None:
+async def warm_retrieval_caches(
+    *,
+    include_catalog: bool = True,
+    include_project_facts: bool = True,
+    start_delay_sec: float = 0.0,
+) -> None:
     try:
-        await _load_catalog_projects()
-        await _load_project_facts()
-        log.info("warm_retrieval_caches: ready")
+        delay = max(0.0, float(start_delay_sec))
+        if delay > 0:
+            await asyncio.sleep(delay)
+        if include_catalog:
+            await _load_catalog_projects()
+        if include_project_facts:
+            await _load_project_facts()
+        log.info(
+            "warm_retrieval_caches: ready (catalog=%s, project_facts=%s)",
+            include_catalog,
+            include_project_facts,
+        )
     except Exception as e:
         log.warning("warm_retrieval_caches failed: %s", e)
 

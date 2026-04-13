@@ -67,7 +67,14 @@ async def startup_event():
     await ensure_sales_schema()
     await ensure_pipeline_schema()
     import asyncio
-    asyncio.create_task(warm_retrieval_caches())
+    if settings.warm_retrieval_catalog_on_startup or settings.warm_project_facts_on_startup:
+        asyncio.create_task(
+            warm_retrieval_caches(
+                include_catalog=settings.warm_retrieval_catalog_on_startup,
+                include_project_facts=settings.warm_project_facts_on_startup,
+                start_delay_sec=settings.warm_retrieval_start_delay_sec,
+            )
+        )
     log.info("Haystack storages initialised.")
 
 @app.on_event("shutdown")

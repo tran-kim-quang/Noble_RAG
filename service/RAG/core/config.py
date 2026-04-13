@@ -19,6 +19,18 @@ class Settings(BaseSettings):
     llm_model: str = "gemini-2.5-flash"
     llm_api_key: str = ""
     llm_api_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
+    llm_request_timeout_sec: float = 25.0
+    llm_request_retries: int = 0
+    llm_sdk_max_retries: int = 0
+    llm_max_concurrency: int = 2
+    llm_max_prompt_chars: int = 8000
+    llm_long_prompt_threshold_chars: int = 5000
+    llm_default_max_tokens: int = 480
+    llm_long_prompt_max_tokens: int = 240
+    llm_retry_base_delay_sec: float = 0.6
+    llm_retry_max_delay_sec: float = 4.0
+    llm_retry_jitter_sec: float = 0.25
+    llm_request_timeout_max_sec: float = 70.0
 
     # Embedding
     embedding_provider: str = ""
@@ -75,7 +87,7 @@ class Settings(BaseSettings):
     rag_service_host: str = "0.0.0.0"
     session_export_dir: str = "./exports/sessions"
     vision_service_url: str = "http://127.0.0.1:8020"
-    vision_session_sync_enabled: bool = True
+    vision_session_sync_enabled: bool = False
     vision_session_lookup_timeout_sec: float = 2.0
     cors_origins: str = "*"
     machine_b_base_url: str = ""
@@ -85,6 +97,9 @@ class Settings(BaseSettings):
     chat_history_purge_token: str = ""
     # Khi false: purge-all chỉ xóa Redis/snapshot, không gọi Máy B xóa embedding (ghi đè query notify_machine_b).
     purge_all_notify_machine_b: bool = True
+    warm_retrieval_catalog_on_startup: bool = True
+    warm_project_facts_on_startup: bool = False
+    warm_retrieval_start_delay_sec: float = 8.0
 
     @model_validator(mode="after")
     def _assemble_derived_fields(self) -> "Settings":
@@ -140,6 +155,16 @@ def _apply_alt_env_names(s: Settings) -> Settings:
         if (val := os.getenv("LLM_GEMINI_API_KEY")) and not s.llm_api_key:
             s.llm_api_key = val
         if (val := os.getenv("LLM_GEMINI_API_URL")) and s.llm_api_url == "https://generativelanguage.googleapis.com/v1beta/openai":
+            s.llm_api_url = val
+
+    if provider == "kimi":
+        if (val := os.getenv("LLM_KIMI_MODEL")) and s.llm_model == "gemini-2.5-flash":
+            s.llm_model = val
+        if s.llm_model == "gemini-2.5-flash":
+            s.llm_model = "kimi-k2.5"
+        if (val := os.getenv("LLM_KIMI_API_KEY")) and not s.llm_api_key:
+            s.llm_api_key = val
+        if (val := os.getenv("LLM_KIMI_API_URL")) and s.llm_api_url == "https://generativelanguage.googleapis.com/v1beta/openai":
             s.llm_api_url = val
 
     return s

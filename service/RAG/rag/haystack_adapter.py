@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
+import unicodedata
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -148,6 +150,7 @@ class HaystackRAGAdapter:
             ),
         )
         results = list(getattr(query_response, "points", []) or [])
+        results = self._rerank_points(search_query, results)
 
         context_blocks: List[str] = []
         for point in results:
@@ -212,6 +215,7 @@ class HaystackRAGAdapter:
             ),
         )
         results = list(getattr(query_response, "points", []) or [])
+        results = self._rerank_points(search_query, results)
 
         context_blocks: List[str] = []
         for point in results:
@@ -280,6 +284,49 @@ class HaystackRAGAdapter:
             "Retrieved Context:\n"
             + "\n\n---\n\n".join(context_blocks[:top_k])
         )
+
+    @staticmethod
+    def _fold_vn(text: str) -> str:
+        raw = (text or "").strip().lower()
+        folded = unicodedata.normalize("NFD", raw)
+        folded = "".join(ch for ch in folded if unicodedata.category(ch) != "Mn")
+        return folded.replace("đ", "d")
+
+    @classmethod
+    def _token_overlap_score(cls, query: str, content: str) -> float:
+        q_tokens = {
+            tok
+            for tok in re.findall(r"[a-z0-9]+", cls._fold_vn(query))
+            if len(tok) >= 2
+        }
+        if not q_tokens:
+            return 0.0
+        c_tokens = set(re.findall(r"[a-z0-9]+", cls._fold_vn(content)))
+        if not c_tokens:
+            return 0.0
+        overlap = q_tokens.intersection(c_tokens)
+        return len(overlap) / float(len(q_tokens))
+
+    def _rerank_points(self, query: str, points: List[Any]) -> List[Any]:
+        """Lightweight reranking: combine vector score with lexical overlap signal."""
+        enabled = (os.getenv("ENABLE_SIMPLE_RERANKER") or "true").strip().lower() in {"1", "true", "yes", "on"}
+        if not enabled or not points:
+            return points
+
+        vector_w = float((os.getenv("SIMPLE_RERANK_VECTOR_WEIGHT") or "0.7").strip() or "0.7")
+        lexical_w = float((os.getenv("SIMPLE_RERANK_LEXICAL_WEIGHT") or "0.3").strip() or "0.3")
+
+        scored: List[tuple[float, Any]] = []
+        for point in points:
+            payload = dict(getattr(point, "payload", None) or {})
+            content = str(payload.get("content") or "")
+            vector_score = float(getattr(point, "score", 0.0) or 0.0)
+            lexical_score = self._token_overlap_score(query, content)
+            final = vector_w * vector_score + lexical_w * lexical_score
+            scored.append((final, point))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [point for _, point in scored]
 
     def _ensure_qdrant_collection(self) -> None:
         collections = self.qdrant.get_collections().collections

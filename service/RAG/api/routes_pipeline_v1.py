@@ -946,19 +946,29 @@ async def sales_chat_with_camera_v1(
     if not resolved_hint and requested_session_id:
         existing_context = await load_session_context(requested_session_id)
         resolved_hint = str(existing_context.get("customer_id") or "").strip()
+    if not resolved_hint and requested_session_id:
+        resolved_hint = requested_session_id
     if not resolved_hint:
         resolved_hint = f"cam_{uuid.uuid4().hex[:12]}"
 
-    face_payload = await _register_face_to_machine_b(
-        customer_id=resolved_hint,
-        image_bytes=image_bytes,
-        filename=file.filename or f"{resolved_hint}.jpg",
-        content_type=file.content_type or "application/octet-stream",
-    )
+    if settings.vision_session_sync_enabled:
+        face_payload = await _register_face_to_machine_b(
+            customer_id=resolved_hint,
+            image_bytes=image_bytes,
+            filename=file.filename or f"{resolved_hint}.jpg",
+            content_type=file.content_type or "application/octet-stream",
+        )
 
-    customer_id = str(face_payload.get("customer_id") or resolved_hint).strip()
-    if not customer_id:
-        raise HTTPException(status_code=502, detail="machine B did not return customer_id")
+        customer_id = str(face_payload.get("customer_id") or resolved_hint).strip()
+        if not customer_id:
+            raise HTTPException(status_code=502, detail="machine B did not return customer_id")
+    else:
+        customer_id = resolved_hint
+        face_payload = {
+            "customer_id": customer_id,
+            "vision_skipped": True,
+            "reason": "vision_session_sync_disabled",
+        }
 
     # ── DEBUG: log raw face_payload fields từ Máy B để trace gender
     _fp_gioi_tinh = face_payload.get("gioi_tinh")
@@ -981,7 +991,7 @@ async def sales_chat_with_camera_v1(
         f"vision_summary.gender_guess={_fp_vs.get('gender_guess')!r}",
         flush=True,
     )
-    machine_b_summary = _vision_context_from_machine_b_register(face_payload)
+    machine_b_summary = _vision_context_from_machine_b_register(face_payload) if settings.vision_session_sync_enabled else {}
     if raw_vision_summary:
         vision_summary = dict(raw_vision_summary)
         for key, value in machine_b_summary.items():

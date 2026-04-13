@@ -414,15 +414,11 @@
                         </div>
 
                         <div class="mb-3">
-                            <label class="form-label">Camera (tự động)</label>
-                            <video id="vision-preview" class="w-100 rounded border" autoplay playsinline muted style="display: none;"></video>
-                            <div id="vision-placeholder" class="border rounded p-3 text-muted small">Camera bật tự động sau khi tải trang. Giữ mic: chụp khung hình và gửi tới Vision/Máy B ngay khi nhấn.</div>
-                            <div class="d-flex gap-2 mt-2">
-                                <button class="btn btn-outline-secondary" id="btn_stop_camera" type="button" disabled>Tắt camera</button>
-                            </div>
+                            <label class="form-label">Trạng thái phiên</label>
+                            <div class="border rounded p-3 text-muted small">Vision và camera đã tắt. Hệ thống chạy text-only qua STT - RAG - TTS.</div>
                         </div>
 
-                        <div id="vision-status" class="small text-muted">Đang khởi tạo camera…</div>
+                        <div id="workflow-status" class="small text-muted">Đang khởi tạo phiên RAG…</div>
                     </div>
                 </div>
             </div>
@@ -436,7 +432,6 @@
     <!-- ÃƒÂ©Ã…Â¡Ã‚ÂÃƒÂ¨Ã¢â‚¬â€Ã‚ÂÃƒÂ§Ã…Â¡Ã¢â‚¬Å¾ÃƒÂ¤Ã‚Â¼Ã…Â¡ÃƒÂ¨Ã‚Â¯Ã‚ÂID -->
     <input type="hidden" id="sessionid" value="0">
     <input type="hidden" id="rag-session-id" value="">
-    <canvas id="vision-canvas" width="640" height="480" style="display: none;"></canvas>
 
 
     <script src="client.js"></script>
@@ -445,9 +440,7 @@
     <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
     <script>
         $(document).ready(function() {
-            let nobleConfig = null;
             let ragSessionId = '';
-            let visionStream = null;
 
             function localizeUiText() {
                 document.title = 'LiveTalking - Trợ lý hội thoại';
@@ -471,10 +464,7 @@
                 $('#echo-form button[type=\"submit\"]').html('<i class=\"bi bi-volume-up\"></i> Phát TTS');
                 $('.card-header:contains(\"Noble RAG Workflow\")').text('Noble RAG Workflow');
                 $('#rag-session-label').text('Đang khởi tạo...');
-                $('label.form-label:contains(\"Camera\")').text('Camera (tự động)');
-                $('#vision-placeholder').text('Camera bật tự động sau khi tải trang. Giữ mic: chụp khung hình và gửi tới Vision/Máy B ngay khi nhấn.');
-                $('#btn_stop_camera').text('Tắt camera');
-                $('#vision-status').text('Đang khởi tạo camera…');
+                $('#workflow-status').text('Đang khởi tạo phiên RAG…');
             }
 
             localizeUiText();
@@ -485,8 +475,8 @@
                 $('#video').css('width', value + '%');
             });
 
-            function setVisionStatus(message, isError = false) {
-                const status = $('#vision-status');
+            function setWorkflowStatus(message, isError = false) {
+                const status = $('#workflow-status');
                 status.text(message);
                 status.toggleClass('text-danger', isError);
                 status.toggleClass('text-muted', !isError);
@@ -497,22 +487,15 @@
                 $('#rag-session-id').val(ragSessionId);
             }
 
-            async function initializeNobleSession() {
-                const configResponse = await fetch('/noble/config');
-                if (!configResponse.ok) {
-                    throw new Error('Không đọc được cấu hình Noble RAG.');
+            function bindRagSessionToLiveSession(liveSessionId) {
+                const sid = parseInt(String(liveSessionId || '0'), 10);
+                if (!sid) {
+                    return;
                 }
-                nobleConfig = await configResponse.json();
-
-                const sessionResponse = await fetch('/noble/session', { method: 'POST' });
-                if (!sessionResponse.ok) {
-                    throw new Error('Không tạo được session_id cho Noble RAG.');
-                }
-
-                const sessionData = await sessionResponse.json();
-                ragSessionId = sessionData.session_id || '';
+                // Tạo phiên RAG mới theo vòng đời WebRTC session để không tái dùng history cũ.
+                ragSessionId = `livetalking-${sid}-${Date.now()}`;
                 renderRagSessionId();
-                setVisionStatus('Đã sẵn sàng. Camera sẽ bật tự động; khi giữ mic, ảnh gửi Vision/Máy B ngay.');
+                setWorkflowStatus(`Đã tạo phiên RAG mới theo LiveTalking session ${sid}.`);
             }
 
             function ensureRagSessionId() {
@@ -520,8 +503,13 @@
                     return ragSessionId;
                 }
 
-                ragSessionId = `livetalking_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+                const liveSessionId = parseInt(document.getElementById('sessionid').value, 10);
+                if (!liveSessionId) {
+                    throw new Error('Chưa có WebRTC session. Bạn bấm "Bắt đầu kết nối" trước nhé.');
+                }
+                ragSessionId = `livetalking-${liveSessionId}-${Date.now()}`;
                 renderRagSessionId();
+                setWorkflowStatus(`Đã tạo phiên RAG mới theo LiveTalking session ${liveSessionId}.`);
                 return ragSessionId;
             }
 
@@ -531,142 +519,11 @@
                 });
             }
 
-            async function waitForPreviewReady(preview, timeoutMs) {
-                const startedAt = Date.now();
-                while ((preview.videoWidth || 0) <= 0 || (preview.videoHeight || 0) <= 0) {
-                    if (Date.now() - startedAt > timeoutMs) {
-                        throw new Error('Camera browser chưa sẵn sàng để chụp keyframe.');
-                    }
-                    await delay(60);
-                }
-            }
-
-            async function captureChatFrameBlob(options) {
-                const opts = options || {};
-                const autoStart = opts.autoStart !== false;
-                const quality = typeof opts.quality === 'number' ? opts.quality : 0.9;
-                const previewTimeoutMs = Math.max(1200, Number(opts.previewTimeoutMs || 4000));
-
-                if (!visionStream) {
-                    if (!autoStart) {
-                        return null;
-                    }
-                    await startVisionCamera();
-                }
-
-                const preview = document.getElementById('vision-preview');
-                await waitForPreviewReady(preview, previewTimeoutMs);
-                const canvas = document.getElementById('vision-canvas');
-                const width = preview.videoWidth || 640;
-                const height = preview.videoHeight || 480;
-                canvas.width = width;
-                canvas.height = height;
-                const context = canvas.getContext('2d');
-                context.drawImage(preview, 0, 0, width, height);
-                const blob = await new Promise(function(resolve) {
-                    canvas.toBlob(resolve, 'image/jpeg', quality);
-                });
-                return blob || null;
-            }
-
-            async function blobToDataUrl(blob) {
-                return await new Promise(function(resolve, reject) {
-                    const reader = new FileReader();
-                    reader.onload = function() {
-                        resolve(String(reader.result || ''));
-                    };
-                    reader.onerror = reject;
-                    reader.readAsDataURL(blob);
-                });
-            }
-
-            async function captureChatFrameDataUrl(options) {
-                const blob = await captureChatFrameBlob(options);
-                if (!blob) {
-                    return '';
-                }
-                return await blobToDataUrl(blob);
-            }
-
-            async function captureChatFrameDataUrlWithRetry(options) {
-                const opts = options || {};
-                const retries = Math.max(1, Number(opts.retries || 3));
-                let lastError = null;
-                for (let attempt = 0; attempt < retries; attempt += 1) {
-                    try {
-                        const dataUrl = await captureChatFrameDataUrl(opts);
-                        if (dataUrl) {
-                            return dataUrl;
-                        }
-                    } catch (error) {
-                        lastError = error;
-                    }
-                    await delay(180);
-                }
-                if (lastError) {
-                    throw lastError;
-                }
-                return '';
-            }
-
-            let lastCapturedImageBase64 = '';
-            let lastCapturedAtMs = 0;
-            const CAMERA_FRAME_STALE_MS = 15000;
-            const REQUIRE_BROWSER_CAMERA_FRAME = true;
-
-            function rememberCapturedFrame(dataUrl) {
-                const normalized = String(dataUrl || '').trim();
-                if (!normalized) {
-                    return;
-                }
-                lastCapturedImageBase64 = normalized;
-                lastCapturedAtMs = Date.now();
-            }
-
-            function getRecentCapturedFrame() {
-                if (!lastCapturedImageBase64) {
-                    return '';
-                }
-                if (Date.now() - lastCapturedAtMs > CAMERA_FRAME_STALE_MS) {
-                    return '';
-                }
-                return lastCapturedImageBase64;
-            }
-
-            async function sendChatMessage(message, rawTranscript, options) {
-                const opts = options || {};
+            async function sendChatMessage(message, rawTranscript) {
                 const liveSessionId = parseInt(document.getElementById('sessionid').value, 10);
                 if (!liveSessionId) {
                     throw new Error('Hãy bấm "Bắt đầu kết nối" trước khi chat với Noble RAG.');
                 }
-
-                let imageBase64 = String(opts.imageBase64 || '').trim();
-                const shouldAutoCapture = opts.autoCapture !== false;
-                if (!imageBase64) {
-                    imageBase64 = getRecentCapturedFrame();
-                }
-                if (!imageBase64 && shouldAutoCapture) {
-                    try {
-                        imageBase64 = await captureChatFrameDataUrlWithRetry({
-                            autoStart: true,
-                            quality: 0.9,
-                            previewTimeoutMs: 5000,
-                            retries: 3,
-                        });
-                        rememberCapturedFrame(imageBase64);
-                    } catch (captureErr) {
-                        console.warn('Auto keyframe capture failed:', captureErr);
-                        setVisionStatus('Không chụp được keyframe tự động, hệ thống sẽ fallback camera local.', true);
-                    }
-                }
-                if (!imageBase64 && REQUIRE_BROWSER_CAMERA_FRAME) {
-                    setVisionStatus(
-                        'Không lấy được ảnh camera từ browser. Vui lòng bật camera trên dashboard.html và cấp quyền camera cho trình duyệt.',
-                        true
-                    );
-                    throw new Error('Thiếu image_base64 từ browser camera');
-                }
-                console.log('Sending /human with image_base64 length=', imageBase64 ? imageBase64.length : 0);
 
                 const response = await fetch('/human', {
                     body: JSON.stringify({
@@ -676,7 +533,6 @@
                         interrupt: true,
                         sessionid: liveSessionId,
                         rag_session_id: ensureRagSessionId(),
-                        image_base64: imageBase64 || '',
                     }),
                     headers: {
                         'Content-Type': 'application/json'
@@ -689,6 +545,9 @@
                 }
 
                 const data = await response.json();
+                if (typeof data.code !== 'undefined' && Number(data.code) !== 0) {
+                    throw new Error(String(data.msg || 'Server /human trả lỗi'));
+                }
                 if (data.rag_session_id) {
                     ragSessionId = data.rag_session_id;
                     renderRagSessionId();
@@ -696,84 +555,16 @@
                 return data;
             }
 
-            async function startVisionCamera() {
-                if (visionStream) {
-                    return;
+            function getHumanSendErrorMessage(error, fallbackMessage) {
+                const msg = String((error && error.message) || '').trim();
+                if (msg) {
+                    return 'Không gửi được câu hỏi: ' + msg;
                 }
-
-                visionStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-                const preview = document.getElementById('vision-preview');
-                preview.srcObject = visionStream;
-                preview.style.display = 'block';
-                $('#vision-placeholder').hide();
-                $('#btn_stop_camera').prop('disabled', false);
-                setVisionStatus('Camera đã bật. Giữ mic để gửi ảnh tới Vision/Máy B ngay lúc nhấn.');
+                return fallbackMessage;
             }
 
-            function stopVisionCamera() {
-                if (visionStream) {
-                    visionStream.getTracks().forEach(track => track.stop());
-                    visionStream = null;
-                }
-
-                const preview = document.getElementById('vision-preview');
-                preview.srcObject = null;
-                preview.style.display = 'none';
-                $('#vision-placeholder').show();
-                $('#btn_stop_camera').prop('disabled', true);
-            }
-
-            window.addEventListener('beforeunload', function() {
-                stopVisionCamera();
-            });
-
-            async function sendVisionIdentifyWithBlob(imageBlob) {
-                if (!imageBlob) {
-                    throw new Error('Không tạo được ảnh keyframe.');
-                }
-                rememberCapturedFrame(await blobToDataUrl(imageBlob));
-
-                const formData = new FormData();
-                formData.append('session_id', ensureRagSessionId());
-                formData.append('source', (nobleConfig && nobleConfig.vision_source) || 'browser');
-                formData.append('image', imageBlob, 'vision-keyframe.jpg');
-
-                const response = await fetch('/noble/vision/identify', {
-                    method: 'POST',
-                    body: formData,
-                });
-                const result = await response.json();
-
-                if (!response.ok) {
-                    throw new Error(result.detail || 'Vision identify thất bại.');
-                }
-
-                const customerId = result.customer_id || 'unknown';
-                const customerType = result.is_existing_customer ? 'khách cũ' : 'khách mới';
-                const matchScore = result.match_score == null ? 'n/a' : result.match_score;
-                setVisionStatus(`Vision/Máy B: ${customerType}. customer_id=${customerId}, match_score=${matchScore}`);
-                return result;
-            }
-
-            async function captureVisionKeyframe() {
-                const imageBlob = await captureChatFrameBlob({ autoStart: true, quality: 0.92 });
-                return sendVisionIdentifyWithBlob(imageBlob);
-            }
-
-            initializeNobleSession()
-                .then(function() {
-                    return startVisionCamera().catch(function(camErr) {
-                        console.warn('Auto-start camera:', camErr);
-                        setVisionStatus(
-                            camErr.message || 'Không bật được camera tự động — hãy cấp quyền camera cho trang.',
-                            true
-                        );
-                    });
-                })
-                .catch(function(error) {
-                    console.error(error);
-                    setVisionStatus(error.message || 'Không khởi tạo được Noble RAG session.', true);
-                });
+            renderRagSessionId();
+            setWorkflowStatus('Sẵn sàng. Bấm "Bắt đầu kết nối" để tạo phiên WebRTC + RAG mới.');
 
             function updateConnectionStatus(status) {
                 const statusIndicator = $('#connection-status');
@@ -817,6 +608,9 @@
             // ÃƒÂ¥Ã‚Â¼Ã¢â€šÂ¬ÃƒÂ¥Ã‚Â§Ã¢â‚¬Â¹/ÃƒÂ¥Ã‚ÂÃ…â€œÃƒÂ¦Ã‚Â­Ã‚Â¢ÃƒÂ¦Ã…â€™Ã¢â‚¬Â°ÃƒÂ©Ã¢â‚¬â„¢Ã‚Â®
             $('#start').click(function() {
                 updateConnectionStatus('connecting');
+                ragSessionId = '';
+                renderRagSessionId();
+                setWorkflowStatus('Đang kết nối WebRTC và tạo phiên RAG mới...');
                 start();
                 $(this).hide();
                 $('#stop').show();
@@ -844,11 +638,9 @@
                 $(this).hide();
                 $('#start').show();
                 updateConnectionStatus('disconnected');
-            });
-
-            $('#btn_stop_camera').click(function() {
-                stopVisionCamera();
-                setVisionStatus('Đã tắt camera. Bấm F5 hoặc tải lại trang để bật lại (tự động).');
+                ragSessionId = '';
+                renderRagSessionId();
+                setWorkflowStatus('Đã dừng kết nối. Phiên RAG cũ đã tách, lần Start tiếp theo sẽ là phiên mới.');
             });
 
             // ÃƒÂ¥Ã‚Â½Ã¢â‚¬Â¢ÃƒÂ¥Ã‹â€ Ã‚Â¶ÃƒÂ¥Ã…Â Ã…Â¸ÃƒÂ¨Ã†â€™Ã‚Â½
@@ -935,7 +727,10 @@
                 console.log('Sending chat message:', message);
                 sendChatMessage(message, message).catch(function(error) {
                     console.error(error);
-                    addChatMessage('Không gửi được câu hỏi: thiếu khung hình camera browser hoặc chưa cấp quyền camera.', 'system');
+                    addChatMessage(
+                        getHumanSendErrorMessage(error, 'Không gửi được câu hỏi tới hệ thống.'),
+                        'system'
+                    );
                 });
                 
                 addChatMessage(message, 'user');
@@ -946,35 +741,39 @@
             let mediaRecorder;
             let audioChunks = [];
             let isRecording = false;
-            let pendingMicImageBase64 = '';
-            let pendingVisionIdentifyPromise = null;
             let recordingStartedAtMs = 0;
             let stopRetryTimer = null;
             const MIN_RECORD_MS = 500;
 
-            async function transcribeWithWhisperService(audioBlob) {
+            async function transcribeWithDeepgramService(audioBlob) {
                 const formData = new FormData();
-                formData.append('audio', audioBlob, 'mic-input.webm');
+                formData.append('file', audioBlob, 'mic-input.webm');
                 formData.append('language', 'vi');
                 let lastDetail = '';
 
                 for (let attempt = 0; attempt < 2; attempt += 1) {
-                    const response = await fetch('/noble/whisper/transcribe', {
+                    const response = await fetch('/stt/transcribe', {
                         method: 'POST',
                         body: formData,
                     });
                     const payload = await response.json();
-                    if (response.ok) {
-                        return (payload.text || '').trim();
+                    const okByCode = payload && (typeof payload.code === 'undefined' || Number(payload.code) === 0);
+                    if (response.ok && okByCode) {
+                        const text = String(payload.text || ((payload.data || {}).text || '')).trim();
+                        if (text) {
+                            return text;
+                        }
+                        lastDetail = payload.msg || payload.detail || 'Deepgram STT trả về rỗng';
+                        throw new Error(lastDetail);
                     }
-                    lastDetail = payload.detail || 'Whisper service transcribe failed';
+                    lastDetail = payload.detail || payload.msg || payload.error || 'Deepgram STT transcribe failed';
                     if (attempt === 0 && /end of file|eof/i.test(lastDetail)) {
                         await delay(180);
                         continue;
                     }
                     throw new Error(lastDetail);
                 }
-                throw new Error(lastDetail || 'Whisper service transcribe failed');
+                throw new Error(lastDetail || 'Deepgram STT transcribe failed');
             }
 
             $('#voice-record-btn').on('mousedown touchstart', function(e) {
@@ -988,41 +787,10 @@
 
             function startRecording() {
                 if (isRecording) return;
-                pendingMicImageBase64 = '';
-                pendingVisionIdentifyPromise = null;
                 if (stopRetryTimer) {
                     clearTimeout(stopRetryTimer);
                     stopRetryTimer = null;
                 }
-
-                setVisionStatus('Đang chụp khung hình và gửi Vision/Máy B…');
-                pendingVisionIdentifyPromise = (async function() {
-                    try {
-                        const imageBlob = await captureChatFrameBlob({
-                            autoStart: true,
-                            quality: 0.92,
-                            previewTimeoutMs: 5000,
-                        });
-                        if (!imageBlob) {
-                            throw new Error('Không chụp được khung hình camera.');
-                        }
-                        const dataUrl = await blobToDataUrl(imageBlob);
-                        pendingMicImageBase64 = dataUrl;
-                        rememberCapturedFrame(dataUrl);
-                        await sendVisionIdentifyWithBlob(imageBlob);
-                        return true;
-                    } catch (error) {
-                        console.warn('Mic-start vision / Máy B:', error);
-                        pendingMicImageBase64 = getRecentCapturedFrame();
-                        if (!pendingMicImageBase64) {
-                            setVisionStatus(
-                                error.message || 'Không gửi được ảnh tới Vision/Máy B.',
-                                true
-                            );
-                        }
-                        return false;
-                    }
-                })();
 
                 navigator.mediaDevices.getUserMedia({ audio: true })
                     .then(function(stream) {
@@ -1051,39 +819,25 @@
                                     addChatMessage('Đoạn ghi âm quá ngắn, bạn giữ mic lâu hơn giúp mình nhé.', 'system');
                                     return;
                                 }
-                                if (pendingVisionIdentifyPromise) {
-                                    try {
-                                        await pendingVisionIdentifyPromise;
-                                    } catch (e) {
-                                        console.warn('Vision identify await:', e);
-                                    }
-                                    pendingVisionIdentifyPromise = null;
-                                }
-                                const recognizedText = await transcribeWithWhisperService(audioBlob);
+                                const recognizedText = await transcribeWithDeepgramService(audioBlob);
                                 if (!recognizedText) {
-                                    addChatMessage('Whisper service không nhận được nội dung, bạn nói chậm và rõ hơn giúp mình nhé.', 'system');
+                                    addChatMessage('Deepgram STT không nhận được nội dung, bạn nói chậm và rõ hơn giúp mình nhé.', 'system');
                                     return;
                                 }
 
                                 $('#chat-message').val(recognizedText);
-                                const imageForThisTurn = pendingMicImageBase64;
-                                pendingMicImageBase64 = '';
-                                sendChatMessage(
-                                    recognizedText,
-                                    recognizedText,
-                                    {
-                                        imageBase64: imageForThisTurn,
-                                        autoCapture: !imageForThisTurn,
-                                    }
-                                ).catch(function(error) {
+                                sendChatMessage(recognizedText, recognizedText).catch(function(error) {
                                     console.error(error);
-                                    addChatMessage('Không gửi được transcript: thiếu khung hình camera browser hoặc chưa cấp quyền camera.', 'system');
+                                    addChatMessage(
+                                        getHumanSendErrorMessage(error, 'Không gửi được transcript tới hệ thống.'),
+                                        'system'
+                                    );
                                 });
                                 addChatMessage(recognizedText, 'user');
                                 $('#chat-message').val('');
                             } catch (error) {
-                                console.error('Whisper service transcribe error:', error);
-                                addChatMessage('Không nhận diện được giọng nói bằng Whisper service.', 'system');
+                                console.error('Deepgram STT transcribe error:', error);
+                                addChatMessage('Không nhận diện được giọng nói bằng Deepgram STT.', 'system');
                             }
                         };
 
@@ -1130,6 +884,10 @@
                 $('#voice-record-btn').css('background-color', '');
             }
             // WebRTC ÃƒÂ§Ã¢â‚¬ÂºÃ‚Â¸ÃƒÂ¥Ã¢â‚¬Â¦Ã‚Â³ÃƒÂ¥Ã…Â Ã…Â¸ÃƒÂ¨Ã†â€™Ã‚Â½
+            window.onWebRTCSessionCreated = function(sessionId) {
+                bindRagSessionToLiveSession(sessionId);
+            };
+
             if (typeof window.onWebRTCConnected === 'function') {
                 const originalOnConnected = window.onWebRTCConnected;
                 window.onWebRTCConnected = function() {

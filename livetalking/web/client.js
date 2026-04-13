@@ -1,4 +1,5 @@
 var pc = null;
+var remoteStream = null;
 
 function negotiate() {
     pc.addTransceiver('video', { direction: 'recvonly' });
@@ -36,7 +37,14 @@ function negotiate() {
         return response.json();
     }).then((answer) => {
         document.getElementById('sessionid').value = answer.sessionid
+        if (typeof window.onWebRTCSessionCreated === 'function') {
+            window.onWebRTCSessionCreated(answer.sessionid);
+        }
         return pc.setRemoteDescription(answer);
+    }).then(() => {
+        if (typeof window.onWebRTCConnected === 'function') {
+            window.onWebRTCConnected();
+        }
     }).catch((e) => {
         alert(e);
     });
@@ -52,13 +60,34 @@ function start() {
     }
 
     pc = new RTCPeerConnection(config);
+    pc.addEventListener('connectionstatechange', () => {
+        if (pc.connectionState === 'connected' && typeof window.onWebRTCConnected === 'function') {
+            window.onWebRTCConnected();
+        }
+        if ((pc.connectionState === 'failed' || pc.connectionState === 'closed' || pc.connectionState === 'disconnected')
+            && typeof window.onWebRTCDisconnected === 'function') {
+            window.onWebRTCDisconnected();
+        }
+    });
 
     // connect audio / video
+    remoteStream = new MediaStream();
     pc.addEventListener('track', (evt) => {
-        if (evt.track.kind == 'video') {
-            document.getElementById('video').srcObject = evt.streams[0];
-        } else {
-            document.getElementById('audio').srcObject = evt.streams[0];
+        const videoEl = document.getElementById('video');
+        const audioEl = document.getElementById('audio');
+
+        // Some browsers send tracks without evt.streams[0], so build a stream manually.
+        remoteStream.addTrack(evt.track);
+
+        if (videoEl) {
+            videoEl.srcObject = remoteStream;
+            videoEl.muted = false;
+            videoEl.play().catch(() => {});
+        }
+        if (audioEl) {
+            audioEl.srcObject = remoteStream;
+            audioEl.muted = false;
+            audioEl.play().catch(() => {});
         }
     });
 
@@ -69,10 +98,14 @@ function start() {
 
 function stop() {
     document.getElementById('stop').style.display = 'none';
+    document.getElementById('sessionid').value = '0';
 
     // close peer connection
     setTimeout(() => {
         pc.close();
+        if (typeof window.onWebRTCDisconnected === 'function') {
+            window.onWebRTCDisconnected();
+        }
     }, 500);
 }
 
