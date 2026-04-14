@@ -1,0 +1,41 @@
+{
+  "top_k": 5,
+  "cases": [
+    {"query": "du an o dau", "expected_doc_ids": ["loc-001"]},
+    {"query": "di den ho tay mat bao lau", "expected_doc_ids": ["loc-002"]},
+    {"query": "gia can 2 phong ngu", "expected_doc_ids": ["price-001"]},
+    {"query": "3 phong ngu gia bao nhieu", "expected_doc_ids": ["price-002"]},
+    {"query": "dien tich can 2pn", "expected_doc_ids": ["area-001"]},
+    {"query": "co can 3 phong ngu 118m2 khong", "expected_doc_ids": ["area-002"]},
+    {"query": "thanh toan chia dot nhu the nao", "expected_doc_ids": ["pay-001"]},
+    {"query": "thanh toan som co duoc giam gia khong", "expected_doc_ids": ["pay-002"]},
+    {"query": "du an co ho boi va gym khong", "expected_doc_ids": ["amen-001"]},
+    {"query": "duoi chan de co sieu thi khong", "expected_doc_ids": ["amen-002"]},
+    {"query": "du an da co giay phep xay dung chua", "expected_doc_ids": ["legal-001"]},
+    {"query": "so huu can ho la so hong lau dai hay 50 nam", "expected_doc_ids": ["legal-002"]},
+    {"query": "ngan hang nao cho vay", "expected_source": ["bank_support.md"]},
+    {"query": "lai suat uu dai bao nhieu thang", "expected_doc_ids": ["bank-002"]},
+    {"query": "du kien khi nao ban giao", "expected_doc_ids": ["timeline-001"]},
+    {"query": "nha mau mo cua gio nao", "expected_doc_ids": ["timeline-002"]},
+    {"query": "co phuong an tra gop 12 thang khong", "expected_source": ["payment_policy_2026.md"]},
+    {"query": "du an co san truot tuyet trong nha khong", "expected_doc_ids": []},
+
+    {"query": "Dự án ở đâu vậy?", "expected_doc_ids": ["loc-001"]},
+    {"query": "Đi từ dự án qua Hồ Tây khoảng mấy phút?", "expected_doc_ids": ["loc-002"]},
+    {"query": "Mình cần căn 2PN, giá tầm bao nhiêu?", "expected_doc_ids": ["price-001"]},
+    {"query": "Có căn 3 phòng ngủ không, giá thế nào?", "expected_doc_ids": ["price-002"]},
+    {"query": "Diện tích căn hai phòng ngủ có những loại nào?", "expected_doc_ids": ["area-001"]},
+    {"query": "Thanh toán chia theo tiến độ ra sao?", "expected_doc_ids": ["pay-001"]},
+    {"query": "Nếu trả sớm thì được chiết khấu bao nhiêu?", "expected_doc_ids": ["pay-002"]},
+    {"query": "Dự án có tiện ích gì nổi bật?", "expected_source": ["amenities.md"]},
+    {"query": "Pháp lý hiện tại của dự án thế nào?", "expected_source": ["legal_status.md"]},
+    {"query": "Có ngân hàng nào hỗ trợ vay mua không?", "expected_source": ["bank_support.md"]},
+    {"query": "Thời điểm bàn giao dự kiến là khi nào?", "expected_doc_ids": ["timeline-001"]},
+
+    {"query": "Cho mình xin thông tin tổng quan dự án", "expected_source": ["brochure_location.md", "amenities.md", "pricing_sheet_q1.md"]},
+    {"query": "Tài chính tầm 9 tỷ thì có phương án nào?", "expected_source": ["pricing_sheet_q1.md"]},
+
+    {"query": "Dự án có sân trượt tuyết trong nhà không?", "expected_doc_ids": []},
+    {"query": "Ở đây có bến du thuyền riêng cho cư dân không?", "expected_doc_ids": []}
+  ]
+}

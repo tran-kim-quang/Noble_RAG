@@ -1,0 +1,1 @@
+"""Minimal retrieval service package."""

@@ -1,0 +1,72 @@
+version: "3.8"
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: noble_qdrant
+    volumes:
+      - ./volumes/qdrant:/qdrant/storage
+    networks:
+      - internal_net
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  retrieval-service:
+    build:
+      context: ..
+      dockerfile: retrieval_service/Dockerfile
+    container_name: noble_retrieval_service
+    env_file:
+      - ./.env.retrieval
+    depends_on:
+      - qdrant
+    expose:
+      - "8011"
+    networks:
+      - internal_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8011/health', timeout=5)"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  orchestrator-service:
+    build:
+      context: ..
+      dockerfile: orchestrator_service/Dockerfile
+    container_name: noble_orchestrator_service
+    env_file:
+      - ./.env.orchestrator
+    depends_on:
+      - retrieval-service
+    ports:
+      - "${ORCH_BIND_IP:-127.0.0.1}:8021:8021"
+    networks:
+      - internal_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8021/health', timeout=5)"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+networks:
+  internal_net:
+    driver: bridge

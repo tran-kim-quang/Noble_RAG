@@ -1,0 +1,100 @@
+{
+  "documents": [
+    {
+      "doc_id": "loc-001",
+      "source": "brochure_location.md",
+      "text": "Noble Palace Tay Thang Long nam tren truc duong Vo Chi Cong, di chuyen nhanh den Tay Ho va trung tam Ha Noi.",
+      "metadata": {"topic": "location", "lang": "vi"}
+    },
+    {
+      "doc_id": "loc-002",
+      "source": "brochure_location.md",
+      "text": "Tu du an den ho Tay mat khoang 12 phut lai xe trong dieu kien giao thong binh thuong.",
+      "metadata": {"topic": "location", "lang": "vi"}
+    },
+    {
+      "doc_id": "price-001",
+      "source": "pricing_sheet_q1.md",
+      "text": "Gia can ho 2 phong ngu dao dong tu 7.8 ty den 9.2 ty tuy tang va huong view.",
+      "metadata": {"topic": "price", "lang": "vi"}
+    },
+    {
+      "doc_id": "price-002",
+      "source": "pricing_sheet_q1.md",
+      "text": "Gia can ho 3 phong ngu thuong nam trong khoang 10.5 ty den 13 ty.",
+      "metadata": {"topic": "price", "lang": "vi"}
+    },
+    {
+      "doc_id": "area-001",
+      "source": "unit_mix.md",
+      "text": "Dien tich tim tuong cho can 2 phong ngu la 78m2, 85m2 va 92m2.",
+      "metadata": {"topic": "area", "lang": "vi"}
+    },
+    {
+      "doc_id": "area-002",
+      "source": "unit_mix.md",
+      "text": "Can 3 phong ngu co cac lua chon dien tich 105m2, 118m2 va 128m2.",
+      "metadata": {"topic": "area", "lang": "vi"}
+    },
+    {
+      "doc_id": "pay-001",
+      "source": "payment_policy_2026.md",
+      "text": "Chinh sach thanh toan chia thanh 6 dot trong 12 thang ke tu ngay ky hop dong mua ban.",
+      "metadata": {"topic": "payment", "lang": "vi"}
+    },
+    {
+      "doc_id": "pay-002",
+      "source": "payment_policy_2026.md",
+      "text": "Khach thanh toan som toan bo duoc chiet khau toi da 3 phan tram gia tri can ho.",
+      "metadata": {"topic": "payment", "lang": "vi"}
+    },
+    {
+      "doc_id": "amen-001",
+      "source": "amenities.md",
+      "text": "Du an co ho boi bon mua, phong gym, khu vui choi tre em va vuon tren cao.",
+      "metadata": {"topic": "amenities", "lang": "vi"}
+    },
+    {
+      "doc_id": "amen-002",
+      "source": "amenities.md",
+      "text": "Khu thuong mai khoi de co sieu thi mini, nha thuoc va quan ca phe.",
+      "metadata": {"topic": "amenities", "lang": "vi"}
+    },
+    {
+      "doc_id": "legal-001",
+      "source": "legal_status.md",
+      "text": "Du an da co quyet dinh giao dat va giay phep xay dung theo quy dinh hien hanh.",
+      "metadata": {"topic": "legal", "lang": "vi"}
+    },
+    {
+      "doc_id": "legal-002",
+      "source": "legal_status.md",
+      "text": "Hinh thuc so huu can ho la so hong lau dai doi voi khach hang nguoi Viet Nam.",
+      "metadata": {"topic": "legal", "lang": "vi"}
+    },
+    {
+      "doc_id": "bank-001",
+      "source": "bank_support.md",
+      "text": "Ngan hang Techcombank ho tro vay toi da 70 phan tram gia tri hop dong mua ban.",
+      "metadata": {"topic": "bank", "lang": "vi"}
+    },
+    {
+      "doc_id": "bank-002",
+      "source": "bank_support.md",
+      "text": "Lai suat uu dai 0 phan tram trong 18 thang dau cho khoan vay tai VPBank.",
+      "metadata": {"topic": "bank", "lang": "vi"}
+    },
+    {
+      "doc_id": "timeline-001",
+      "source": "construction_timeline.md",
+      "text": "Tien do du kien ban giao can ho vao quy 4 nam 2027 neu khong co bien dong lon ve phap ly.",
+      "metadata": {"topic": "timeline", "lang": "vi"}
+    },
+    {
+      "doc_id": "timeline-002",
+      "source": "construction_timeline.md",
+      "text": "Nha mau mo cua tu thu 2 den chu nhat, khung gio 09:00 den 18:00.",
+      "metadata": {"topic": "timeline", "lang": "vi"}
+    }
+  ]
+}

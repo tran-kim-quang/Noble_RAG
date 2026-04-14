@@ -1,0 +1,1 @@
+"""Minimal sales orchestrator service."""
