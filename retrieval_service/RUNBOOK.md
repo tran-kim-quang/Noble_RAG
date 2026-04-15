@@ -35,6 +35,32 @@ Notes:
 - Current pipeline uses Haystack SentenceTransformers embedders, so use the HF model id (`Qwen/Qwen3-Embedding-4B`) instead of Ollama tag format (`qwen3-embedding:4b`).
 - If you previously used a 384-dim collection (e.g. MiniLM), keep `QDRANT_COLLECTION` as a new name (example above) to avoid dimension mismatch.
 
+### Run with remote gateway embedding server (`/ollama/...`)
+```bash
+QDRANT_URL=http://localhost:6333 \
+QDRANT_COLLECTION=retrieval_bench_qwen3_4b \
+EMBEDDING_BACKEND=remote \
+EMBEDDING_API_URL=http://10.50.56.103:8000/ollama/api/embeddings \
+EMBEDDING_API_FORMAT=ollama \
+EMBEDDING_API_KEY=replace-with-host-model-api-key \
+EMBEDDING_API_KEY_HEADER=X-API-Key \
+EMBEDDING_MODEL=qwen3-embedding:4b \
+EMBEDDING_DIM=2560 \
+MODEL_WARM_ENABLED=true \
+MODEL_WARM_INTERVAL_SEC=120 \
+LLM_WARM_ENABLED=true \
+LLM_WARM_API_URL=http://10.50.56.103:8000/ollama/api/generate \
+LLM_WARM_MODEL=gemma4:26b \
+MIN_RETRIEVE_SCORE=0.68 \
+uvicorn retrieval_service.app:app --host 127.0.0.1 --port 8011
+```
+
+Prerequisites from `host_model` docs:
+- host_model server listens on `0.0.0.0:8000`
+- client can reach `http://<server-ip>:8000/health`
+- if server requires auth key, pass the same key via `EMBEDDING_API_KEY`
+- `MODEL_WARM_ENABLED=true` keeps remote models warm on a fixed interval (embedding + optional LLM)
+
 ## 5) Run pytest (new terminal)
 ```bash
 source .venv/bin/activate

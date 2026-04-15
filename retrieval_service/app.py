@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import json
 import logging
+import socket
+import threading
+from typing import Any
+import urllib.error
+import urllib.request
 
 from fastapi import FastAPI
 from fastapi import HTTPException
@@ -19,9 +25,85 @@ from retrieval_service.schemas import (
 log = logging.getLogger("retrieval-service")
 
 
+def _post_json(url: str, payload: dict[str, Any], timeout_sec: float, settings) -> dict[str, Any]:
+    body = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if settings.embedding_api_key:
+        key_header = settings.embedding_api_key_header or "X-API-Key"
+        headers[key_header] = settings.embedding_api_key
+    if settings.embedding_api_auth_token:
+        headers["Authorization"] = f"Bearer {settings.embedding_api_auth_token}"
+
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+        raw = resp.read().decode("utf-8")
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("warm endpoint returned non-object JSON payload")
+    return parsed
+
+
+def _warm_embedding_model(svc, settings) -> None:
+    warm_text = (settings.embedding_warm_text or "warmup retrieval embedding").strip()
+    if not warm_text:
+        warm_text = "warmup retrieval embedding"
+    embedding = svc._embed_remote_text(warm_text)
+    log.info("model warm embedding ok dim=%s", len(embedding))
+
+
+def _warm_llm_model(settings) -> None:
+    if not settings.llm_warm_api_url or not settings.llm_warm_model:
+        return
+
+    payload: dict[str, Any] = {
+        "model": settings.llm_warm_model,
+        "prompt": settings.llm_warm_prompt,
+        "stream": False,
+    }
+    if settings.llm_warm_keep_alive:
+        payload["keep_alive"] = settings.llm_warm_keep_alive
+
+    parsed = _post_json(
+        url=settings.llm_warm_api_url,
+        payload=payload,
+        timeout_sec=settings.llm_warm_timeout_sec,
+        settings=settings,
+    )
+    _ = parsed.get("done")
+    log.info("model warm llm ok model=%s", settings.llm_warm_model)
+
+
+def _run_model_warmer_loop(stop_event: threading.Event, get_service_instance, settings) -> None:
+    initial_delay = max(0.0, float(settings.model_warm_initial_delay_sec))
+    if stop_event.wait(initial_delay):
+        return
+
+    interval_sec = max(5.0, float(settings.model_warm_interval_sec))
+    while not stop_event.is_set():
+        try:
+            svc = get_service_instance()
+            if settings.embedding_backend == "remote":
+                _warm_embedding_model(svc, settings)
+            if settings.llm_warm_enabled and settings.llm_warm_api_url and settings.llm_warm_model:
+                _warm_llm_model(settings)
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="ignore")
+            log.warning("model warm HTTP %s: %s", exc.code, raw[:200])
+        except urllib.error.URLError as exc:
+            log.warning("model warm unreachable: %s", exc.reason)
+        except socket.timeout:
+            log.warning("model warm timeout")
+        except Exception as exc:
+            log.warning("model warm failed: %s", exc)
+
+        if stop_event.wait(interval_sec):
+            return
+
+
 def create_app(service=None) -> FastAPI:
     app = FastAPI(title="Minimal Retrieval Service", version="0.1.0")
     holder = {"service": service}
+    warmer_holder: dict[str, Any] = {"thread": None, "stop_event": None}
     settings = get_settings()
     if not logging.getLogger().handlers:
         logging.basicConfig(
@@ -46,9 +128,49 @@ def create_app(service=None) -> FastAPI:
                 settings.port,
                 svc.settings.collection_name,
             )
+            llm_warm_ready = bool(settings.llm_warm_api_url and settings.llm_warm_model)
+            if settings.llm_warm_enabled and not llm_warm_ready:
+                log.warning("llm warm requested but missing LLM_WARM_API_URL or LLM_WARM_MODEL; llm warm disabled")
+
+            warm_targets = []
+            if settings.embedding_backend == "remote":
+                warm_targets.append("embedding")
+            if settings.llm_warm_enabled and llm_warm_ready:
+                warm_targets.append("llm")
+
+            if settings.model_warm_enabled and warm_targets:
+                stop_event = threading.Event()
+                thread = threading.Thread(
+                    target=_run_model_warmer_loop,
+                    args=(stop_event, get_service_instance, settings),
+                    name="model-warmer",
+                    daemon=True,
+                )
+                thread.start()
+                warmer_holder["thread"] = thread
+                warmer_holder["stop_event"] = stop_event
+                log.info(
+                    "model warm enabled targets=%s interval=%ss initial_delay=%ss",
+                    ",".join(warm_targets),
+                    settings.model_warm_interval_sec,
+                    settings.model_warm_initial_delay_sec,
+                )
+            else:
+                log.info("model warm disabled")
         except Exception as exc:
             log.exception("startup failed: %s", exc)
             raise
+
+    @app.on_event("shutdown")
+    def shutdown() -> None:
+        stop_event = warmer_holder.get("stop_event")
+        thread = warmer_holder.get("thread")
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None:
+            thread.join(timeout=3)
+        warmer_holder["thread"] = None
+        warmer_holder["stop_event"] = None
 
     @app.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:

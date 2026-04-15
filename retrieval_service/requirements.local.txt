@@ -1,0 +1,2 @@
+-r requirements.remote.txt
+sentence-transformers>=5.0.0

@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+import json
 import logging
 import re
+import socket
+from typing import TYPE_CHECKING
+import urllib.error
+import urllib.request
 from uuid import uuid4
 
 from haystack import Document, Pipeline
-from haystack.components.embedders import (
-    SentenceTransformersDocumentEmbedder,
-    SentenceTransformersTextEmbedder,
-)
 from haystack.components.writers import DocumentWriter
 from haystack.document_stores.types import DuplicatePolicy
 from haystack_integrations.components.retrievers.qdrant import QdrantEmbeddingRetriever
@@ -19,6 +20,12 @@ from qdrant_client.http import exceptions as qdrant_exceptions
 
 from retrieval_service.config import Settings
 from retrieval_service.schemas import IngestDocument
+
+if TYPE_CHECKING:
+    from haystack.components.embedders import (
+        SentenceTransformersDocumentEmbedder,
+        SentenceTransformersTextEmbedder,
+    )
 
 log = logging.getLogger("retrieval-service")
 
@@ -70,29 +77,61 @@ class RetrievalService:
             recreate_index=False,
         )
 
-        self.doc_embedder = SentenceTransformersDocumentEmbedder(model=settings.embedding_model)
-        self.text_embedder = SentenceTransformersTextEmbedder(model=settings.embedding_model)
+        self.indexing: Pipeline | None = None
+        self.retrieval: Pipeline | None = None
+        self.writer: DocumentWriter | None = None
+        self.embedding_retriever: QdrantEmbeddingRetriever | None = None
+        self.doc_embedder: SentenceTransformersDocumentEmbedder | None = None
+        self.text_embedder: SentenceTransformersTextEmbedder | None = None
 
-        self.doc_embedder.warm_up()
-        self.text_embedder.warm_up()
-        self._validate_embedding_dim()
+        if settings.embedding_backend == "local":
+            try:
+                from haystack.components.embedders import (
+                    SentenceTransformersDocumentEmbedder,
+                    SentenceTransformersTextEmbedder,
+                )
+            except ImportError as exc:
+                raise RuntimeError(
+                    "EMBEDDING_BACKEND=local requires sentence-transformers dependencies. "
+                    "Build image with EMBEDDING_PROFILE=local or install local embedding deps."
+                ) from exc
+            self.doc_embedder = SentenceTransformersDocumentEmbedder(model=settings.embedding_model)
+            self.text_embedder = SentenceTransformersTextEmbedder(model=settings.embedding_model)
+            self.doc_embedder.warm_up()
+            self.text_embedder.warm_up()
+            self._validate_embedding_dim()
+
+            self.indexing = Pipeline()
+            self.indexing.add_component("embedder", self.doc_embedder)
+            self.indexing.add_component(
+                "writer",
+                DocumentWriter(document_store=self.document_store, policy=DuplicatePolicy.OVERWRITE),
+            )
+            self.indexing.connect("embedder.documents", "writer.documents")
+
+            self.retrieval = Pipeline()
+            self.retrieval.add_component("embedder", self.text_embedder)
+            self.retrieval.add_component("retriever", QdrantEmbeddingRetriever(document_store=self.document_store))
+            self.retrieval.connect("embedder.embedding", "retriever.query_embedding")
+        elif settings.embedding_backend == "remote":
+            if not settings.embedding_api_url:
+                raise ValueError("EMBEDDING_API_URL is required when EMBEDDING_BACKEND=remote")
+            self._validate_remote_embedding_dim()
+            self.writer = DocumentWriter(
+                document_store=self.document_store,
+                policy=DuplicatePolicy.OVERWRITE,
+            )
+            self.embedding_retriever = QdrantEmbeddingRetriever(document_store=self.document_store)
+        else:
+            raise ValueError(
+                f"Unsupported EMBEDDING_BACKEND='{settings.embedding_backend}'. Use 'local' or 'remote'."
+            )
+
         self._validate_qdrant_collection_dim()
-
-        self.indexing = Pipeline()
-        self.indexing.add_component("embedder", self.doc_embedder)
-        self.indexing.add_component(
-            "writer",
-            DocumentWriter(document_store=self.document_store, policy=DuplicatePolicy.OVERWRITE),
-        )
-        self.indexing.connect("embedder.documents", "writer.documents")
-
-        self.retrieval = Pipeline()
-        self.retrieval.add_component("embedder", self.text_embedder)
-        self.retrieval.add_component("retriever", QdrantEmbeddingRetriever(document_store=self.document_store))
-        self.retrieval.connect("embedder.embedding", "retriever.query_embedding")
         log.info(
-            "startup complete collection=%s model=%s dim=%s qdrant=%s",
+            "startup complete collection=%s backend=%s model=%s dim=%s qdrant=%s",
             settings.collection_name,
+            settings.embedding_backend,
             settings.embedding_model,
             settings.embedding_dim,
             settings.qdrant_url,
@@ -107,8 +146,9 @@ class RetrievalService:
         return {"status": status, "collection": self.settings.collection_name}
 
     def ingest(self, documents: list[IngestDocument]) -> int:
-        haystack_docs = [
-            Document(
+        haystack_docs = []
+        for item in documents:
+            doc = Document(
                 id=item.doc_id or str(uuid4()),
                 content=item.text,
                 meta={
@@ -116,11 +156,24 @@ class RetrievalService:
                     **(item.metadata or {}),
                 },
             )
-            for item in documents
-        ]
+            haystack_docs.append(doc)
 
-        out = self.indexing.run({"embedder": {"documents": haystack_docs}})
-        written = int(out["writer"]["documents_written"])
+        if self.settings.embedding_backend == "local":
+            if self.indexing is None:
+                raise RuntimeError("indexing pipeline is not initialized")
+            out = self.indexing.run({"embedder": {"documents": haystack_docs}})
+            written = int(out["writer"]["documents_written"])
+        else:
+            if self.writer is None:
+                raise RuntimeError("document writer is not initialized")
+            texts = [doc.content or "" for doc in haystack_docs]
+            embeddings = self._embed_remote_batch(texts)
+            docs_with_embeddings = [
+                Document(id=doc.id, content=doc.content, meta=doc.meta, embedding=embedding)
+                for doc, embedding in zip(haystack_docs, embeddings, strict=True)
+            ]
+            out = self.writer.run(documents=docs_with_embeddings)
+            written = int(out.get("documents_written", len(docs_with_embeddings)))
         log.info("ingest documents=%s written=%s", len(documents), written)
         return written
 
@@ -130,8 +183,17 @@ class RetrievalService:
             return {"results": [], "confidence": 0.0, "low_confidence": True}
         k = top_k or self.settings.default_top_k
         k = max(1, min(k, self.settings.max_top_k))
-        out = self.retrieval.run({"embedder": {"text": query}, "retriever": {"top_k": k}})
-        docs = out.get("retriever", {}).get("documents", []) or []
+        if self.settings.embedding_backend == "local":
+            if self.retrieval is None:
+                raise RuntimeError("retrieval pipeline is not initialized")
+            out = self.retrieval.run({"embedder": {"text": query}, "retriever": {"top_k": k}})
+            docs = out.get("retriever", {}).get("documents", []) or []
+        else:
+            if self.embedding_retriever is None:
+                raise RuntimeError("embedding retriever is not initialized")
+            query_embedding = self._embed_remote_text(query)
+            out = self.embedding_retriever.run(query_embedding=query_embedding, top_k=k)
+            docs = out.get("documents", []) or []
         confidence = float(docs[0].score or 0.0) if docs else 0.0
         low_confidence = confidence < self.settings.min_retrieve_score
         log.info(
@@ -351,6 +413,8 @@ class RetrievalService:
         return out
 
     def _validate_embedding_dim(self) -> None:
+        if self.text_embedder is None:
+            raise RuntimeError("text embedder is not initialized")
         embedding = self.text_embedder.run("dimension probe")["embedding"]
         model_dim = len(embedding)
         if model_dim != self.settings.embedding_dim:
@@ -359,6 +423,104 @@ class RetrievalService:
                 f"EMBEDDING_DIM={self.settings.embedding_dim} but model '{self.settings.embedding_model}' returns {model_dim}. "
                 "Please update EMBEDDING_DIM or choose a compatible model."
             )
+
+    def _validate_remote_embedding_dim(self) -> None:
+        embedding = self._embed_remote_text("dimension probe")
+        model_dim = len(embedding)
+        if model_dim != self.settings.embedding_dim:
+            raise ValueError(
+                "Remote embedding dimension mismatch: "
+                f"EMBEDDING_DIM={self.settings.embedding_dim} but endpoint '{self.settings.embedding_api_url}' "
+                f"returned dim={model_dim}. Please align endpoint model or EMBEDDING_DIM."
+            )
+
+    def _embed_remote_text(self, text: str) -> list[float]:
+        embeddings = self._embed_remote_batch([text])
+        return embeddings[0]
+
+    def _embed_remote_batch(self, texts: list[str]) -> list[list[float]]:
+        fmt = self.settings.embedding_api_format
+        if fmt == "ollama":
+            return [self._embed_remote_ollama(text) for text in texts]
+        if fmt == "openai":
+            return self._embed_remote_openai(texts)
+        if fmt in {"host_model", "noble_api"}:
+            return [self._embed_remote_host_model(text) for text in texts]
+        raise ValueError(
+            f"Unsupported EMBEDDING_API_FORMAT='{fmt}'. Use 'ollama', 'openai', or 'host_model'."
+        )
+
+    def _embed_remote_ollama(self, text: str) -> list[float]:
+        payload = {
+            "model": self.settings.embedding_model,
+            "prompt": text,
+        }
+        parsed = self._post_embedding_json(payload)
+        embedding = parsed.get("embedding")
+        if not isinstance(embedding, list) or not embedding:
+            raise RuntimeError("Remote embedding endpoint returned invalid 'embedding' payload for ollama format.")
+        return [float(item) for item in embedding]
+
+    def _embed_remote_openai(self, texts: list[str]) -> list[list[float]]:
+        payload = {
+            "model": self.settings.embedding_model,
+            "input": texts,
+        }
+        parsed = self._post_embedding_json(payload)
+        data = parsed.get("data")
+        if not isinstance(data, list) or len(data) != len(texts):
+            raise RuntimeError("Remote embedding endpoint returned invalid 'data' payload for openai format.")
+
+        sorted_items = sorted(data, key=lambda item: int(item.get("index", 0)))
+        embeddings: list[list[float]] = []
+        for item in sorted_items:
+            embedding = item.get("embedding")
+            if not isinstance(embedding, list) or not embedding:
+                raise RuntimeError("Remote embedding endpoint returned invalid embedding item in 'data'.")
+            embeddings.append([float(value) for value in embedding])
+        return embeddings
+
+    def _embed_remote_host_model(self, text: str) -> list[float]:
+        payload = {
+            "text": text,
+            "model": self.settings.embedding_model,
+        }
+        parsed = self._post_embedding_json(payload)
+        embedding = parsed.get("embedding")
+        if not isinstance(embedding, list) or not embedding:
+            raise RuntimeError("Remote embedding endpoint returned invalid 'embedding' payload for host_model format.")
+        return [float(item) for item in embedding]
+
+    def _post_embedding_json(self, payload: dict) -> dict:
+        body = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.settings.embedding_api_key:
+            key_header = self.settings.embedding_api_key_header or "X-API-Key"
+            headers[key_header] = self.settings.embedding_api_key
+        if self.settings.embedding_api_auth_token:
+            headers["Authorization"] = f"Bearer {self.settings.embedding_api_auth_token}"
+
+        req = urllib.request.Request(
+            self.settings.embedding_api_url,
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.settings.embedding_api_timeout_sec) as resp:
+                raw = resp.read().decode("utf-8")
+            return json.loads(raw)
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(
+                f"embedding endpoint HTTP {exc.code}: {raw[:200]}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"embedding endpoint unreachable: {exc.reason}") from exc
+        except socket.timeout as exc:
+            raise RuntimeError(
+                f"embedding endpoint timeout after {self.settings.embedding_api_timeout_sec}s"
+            ) from exc
 
     def _validate_qdrant_collection_dim(self) -> None:
         client = QdrantClient(

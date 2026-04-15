@@ -19,11 +19,16 @@ services:
     build:
       context: ..
       dockerfile: retrieval_service/Dockerfile
+      args:
+        EMBEDDING_PROFILE: remote
     container_name: noble_retrieval_service
+    hostname: desktop
     env_file:
       - ./.env.retrieval
     depends_on:
       - qdrant
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     expose:
       - "8011"
     networks:

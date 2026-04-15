@@ -13,6 +13,7 @@
 - `deploy/docker-compose.yml`
 - `deploy/.env.retrieval`
 - `deploy/.env.orchestrator`
+- `docs/huong_dan_ket_noi_host_model_cho_retrieval_service.md`
 - `deploy/volumes/qdrant/`
 - `deploy/scripts/start.sh`
 - `deploy/scripts/stop.sh`
@@ -35,6 +36,16 @@ fi
 # optional: tune config
 vi deploy/.env.retrieval
 vi deploy/.env.orchestrator
+
+# if embedding model runs on host_model server (from tran-kim-quang/host_model)
+# set in deploy/.env.retrieval:
+#   EMBEDDING_BACKEND=remote
+#   EMBEDDING_API_URL=http://host.docker.internal:8000/embed
+#   EMBEDDING_API_FORMAT=host_model
+#   EMBEDDING_API_KEY=replace-with-host-model-api-key
+#   EMBEDDING_API_KEY_HEADER=X-API-Key
+#   EMBEDDING_MODEL=qwen3-embedding:4b
+#   EMBEDDING_DIM=2560
 
 # build images
 $COMPOSE -f deploy/docker-compose.yml build
