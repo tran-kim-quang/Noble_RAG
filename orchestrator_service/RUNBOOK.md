@@ -1,4 +1,4 @@
-# Orchestrator Service Local Runbook
+# Orchestrator Service Local Runbook (2 Routes)
 
 ## Terminal 1 - Start Retrieval Service
 ```bash
@@ -6,9 +6,9 @@ cd /home/ncthang/CongThang/Noble_RAG
 source .venv/bin/activate
 
 QDRANT_URL=http://localhost:6333 \
-QDRANT_COLLECTION=retrieval_bench_v2 \
-EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2 \
-EMBEDDING_DIM=384 \
+QDRANT_COLLECTION=retrieval_bench_qwen3_4b \
+EMBEDDING_MODEL=Qwen/Qwen3-Embedding-4B \
+EMBEDDING_DIM=2560 \
 MIN_RETRIEVE_SCORE=0.68 \
 uvicorn retrieval_service.app:app --host 127.0.0.1 --port 8011
 ```
@@ -21,6 +21,10 @@ source .venv/bin/activate
 curl -s -X POST http://127.0.0.1:8011/ingest \
   -H "Content-Type: application/json" \
   --data @data/sample_docs.json
+
+curl -s -X POST http://127.0.0.1:8011/ingest \
+  -H "Content-Type: application/json" \
+  --data @data/sample_docs_project_layers.json
 
 RETRIEVAL_SERVICE_URL=http://127.0.0.1:8011 \
 ORCHESTRATOR_DEFAULT_TOP_K=5 \
@@ -44,73 +48,60 @@ pytest -q tests/test_orchestrator_e2e.py
 
 ## Curl End-to-End Suite
 
-### 1) Health retrieval
-```bash
-curl -s http://127.0.0.1:8011/health
-```
-
-### 2) Health orchestrator
+### 1) Health orchestrator
 ```bash
 curl -s http://127.0.0.1:8021/health
 ```
 
-### 3) no_retrieval_needed (explicit false)
+### 2) consult_discovery
 ```bash
 curl -s -X POST http://127.0.0.1:8021/sales/query \
   -H "Content-Type: application/json" \
-  -d '{"message":"xin chao", "need_retrieval": false}'
+  -d '{
+    "message":"Mua de dau tu thi nen bat dau tu dau?",
+    "lead_state":{
+      "name":null,
+      "phone_contact":null,
+      "need":{"summary":"","topics":[],"evidence":[],"last_updated_at":null},
+      "painpoint":{"summary":"","topics":[],"evidence":[],"last_updated_at":null}
+    }
+  }'
 ```
 
-### 4) retrieval_confident (explicit true)
+### 3) project_grounded (auto routing)
 ```bash
 curl -s -X POST http://127.0.0.1:8021/sales/query \
   -H "Content-Type: application/json" \
-  -d '{"message":"gia can 2 phong ngu", "need_retrieval": true, "top_k": 5}'
+  -d '{
+    "message":"Co can nao gan truong hoc va benh vien?",
+    "lead_state":{
+      "name":null,
+      "phone_contact":null,
+      "need":{"summary":"","topics":[],"evidence":[],"last_updated_at":null},
+      "painpoint":{"summary":"","topics":[],"evidence":[],"last_updated_at":null}
+    }
+  }'
 ```
 
-### 5) retrieval_confident (auto heuristic)
+### 4) force project_grounded
 ```bash
 curl -s -X POST http://127.0.0.1:8021/sales/query \
   -H "Content-Type: application/json" \
-  -d '{"message":"phap ly du an hien tai"}'
+  -d '{
+    "message":"Cho minh thong tin phap ly du an",
+    "force_route":"project_grounded",
+    "lead_state":{
+      "name":null,
+      "phone_contact":null,
+      "need":{"summary":"","topics":[],"evidence":[],"last_updated_at":null},
+      "painpoint":{"summary":"","topics":[],"evidence":[],"last_updated_at":null}
+    }
+  }'
 ```
 
-### 6) retrieval_low_confidence (no-answer style)
-```bash
-curl -s -X POST http://127.0.0.1:8021/sales/query \
-  -H "Content-Type: application/json" \
-  -d '{"message":"du an co san truot tuyet trong nha khong", "need_retrieval": true}'
-```
-
-### 7) retrieval_low_confidence (mơ hồ)
-```bash
-curl -s -X POST http://127.0.0.1:8021/sales/query \
-  -H "Content-Type: application/json" \
-  -d '{"message":"cho minh thong tin tong quan du an", "need_retrieval": true}'
-```
-
-### 8) blank message -> 422
+### 5) blank message -> 422
 ```bash
 curl -s -X POST http://127.0.0.1:8021/sales/query \
   -H "Content-Type: application/json" \
   -d '{"message":"   "}'
-```
-
-### 9) retrieval service down test
-```bash
-pkill -f "uvicorn retrieval_service.app:app"
-
-curl -s -X POST http://127.0.0.1:8021/sales/query \
-  -H "Content-Type: application/json" \
-  -d '{"message":"gia can 2 phong ngu", "need_retrieval": true}'
-```
-
-### 10) restart retrieval after down test
-```bash
-QDRANT_URL=http://localhost:6333 \
-QDRANT_COLLECTION=retrieval_bench_v2 \
-EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2 \
-EMBEDDING_DIM=384 \
-MIN_RETRIEVE_SCORE=0.68 \
-uvicorn retrieval_service.app:app --host 127.0.0.1 --port 8011
 ```

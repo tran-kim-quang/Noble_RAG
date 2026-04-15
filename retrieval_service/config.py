@@ -11,8 +11,8 @@ class Settings:
     collection_name: str = os.getenv("QDRANT_COLLECTION", "retrieval_docs")
     qdrant_timeout_sec: float = float(os.getenv("QDRANT_TIMEOUT_SEC", "10"))
 
-    embedding_model: str = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-    embedding_dim: int = int(os.getenv("EMBEDDING_DIM", "384"))
+    embedding_model: str = os.getenv("EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-4B")
+    embedding_dim: int = int(os.getenv("EMBEDDING_DIM", "2560"))
 
     default_top_k: int = int(os.getenv("DEFAULT_TOP_K", "5"))
     max_top_k: int = int(os.getenv("MAX_TOP_K", "20"))

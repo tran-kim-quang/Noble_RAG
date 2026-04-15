@@ -10,6 +10,8 @@ from retrieval_service.schemas import (
     HealthResponse,
     IngestRequest,
     IngestResponse,
+    ProjectGroundedRetrieveRequest,
+    ProjectGroundedRetrieveResponse,
     RetrieveRequest,
     RetrieveResponse,
 )
@@ -91,6 +93,39 @@ def create_app(service=None) -> FastAPI:
                 len(payload.query),
                 payload.top_k or svc.settings.default_top_k,
                 len(response.results),
+                response.confidence or 0.0,
+                response.low_confidence,
+            )
+            return response
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/retrieve/project-grounded", response_model=ProjectGroundedRetrieveResponse)
+    def retrieve_project_grounded(payload: ProjectGroundedRetrieveRequest) -> ProjectGroundedRetrieveResponse:
+        svc = get_service_instance()
+        try:
+            raw = svc.retrieve_project_grounded(
+                query=payload.query,
+                retrieval_intent=payload.retrieval_intent,
+                top_k=payload.top_k,
+            )
+            response = ProjectGroundedRetrieveResponse(
+                project_cards=raw.get("project_cards", []) or [],
+                trait_tags=raw.get("trait_tags", []) or [],
+                evidence_chunks=raw.get("evidence_chunks", []) or [],
+                confidence=raw.get("confidence"),
+                low_confidence=bool(raw.get("low_confidence", False)),
+            )
+            log.info(
+                (
+                    "project-grounded retrieve query_len=%s top_k=%s project_cards=%s "
+                    "trait_tags=%s evidence_chunks=%s confidence=%.4f low_confidence=%s"
+                ),
+                len(payload.query),
+                payload.top_k or getattr(getattr(svc, "settings", object()), "default_top_k", 5),
+                len(response.project_cards),
+                len(response.trait_tags),
+                len(response.evidence_chunks),
                 response.confidence or 0.0,
                 response.low_confidence,
             )

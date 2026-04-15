@@ -33,23 +33,27 @@ def post_json(url: str, payload: dict[str, Any], timeout: float = 20.0) -> tuple
 
 def print_case(label: str, status: int, payload: dict[str, Any]) -> None:
     route = payload.get("route")
-    action = payload.get("action")
     reason = payload.get("decision_reason")
-    print(f"[{label}] status={status} route={route} action={action} reason={reason}")
+    has_state = bool(payload.get("lead_state"))
+    print(f"[{label}] status={status} route={route} has_state={has_state} reason={reason}")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Minimal E2E smoke test for orchestrator flow")
+    parser = argparse.ArgumentParser(description="E2E smoke test for 2-route orchestrator flow")
     parser.add_argument("--base-url", default="http://127.0.0.1:8021", help="Orchestrator base URL")
     args = parser.parse_args()
 
     url = args.base_url.rstrip("/") + "/sales/query"
-
+    base_state = {
+        "name": None,
+        "phone_contact": None,
+        "need": {"summary": "", "topics": [], "evidence": [], "last_updated_at": None},
+        "painpoint": {"summary": "", "topics": [], "evidence": [], "last_updated_at": None},
+    }
     cases = [
-        ("NO_RETRIEVAL", {"message": "xin chao", "need_retrieval": False}),
-        ("CONFIDENT", {"message": "gia can 2 phong ngu", "need_retrieval": True, "top_k": 5}),
-        ("LOW_CONF", {"message": "du an co san truot tuyet trong nha khong", "need_retrieval": True}),
-        ("AUTO_HEUR", {"message": "phap ly du an hien tai"}),
+        ("CONSULT", {"message": "Mua de dau tu thi nen bat dau tu dau?", "lead_state": base_state}),
+        ("PROJECT", {"message": "Co can nao gan truong hoc va benh vien?", "lead_state": base_state}),
+        ("FORCE_PROJECT", {"message": "Cho minh thong tin phap ly", "force_route": "project_grounded", "lead_state": base_state}),
         ("BLANK", {"message": "   "}),
     ]
 
@@ -64,12 +68,14 @@ def main() -> int:
         else:
             if status != 200:
                 failed += 1
+            elif data.get("route") not in {"consult_discovery", "project_grounded"}:
+                failed += 1
 
     print("-" * 72)
     if failed:
         print(f"SMOKE FAIL failed_cases={failed}/{len(cases)}")
         return 2
-    print("SMOKE PASS all cases returned expected HTTP status")
+    print("SMOKE PASS all cases returned expected contract")
     return 0
 
 

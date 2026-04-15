@@ -1,0 +1,52 @@
+System Topology
+```mermaid
+flowchart LR
+    U[Client/UI] -->|POST /sales/query| O[orchestrator-service :8021]
+    O -->|POST /retrieve/project-grounded| R[retrieval-service :8011]
+    R -->|Vector search / write| Q[(Qdrant)]
+
+    D[Ingest scripts / ops] -->|POST /ingest| R
+```
+
+Orchestrator Flow (2 Routes)
+```mermaid
+flowchart TD
+    A[Input: message + lead_state] --> B[classify_route]
+    B -->|consult_discovery| C[run_consult_discovery]
+    C --> D[Extract need_update / painpoint_update / routing_signal]
+    D --> E[merge_lead_state]
+    E --> F{should_route_project?}
+
+    F -->|No| G[Return QueryResponse route=consult_discovery]
+    F -->|Yes| H[run_project_grounded]
+
+    B -->|project_grounded| H
+    H --> I[build_retrieval_intent]
+    I --> J[retrieval_client.retrieve_project_grounded]
+    J --> K[Build assistant_reply + updates]
+    K --> L[merge_lead_state]
+    L --> M[Return QueryResponse route=project_grounded]
+```
+
+Retrieval Grounded Flow
+```mermaid
+flowchart TD
+    subgraph Ingest Path
+      I1[/POST /ingest/] --> I2[SentenceTransformersDocumentEmbedder]
+      I2 --> I3[DocumentWriter]
+      I3 --> I4[(Qdrant collection)]
+    end
+
+    subgraph Retrieve Grounded Path
+      R1[/POST /retrieve/project-grounded/] --> R2[build_grounded_query]
+      R2 --> R3[SentenceTransformersTextEmbedder]
+      R3 --> R4[QdrantEmbeddingRetriever]
+      R4 --> R5[docs + scores]
+      R5 --> R6[_build_evidence_chunks]
+      R6 --> R7[_build_project_cards]
+      R6 --> R8[_build_trait_tags]
+      R7 --> R9[ProjectGroundedRetrieveResponse]
+      R8 --> R9
+      R6 --> R9
+    end
+```
