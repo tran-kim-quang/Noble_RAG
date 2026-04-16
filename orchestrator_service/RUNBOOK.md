@@ -6,9 +6,15 @@ cd /home/ncthang/CongThang/Noble_RAG
 source .venv/bin/activate
 
 QDRANT_URL=http://localhost:6333 \
-QDRANT_COLLECTION=retrieval_bench_qwen3_4b \
-EMBEDDING_MODEL=Qwen/Qwen3-Embedding-4B \
-EMBEDDING_DIM=2560 \
+QDRANT_COLLECTION=retrieval_bench_qwen3_8b_local \
+EMBEDDING_BACKEND=remote \
+EMBEDDING_API_URL=http://127.0.0.1:11434/api/embeddings \
+EMBEDDING_API_FORMAT=ollama \
+EMBEDDING_MODEL=qwen3-embedding:8b \
+EMBEDDING_DIM=4096 \
+LLM_WARM_ENABLED=true \
+LLM_WARM_API_URL=http://127.0.0.1:11434/api/generate \
+LLM_WARM_MODEL=gemma4:latest \
 MIN_RETRIEVE_SCORE=0.68 \
 uvicorn retrieval_service.app:app --host 127.0.0.1 --port 8011
 ```
@@ -18,13 +24,10 @@ uvicorn retrieval_service.app:app --host 127.0.0.1 --port 8011
 cd /home/ncthang/CongThang/Noble_RAG
 source .venv/bin/activate
 
-curl -s -X POST http://127.0.0.1:8011/ingest \
-  -H "Content-Type: application/json" \
-  --data @data/sample_docs.json
-
-curl -s -X POST http://127.0.0.1:8011/ingest \
-  -H "Content-Type: application/json" \
-  --data @data/sample_docs_project_layers.json
+python scripts/ingest_markdown_to_retrieval.py \
+  --base-url http://127.0.0.1:8011 \
+  --data-dir data \
+  --files 02_12_2025_CSBH_574_NOBLE_PALACE_TAY_THANG_LONG_HDBM.md CONCEPT_THIET_KE_08_02_2025_only_hang_muc_noi_dung.md
 
 RETRIEVAL_SERVICE_URL=http://127.0.0.1:8011 \
 ORCHESTRATOR_DEFAULT_TOP_K=5 \

@@ -19,6 +19,7 @@ RUN set -eux; \
 
 COPY retrieval_service /app/retrieval_service
 COPY data /app/data
+COPY scripts /app/scripts
 
 EXPOSE 8011
 
