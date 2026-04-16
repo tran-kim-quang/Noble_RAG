@@ -59,6 +59,8 @@ class LeadState(BaseModel):
         "invite_next_step",
         "nurture_lead",
         "handoff_to_human",
+        "capture_contact",
+        "confirm_followup",
     ] | None = None
     next_best_action: Literal[
         "continue_discovery",
@@ -68,7 +70,12 @@ class LeadState(BaseModel):
         "invite_call",
         "invite_site_visit",
         "handoff_human",
+        "ask_name",
+        "ask_phone",
+        "ask_name_and_phone",
+        "schedule_followup",
     ] | None = None
+    contact_capture_status: Literal["unknown", "requested", "partial", "complete"] = "unknown"
 
 
 class NeedPainpointDelta(BaseModel):
@@ -177,6 +184,8 @@ class DecisionTrace(BaseModel):
         "invite_next_step",
         "nurture_lead",
         "handoff_to_human",
+        "capture_contact",
+        "confirm_followup",
     ] | None = None
     response_mode: Literal[
         "warm_welcome",
@@ -188,6 +197,8 @@ class DecisionTrace(BaseModel):
         "soft_next_step",
         "nurture_followup",
         "meeting_invite",
+        "contact_capture",
+        "followup_confirm",
     ] | None = None
     ask_policy: Literal["avoid_question", "allow_question", "must_clarify"] | None = None
 

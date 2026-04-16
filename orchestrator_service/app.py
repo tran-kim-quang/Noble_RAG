@@ -57,6 +57,8 @@ _CONVERSATION_GOALS = {
     "invite_next_step",
     "nurture_lead",
     "handoff_to_human",
+    "capture_contact",
+    "confirm_followup",
 }
 _NEXT_BEST_ACTIONS = {
     "continue_discovery",
@@ -66,6 +68,10 @@ _NEXT_BEST_ACTIONS = {
     "invite_call",
     "invite_site_visit",
     "handoff_human",
+    "ask_name",
+    "ask_phone",
+    "ask_name_and_phone",
+    "schedule_followup",
 }
 _RESPONSE_MODES = {
     "warm_welcome",
@@ -77,6 +83,8 @@ _RESPONSE_MODES = {
     "soft_next_step",
     "nurture_followup",
     "meeting_invite",
+    "contact_capture",
+    "followup_confirm",
 }
 _ASK_POLICIES = {"avoid_question", "allow_question", "must_clarify"}
 _LEGACY_RESPONSE_MODE_MAP = {
@@ -214,10 +222,13 @@ def merge_lead_state(
         phone_contact=extracted_phone or lead_state.phone_contact,
         need=_merge_block(lead_state.need, need_update),
         painpoint=_merge_block(lead_state.painpoint, painpoint_update),
+        engagement_state=lead_state.engagement_state,
+        engagement_confidence=lead_state.engagement_confidence,
         sales_state=lead_state.sales_state,
         lead_level=lead_state.lead_level,
         last_conversation_goal=lead_state.last_conversation_goal,
         next_best_action=lead_state.next_best_action,
+        contact_capture_status=lead_state.contact_capture_status,
     )
 
 
@@ -489,6 +500,31 @@ def _has_grounded_fit(grounded_result: dict[str, Any] | None) -> bool:
     return bool(cards and not bool(grounded_result.get("low_confidence", False)))
 
 
+def _missing_contact_fields(lead_state: LeadState) -> tuple[bool, bool]:
+    missing_name = not bool((lead_state.name or "").strip())
+    missing_phone = not bool((lead_state.phone_contact or "").strip())
+    return missing_name, missing_phone
+
+
+def _message_requests_followup(message: str) -> bool:
+    lowered = (message or "").strip().lower()
+    signals = [
+        "đi xem",
+        "xem thực tế",
+        "gặp trực tiếp",
+        "hẹn",
+        "gọi lại",
+        "liên hệ",
+        "tư vấn kỹ hơn",
+        "tư vấn sâu hơn",
+        "gửi thông tin",
+        "gửi bảng giá",
+        "đặt lịch",
+        "trao đổi thêm",
+    ]
+    return any(token in lowered for token in signals)
+
+
 def _promote_engagement_state(current: str, candidate: str) -> str:
     ranking = {"cold": 0, "warm": 1, "interested": 2, "ready": 3}
     current_norm = _normalize_engagement_state(current)
@@ -545,6 +581,7 @@ def update_engagement_state(
 
 def update_sales_state(
     previous_state: str,
+    message: str,
     query_type: str,
     lead_state: LeadState,
     grounded_result: dict[str, Any] | None,
@@ -585,8 +622,11 @@ def update_sales_state(
 
     if state == "qualified" and grounded_fit and len(recent_history) >= 2:
         state = "interested"
-    if state == "interested" and grounded_fit and _has_structured_need(lead_state):
-        state = "appointment_ready"
+    if state == "interested":
+        if _message_requests_followup(message):
+            state = "appointment_ready"
+        elif lead_state.next_best_action in {"invite_call", "invite_site_visit", "handoff_human"}:
+            state = "appointment_ready"
     if state in {"exploring", "need_identified"} and len(recent_history) >= 4 and not _has_grounded_fit(grounded_result):
         state = "nurture"
 
@@ -600,11 +640,19 @@ def select_conversation_goal(
     engagement_state: str,
     query_type: str,
     grounded_result: dict[str, Any] | None,
+    lead_state: LeadState,
+    message: str,
     suggested_goal: str | None = None,
 ) -> str:
     state = _normalize_sales_state(sales_state)
     engagement = _normalize_engagement_state(engagement_state)
     suggestion = _normalize_conversation_goal(suggested_goal, fallback="build_trust") if suggested_goal else None
+    missing_name, missing_phone = _missing_contact_fields(lead_state)
+
+    if state in {"appointment_ready", "handoff"} or _message_requests_followup(message):
+        if missing_name or missing_phone:
+            return "capture_contact"
+        return "confirm_followup"
     if suggestion == "handoff_to_human":
         return "handoff_to_human"
 
@@ -637,10 +685,23 @@ def select_next_best_action(
     engagement_state: str,
     conversation_goal: str,
     grounded_result: dict[str, Any] | None,
+    lead_state: LeadState,
 ) -> str:
     state = _normalize_sales_state(sales_state)
     engagement = _normalize_engagement_state(engagement_state)
     goal = _normalize_conversation_goal(conversation_goal)
+    missing_name, missing_phone = _missing_contact_fields(lead_state)
+
+    if goal == "capture_contact":
+        if missing_name and missing_phone:
+            return "ask_name_and_phone"
+        if missing_name:
+            return "ask_name"
+        if missing_phone:
+            return "ask_phone"
+    if goal == "confirm_followup":
+        return "schedule_followup"
+
     if state == "handoff" or goal == "handoff_to_human":
         return "handoff_human"
     if engagement == "ready":
@@ -695,6 +756,14 @@ def _is_short_user_reply_after_assistant_question(message: str, recent_history: 
 def _select_question_focus(conversation_goal: str, next_best_action: str, query_type: str) -> str:
     goal = _normalize_conversation_goal(conversation_goal)
     action = _normalize_next_best_action(next_best_action)
+    if action == "ask_name":
+        return "tên xưng hô thuận tiện"
+    if action == "ask_phone":
+        return "số điện thoại liên hệ"
+    if action == "ask_name_and_phone":
+        return "tên và số điện thoại liên hệ"
+    if action == "schedule_followup":
+        return "thời điểm tiện để mình liên hệ lại"
     if goal == "discover_need":
         return "mục tiêu sử dụng"
     if goal == "surface_priority":
@@ -724,6 +793,10 @@ def _select_response_mode(
     has_grounded_result = _has_grounded_fit(grounded_result)
     low_confidence = bool(grounded_result.get("low_confidence", False)) if grounded_result else False
 
+    if goal == "capture_contact":
+        return "contact_capture"
+    if goal == "confirm_followup":
+        return "followup_confirm"
     if goal == "handoff_to_human":
         return "meeting_invite"
 
@@ -824,6 +897,33 @@ def build_reply_plan(
     has_grounded_result = _has_grounded_fit(grounded_result=grounded_result)
     has_state_context = _has_structured_need(lead_state)
 
+    if response_mode == "contact_capture":
+        return ReplyPlan(
+            response_mode=response_mode,
+            ask_policy="must_clarify",
+            focus=_build_reply_focus(message=message, lead_state=lead_state, grounded_result=grounded_result),
+            question_focus=_select_question_focus(
+                conversation_goal=goal,
+                next_best_action=action,
+                query_type=analysis.query_type,
+            ),
+            conversation_goal=goal,
+            next_best_action=action,
+        )
+    if response_mode == "followup_confirm":
+        return ReplyPlan(
+            response_mode=response_mode,
+            ask_policy="allow_question",
+            focus=_build_reply_focus(message=message, lead_state=lead_state, grounded_result=grounded_result),
+            question_focus=_select_question_focus(
+                conversation_goal=goal,
+                next_best_action=action,
+                query_type=analysis.query_type,
+            ),
+            conversation_goal=goal,
+            next_best_action=action,
+        )
+
     if engagement_state == "ready":
         ask_policy = "avoid_question"
     elif engagement_state == "interested":
@@ -835,7 +935,13 @@ def build_reply_plan(
 
     if response_mode in {"meeting_invite", "soft_next_step", "grounded_recommendation", "value_teaser", "warm_welcome"}:
         ask_policy = "avoid_question"
-    elif response_mode in {"discover_need", "consultive_recommendation", "nurture_followup", "handle_concern"}:
+    elif response_mode in {
+        "discover_need",
+        "consultive_recommendation",
+        "nurture_followup",
+        "handle_concern",
+        "followup_confirm",
+    }:
         ask_policy = "allow_question"
 
     if response_mode == "discover_need" and not has_state_context and engagement_state in {"cold", "warm"}:
@@ -848,7 +954,6 @@ def build_reply_plan(
         ask_policy = "avoid_question"
     if engagement_state == "ready":
         ask_policy = "avoid_question"
-
     return ReplyPlan(
         response_mode=response_mode,
         ask_policy=_normalize_ask_policy(ask_policy),
@@ -947,12 +1052,14 @@ def _build_reply_synthesis_prompt(
         "painpoint_summary": lead_state.painpoint.summary,
         "painpoint_topics": [{"label": t.label, "weight": t.weight} for t in lead_state.painpoint.topics[:6]],
         "name": lead_state.name,
+        "phone_contact": lead_state.phone_contact,
         "sales_state": lead_state.sales_state,
         "engagement_state": lead_state.engagement_state,
         "engagement_confidence": lead_state.engagement_confidence,
         "lead_level": lead_state.lead_level,
         "last_conversation_goal": lead_state.last_conversation_goal,
         "next_best_action": lead_state.next_best_action,
+        "contact_capture_status": lead_state.contact_capture_status,
     }
     grounded_snapshot = _build_grounded_snapshot(grounded_result=grounded_result)
     return (
@@ -989,6 +1096,10 @@ def _build_reply_synthesis_prompt(
         "- response_mode=soft_next_step: mời bước tiếp theo mềm, không gây áp lực.\n"
         "- response_mode=nurture_followup: nuôi lead, không gây áp lực.\n"
         "- response_mode=meeting_invite: tư vấn ngắn gọn và đề xuất buổi hẹn trực tiếp.\n"
+        "- response_mode=contact_capture: khi khách đã muốn đi tiếp, xin thông tin liên hệ trực tiếp nhưng lịch sự.\n"
+        "- Nếu thiếu cả name và phone_contact, có thể hỏi gọn cả hai trong cùng một câu.\n"
+        "- Khi xin thông tin liên hệ, luôn nêu lý do rõ: để sắp xếp tư vấn sâu hơn, gửi tài liệu phù hợp hoặc đặt lịch hẹn.\n"
+        "- response_mode=followup_confirm: xác nhận bước tiếp theo ngắn gọn, không hỏi lan man.\n"
         "- ask_policy=avoid_question: kết thúc KHÔNG có dấu hỏi.\n"
         "- ask_policy=allow_question: có thể không hỏi, hoặc hỏi tối đa 1 câu mở.\n"
         "- ask_policy=must_clarify: hỏi đúng 1 câu ngắn về question_focus sau khi đã có nhận định.\n"
@@ -1404,7 +1515,7 @@ def _build_decider_prompt(message: str, lead_state: LeadState, recent_history: l
         '  "route": "consult_discovery|project_grounded",\n'
         '  "engagement_state_after": "cold|warm|interested|ready",\n'
         '  "sales_state_after": "unknown|exploring|need_identified|qualified|interested|appointment_ready|nurture|handoff",\n'
-        '  "conversation_goal": "build_trust|discover_need|surface_priority|show_fit|handle_concern|invite_next_step|nurture_lead|handoff_to_human",\n'
+        '  "conversation_goal": "build_trust|discover_need|surface_priority|show_fit|handle_concern|invite_next_step|nurture_lead|handoff_to_human|capture_contact|confirm_followup",\n'
         '  "decision_reason": "string",\n'
         '  "should_route_project": true|false,\n'
         '  "project_query_hint": "string|null",\n'
@@ -1879,6 +1990,7 @@ def create_app(
                         )
                         sales_state_after = update_sales_state(
                             previous_state=sales_state_before,
+                            message=message,
                             query_type=_normalize_query_type(analysis.query_type),
                             lead_state=final_state,
                             grounded_result=grounded_result,
@@ -1891,6 +2003,8 @@ def create_app(
                             engagement_state=engagement_state_after,
                             query_type=_normalize_query_type(analysis.query_type),
                             grounded_result=grounded_result,
+                            lead_state=final_state,
+                            message=message,
                             suggested_goal=analysis.conversation_goal_hint,
                         )
                         next_best_action = _normalize_next_best_action(
@@ -1899,6 +2013,7 @@ def create_app(
                                 engagement_state=engagement_state_after,
                                 conversation_goal=conversation_goal,
                                 grounded_result=grounded_result,
+                                lead_state=final_state,
                             )
                         )
                         final_state = final_state.model_copy(
@@ -1909,6 +2024,15 @@ def create_app(
                                 "lead_level": _derive_lead_level(sales_state_after),
                                 "last_conversation_goal": conversation_goal,
                                 "next_best_action": next_best_action,
+                                "contact_capture_status": (
+                                    "complete"
+                                    if final_state.name and final_state.phone_contact
+                                    else "partial"
+                                    if final_state.name or final_state.phone_contact
+                                    else "requested"
+                                    if conversation_goal == "capture_contact"
+                                    else final_state.contact_capture_status
+                                ),
                             }
                         )
                         state_obs.update(
