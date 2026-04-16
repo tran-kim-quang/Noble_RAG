@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import socket
 import threading
 from typing import Any
@@ -10,8 +11,12 @@ import urllib.request
 
 from fastapi import FastAPI
 from fastapi import HTTPException
+from fastapi import Request
 
 from retrieval_service.config import get_settings
+from retrieval_service.observability import flush_observability
+from retrieval_service.observability import propagate_context
+from retrieval_service.observability import start_observation
 from retrieval_service.schemas import (
     HealthResponse,
     IngestRequest,
@@ -23,6 +28,25 @@ from retrieval_service.schemas import (
 )
 
 log = logging.getLogger("retrieval-service")
+
+
+def _extract_langfuse_trace_context(request: Request) -> dict[str, str] | None:
+    trace_id = str(request.headers.get("X-Langfuse-Trace-Id", "")).strip().lower()
+    if not trace_id:
+        return None
+    if not re.fullmatch(r"[0-9a-f]{32}", trace_id):
+        return None
+    return {"trace_id": trace_id}
+
+
+def _extract_langfuse_session_id(request: Request) -> str | None:
+    value = str(request.headers.get("X-Langfuse-Session-Id", "")).strip()
+    return value[:128] if value else None
+
+
+def _extract_langfuse_user_id(request: Request) -> str | None:
+    value = str(request.headers.get("X-Langfuse-User-Id", "")).strip()
+    return value[:128] if value else None
 
 
 def _post_json(url: str, payload: dict[str, Any], timeout_sec: float, settings) -> dict[str, Any]:
@@ -180,85 +204,154 @@ def create_app(service=None) -> FastAPI:
         return payload
 
     @app.post("/ingest", response_model=IngestResponse)
-    def ingest(payload: IngestRequest) -> IngestResponse:
+    def ingest(payload: IngestRequest, request: Request) -> IngestResponse:
         svc = get_service_instance()
         try:
-            count = svc.ingest(payload.documents)
-            response = IngestResponse(ingested=count, collection=svc.settings.collection_name)
-            log.info("ingest request_docs=%s ingested=%s", len(payload.documents), response.ingested)
-            return response
+            with start_observation(
+                settings.langfuse_enabled,
+                name="retrieval.ingest",
+                as_type="span",
+                input={"documents": len(payload.documents)},
+                metadata={"service": "retrieval-service", "endpoint": "/ingest"},
+                trace_context=_extract_langfuse_trace_context(request),
+            ) as obs:
+                with propagate_context(
+                    settings.langfuse_enabled,
+                    session_id=_extract_langfuse_session_id(request),
+                    user_id=_extract_langfuse_user_id(request),
+                    metadata={"service": "retrieval-service"},
+                ):
+                    count = svc.ingest(payload.documents)
+                    response = IngestResponse(ingested=count, collection=svc.settings.collection_name)
+                    obs.update(output={"ingested": response.ingested, "collection": response.collection})
+                    log.info("ingest request_docs=%s ingested=%s", len(payload.documents), response.ingested)
+                    return response
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            if settings.langfuse_flush_at_request_end:
+                flush_observability(settings.langfuse_enabled)
 
     @app.post("/retrieve", response_model=RetrieveResponse)
-    def retrieve(payload: RetrieveRequest) -> RetrieveResponse:
+    def retrieve(payload: RetrieveRequest, request: Request) -> RetrieveResponse:
         svc = get_service_instance()
         try:
-            raw = svc.retrieve(payload.query, payload.top_k)
-            if isinstance(raw, dict):
-                results = raw.get("results", []) or []
-                confidence = float(raw.get("confidence", 0.0))
-                low_confidence = bool(raw.get("low_confidence", False))
-            else:
-                # Backward compatibility for simple test doubles that return list
-                results = raw or []
-                confidence = float(results[0]["score"]) if results else 0.0
-                threshold = getattr(getattr(svc, "settings", object()), "min_retrieve_score", 0.0)
-                low_confidence = confidence < float(threshold)
-            response = RetrieveResponse(
-                results=results,
-                confidence=confidence,
-                low_confidence=low_confidence,
-            )
-            log.info(
-                "retrieve query_len=%s top_k=%s results=%s confidence=%.4f low_confidence=%s",
-                len(payload.query),
-                payload.top_k or svc.settings.default_top_k,
-                len(response.results),
-                response.confidence or 0.0,
-                response.low_confidence,
-            )
-            return response
+            with start_observation(
+                settings.langfuse_enabled,
+                name="retrieval.retrieve",
+                as_type="span",
+                input={"query": payload.query[:500], "top_k": payload.top_k},
+                metadata={"service": "retrieval-service", "endpoint": "/retrieve"},
+                trace_context=_extract_langfuse_trace_context(request),
+            ) as obs:
+                with propagate_context(
+                    settings.langfuse_enabled,
+                    session_id=_extract_langfuse_session_id(request),
+                    user_id=_extract_langfuse_user_id(request),
+                    metadata={"service": "retrieval-service"},
+                ):
+                    raw = svc.retrieve(payload.query, payload.top_k)
+                    if isinstance(raw, dict):
+                        results = raw.get("results", []) or []
+                        confidence = float(raw.get("confidence", 0.0))
+                        low_confidence = bool(raw.get("low_confidence", False))
+                    else:
+                        # Backward compatibility for simple test doubles that return list
+                        results = raw or []
+                        confidence = float(results[0]["score"]) if results else 0.0
+                        threshold = getattr(getattr(svc, "settings", object()), "min_retrieve_score", 0.0)
+                        low_confidence = confidence < float(threshold)
+                    response = RetrieveResponse(
+                        results=results,
+                        confidence=confidence,
+                        low_confidence=low_confidence,
+                    )
+                    obs.update(
+                        output={
+                            "results": len(response.results),
+                            "confidence": response.confidence,
+                            "low_confidence": response.low_confidence,
+                        }
+                    )
+                    log.info(
+                        "retrieve query_len=%s top_k=%s results=%s confidence=%.4f low_confidence=%s",
+                        len(payload.query),
+                        payload.top_k or svc.settings.default_top_k,
+                        len(response.results),
+                        response.confidence or 0.0,
+                        response.low_confidence,
+                    )
+                    return response
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            if settings.langfuse_flush_at_request_end:
+                flush_observability(settings.langfuse_enabled)
 
     @app.post("/retrieve/project-grounded", response_model=ProjectGroundedRetrieveResponse)
-    def retrieve_project_grounded(payload: ProjectGroundedRetrieveRequest) -> ProjectGroundedRetrieveResponse:
+    def retrieve_project_grounded(payload: ProjectGroundedRetrieveRequest, request: Request) -> ProjectGroundedRetrieveResponse:
         svc = get_service_instance()
         try:
-            retrieval_intent = payload.retrieval_intent
-            if hasattr(retrieval_intent, "model_dump"):
-                retrieval_intent = retrieval_intent.model_dump()
-            raw = svc.retrieve_project_grounded(
-                query=payload.query,
-                retrieval_intent=retrieval_intent,
-                top_k=payload.top_k,
-            )
-            response = ProjectGroundedRetrieveResponse(
-                project_cards=raw.get("project_cards", []) or [],
-                trait_tags=raw.get("trait_tags", []) or [],
-                proximity_facts=raw.get("proximity_facts", []) or [],
-                evidence_chunks=raw.get("evidence_chunks", []) or [],
-                confidence=raw.get("confidence"),
-                low_confidence=bool(raw.get("low_confidence", False)),
-            )
-            log.info(
-                (
-                    "project-grounded retrieve query_len=%s top_k=%s project_cards=%s "
-                    "trait_tags=%s proximity_facts=%s evidence_chunks=%s confidence=%.4f low_confidence=%s"
-                ),
-                len(payload.query),
-                payload.top_k or getattr(getattr(svc, "settings", object()), "default_top_k", 5),
-                len(response.project_cards),
-                len(response.trait_tags),
-                len(response.proximity_facts),
-                len(response.evidence_chunks),
-                response.confidence or 0.0,
-                response.low_confidence,
-            )
-            return response
+            with start_observation(
+                settings.langfuse_enabled,
+                name="retrieval.project_grounded",
+                as_type="span",
+                input={"query": payload.query[:500], "top_k": payload.top_k},
+                metadata={"service": "retrieval-service", "endpoint": "/retrieve/project-grounded"},
+                trace_context=_extract_langfuse_trace_context(request),
+            ) as obs:
+                with propagate_context(
+                    settings.langfuse_enabled,
+                    session_id=_extract_langfuse_session_id(request),
+                    user_id=_extract_langfuse_user_id(request),
+                    metadata={"service": "retrieval-service"},
+                ):
+                    retrieval_intent = payload.retrieval_intent
+                    if hasattr(retrieval_intent, "model_dump"):
+                        retrieval_intent = retrieval_intent.model_dump()
+                    raw = svc.retrieve_project_grounded(
+                        query=payload.query,
+                        retrieval_intent=retrieval_intent,
+                        top_k=payload.top_k,
+                    )
+                    response = ProjectGroundedRetrieveResponse(
+                        project_cards=raw.get("project_cards", []) or [],
+                        trait_tags=raw.get("trait_tags", []) or [],
+                        proximity_facts=raw.get("proximity_facts", []) or [],
+                        evidence_chunks=raw.get("evidence_chunks", []) or [],
+                        confidence=raw.get("confidence"),
+                        low_confidence=bool(raw.get("low_confidence", False)),
+                    )
+                    obs.update(
+                        output={
+                            "project_cards": len(response.project_cards),
+                            "trait_tags": len(response.trait_tags),
+                            "proximity_facts": len(response.proximity_facts),
+                            "evidence_chunks": len(response.evidence_chunks),
+                            "confidence": response.confidence,
+                            "low_confidence": response.low_confidence,
+                        }
+                    )
+                    log.info(
+                        (
+                            "project-grounded retrieve query_len=%s top_k=%s project_cards=%s "
+                            "trait_tags=%s proximity_facts=%s evidence_chunks=%s confidence=%.4f low_confidence=%s"
+                        ),
+                        len(payload.query),
+                        payload.top_k or getattr(getattr(svc, "settings", object()), "default_top_k", 5),
+                        len(response.project_cards),
+                        len(response.trait_tags),
+                        len(response.proximity_facts),
+                        len(response.evidence_chunks),
+                        response.confidence or 0.0,
+                        response.low_confidence,
+                    )
+                    return response
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            if settings.langfuse_flush_at_request_end:
+                flush_observability(settings.langfuse_enabled)
 
     return app
 

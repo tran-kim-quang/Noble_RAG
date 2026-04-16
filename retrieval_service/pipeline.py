@@ -20,6 +20,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.http import exceptions as qdrant_exceptions
 
 from retrieval_service.config import Settings
+from retrieval_service.observability import start_observation
 from retrieval_service.schemas import IngestDocument
 
 if TYPE_CHECKING:
@@ -271,28 +272,75 @@ class RetrievalService:
         k = top_k or self.settings.default_top_k
         k = max(1, min(k, self.settings.max_top_k))
 
-        candidate_query = self._build_candidate_query(query=query, retrieval_intent=intent)
-        candidate_raw = self.retrieve(candidate_query, top_k=max(k, 6))
-        candidate_chunks = self._build_evidence_chunks(candidate_raw.get("results", []))
-        candidate_project_ids = self._dedupe_keep_order(
-            [str(chunk.get("project_id") or "") for chunk in candidate_chunks if chunk.get("project_id")],
-            max_items=6,
-        )
+        with start_observation(
+            self.settings.langfuse_enabled,
+            name="retrieval.project_grounded.candidate_pass",
+            as_type="span",
+            input={"query": query[:500], "goal": intent.get("goal"), "top_k": max(k, 6)},
+            metadata={"service": "retrieval-service"},
+        ) as candidate_obs:
+            candidate_query = self._build_candidate_query(query=query, retrieval_intent=intent)
+            candidate_raw = self.retrieve(candidate_query, top_k=max(k, 6))
+            candidate_chunks = self._build_evidence_chunks(candidate_raw.get("results", []))
+            candidate_project_ids = self._dedupe_keep_order(
+                [str(chunk.get("project_id") or "") for chunk in candidate_chunks if chunk.get("project_id")],
+                max_items=6,
+            )
+            candidate_obs.update(
+                output={
+                    "query": candidate_query[:500],
+                    "chunks": len(candidate_chunks),
+                    "project_ids": len(candidate_project_ids),
+                    "confidence": candidate_raw.get("confidence"),
+                    "low_confidence": bool(candidate_raw.get("low_confidence", False)),
+                }
+            )
 
-        proximity_query = self._build_proximity_query(query=query, retrieval_intent=intent)
-        proximity_raw = self.retrieve(proximity_query, top_k=max(k * 2, 8))
-        proximity_chunks = self._build_evidence_chunks(proximity_raw.get("results", []))
-        proximity_facts = self._build_proximity_facts(
-            chunks=proximity_chunks,
-            retrieval_intent=intent,
-            candidate_project_ids=candidate_project_ids,
-        )
+        with start_observation(
+            self.settings.langfuse_enabled,
+            name="retrieval.project_grounded.proximity_pass",
+            as_type="span",
+            input={"query": query[:500], "top_k": max(k * 2, 8)},
+            metadata={"service": "retrieval-service"},
+        ) as proximity_obs:
+            proximity_query = self._build_proximity_query(query=query, retrieval_intent=intent)
+            proximity_raw = self.retrieve(proximity_query, top_k=max(k * 2, 8))
+            proximity_chunks = self._build_evidence_chunks(proximity_raw.get("results", []))
+            proximity_facts = self._build_proximity_facts(
+                chunks=proximity_chunks,
+                retrieval_intent=intent,
+                candidate_project_ids=candidate_project_ids,
+            )
+            proximity_obs.update(
+                output={
+                    "query": proximity_query[:500],
+                    "chunks": len(proximity_chunks),
+                    "facts": len(proximity_facts),
+                    "confidence": proximity_raw.get("confidence"),
+                    "low_confidence": bool(proximity_raw.get("low_confidence", False)),
+                }
+            )
 
-        evidence_query = self._build_evidence_query(query=query, retrieval_intent=intent)
-        evidence_raw = self.retrieve(evidence_query, top_k=max(k, 5))
-        evidence_chunks = self._build_evidence_chunks(evidence_raw.get("results", []))
-        if not evidence_chunks:
-            evidence_chunks = candidate_chunks
+        with start_observation(
+            self.settings.langfuse_enabled,
+            name="retrieval.project_grounded.evidence_pass",
+            as_type="span",
+            input={"query": query[:500], "top_k": max(k, 5)},
+            metadata={"service": "retrieval-service"},
+        ) as evidence_obs:
+            evidence_query = self._build_evidence_query(query=query, retrieval_intent=intent)
+            evidence_raw = self.retrieve(evidence_query, top_k=max(k, 5))
+            evidence_chunks = self._build_evidence_chunks(evidence_raw.get("results", []))
+            if not evidence_chunks:
+                evidence_chunks = candidate_chunks
+            evidence_obs.update(
+                output={
+                    "query": evidence_query[:500],
+                    "chunks": len(evidence_chunks),
+                    "confidence": evidence_raw.get("confidence"),
+                    "low_confidence": bool(evidence_raw.get("low_confidence", False)),
+                }
+            )
 
         if candidate_project_ids:
             evidence_chunks.sort(
@@ -302,23 +350,36 @@ class RetrievalService:
                 )
             )
 
-        project_cards = self._build_project_cards(
-            evidence_chunks=evidence_chunks,
-            proximity_facts=proximity_facts,
-            retrieval_intent=intent,
-        )
-        if not project_cards:
+        with start_observation(
+            self.settings.langfuse_enabled,
+            name="retrieval.project_grounded.shape_response",
+            as_type="span",
+            input={"evidence_chunks": len(evidence_chunks), "proximity_facts": len(proximity_facts)},
+            metadata={"service": "retrieval-service"},
+        ) as shaping_obs:
             project_cards = self._build_project_cards(
-                evidence_chunks=candidate_chunks,
+                evidence_chunks=evidence_chunks,
                 proximity_facts=proximity_facts,
                 retrieval_intent=intent,
             )
+            if not project_cards:
+                project_cards = self._build_project_cards(
+                    evidence_chunks=candidate_chunks,
+                    proximity_facts=proximity_facts,
+                    retrieval_intent=intent,
+                )
 
-        trait_tags = self._build_trait_tags(
-            evidence_chunks=evidence_chunks,
-            query=evidence_query,
-            retrieval_intent=intent,
-        )
+            trait_tags = self._build_trait_tags(
+                evidence_chunks=evidence_chunks,
+                query=evidence_query,
+                retrieval_intent=intent,
+            )
+            shaping_obs.update(
+                output={
+                    "project_cards": len(project_cards),
+                    "trait_tags": len(trait_tags),
+                }
+            )
         confidence = max(
             float(candidate_raw.get("confidence", 0.0) or 0.0),
             float(evidence_raw.get("confidence", 0.0) or 0.0),

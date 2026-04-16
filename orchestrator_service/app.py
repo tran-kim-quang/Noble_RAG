@@ -15,6 +15,9 @@ from fastapi import HTTPException
 
 from orchestrator_service.config import Settings
 from orchestrator_service.config import get_settings
+from orchestrator_service.observability import flush_observability
+from orchestrator_service.observability import propagate_context
+from orchestrator_service.observability import start_observation
 from orchestrator_service.retrieval_client import RetrievalClient
 from orchestrator_service.schemas import (
     DecisionTrace,
@@ -34,8 +37,53 @@ _QUERY_TYPES = {"advisory_strategy", "project_matching", "project_specific", "cl
 _READINESS_VALUES = {"not_ready", "soft_ready", "ready"}
 _PROJECT_QUERY_TYPES = {"project_matching", "project_specific"}
 _POI_TYPE_VALUES = {"hospital", "school", "park", "mall"}
-_RESPONSE_MODES = {"inform_only", "recommendation", "clarify_light", "meeting_invite"}
+_ENGAGEMENT_STATES = {"cold", "warm", "interested", "ready"}
+_SALES_STATES = {
+    "unknown",
+    "exploring",
+    "need_identified",
+    "qualified",
+    "interested",
+    "appointment_ready",
+    "nurture",
+    "handoff",
+}
+_CONVERSATION_GOALS = {
+    "build_trust",
+    "discover_need",
+    "surface_priority",
+    "show_fit",
+    "handle_concern",
+    "invite_next_step",
+    "nurture_lead",
+    "handoff_to_human",
+}
+_NEXT_BEST_ACTIONS = {
+    "continue_discovery",
+    "show_project_fit",
+    "handle_concern",
+    "invite_brochure",
+    "invite_call",
+    "invite_site_visit",
+    "handoff_human",
+}
+_RESPONSE_MODES = {
+    "warm_welcome",
+    "value_teaser",
+    "discover_need",
+    "consultive_recommendation",
+    "grounded_recommendation",
+    "handle_concern",
+    "soft_next_step",
+    "nurture_followup",
+    "meeting_invite",
+}
 _ASK_POLICIES = {"avoid_question", "allow_question", "must_clarify"}
+_LEGACY_RESPONSE_MODE_MAP = {
+    "recommendation": "grounded_recommendation",
+    "handle_objection": "handle_concern",
+    "next_step_invite": "soft_next_step",
+}
 
 
 @dataclass(frozen=True)
@@ -49,6 +97,9 @@ class TurnAnalysis:
     query_type: str = "clarification"
     retrieval_readiness: str = "not_ready"
     route_source: str = "unknown"
+    engagement_state_after_hint: str | None = None
+    sales_state_after_hint: str | None = None
+    conversation_goal_hint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +108,8 @@ class ReplyPlan:
     ask_policy: str
     focus: str
     question_focus: str
+    conversation_goal: str
+    next_best_action: str
 
 
 def _now_iso() -> str:
@@ -155,13 +208,41 @@ def merge_lead_state(
     painpoint_update: NeedPainpointDelta,
     extracted_name: str | None,
     extracted_phone: str | None,
-) -> LeadState:
+    ) -> LeadState:
     return LeadState(
         name=extracted_name or lead_state.name,
         phone_contact=extracted_phone or lead_state.phone_contact,
         need=_merge_block(lead_state.need, need_update),
         painpoint=_merge_block(lead_state.painpoint, painpoint_update),
+        sales_state=lead_state.sales_state,
+        lead_level=lead_state.lead_level,
+        last_conversation_goal=lead_state.last_conversation_goal,
+        next_best_action=lead_state.next_best_action,
     )
+
+
+def _derive_observability_session_id(payload: QueryRequest, lead_state: LeadState) -> str | None:
+    explicit = str(payload.session_id or "").strip()
+    if explicit:
+        return explicit[:128]
+    if lead_state.phone_contact:
+        return f"phone:{lead_state.phone_contact}"[:128]
+    if lead_state.name:
+        normalized = re.sub(r"\s+", "-", lead_state.name.strip().lower())
+        normalized = re.sub(r"[^a-z0-9_\-]", "", normalized)
+        if normalized:
+            return f"name:{normalized}"[:128]
+    return None
+
+
+def _derive_observability_user_id(lead_state: LeadState) -> str | None:
+    phone = str(lead_state.phone_contact or "").strip()
+    if phone:
+        return phone[:128]
+    name = str(lead_state.name or "").strip()
+    if name:
+        return name[:128]
+    return None
 
 
 def _build_retrieval_intent(
@@ -188,11 +269,37 @@ def _build_retrieval_intent(
     }
 
 
-def _call_project_grounded_fetcher(fetcher, message: str, intent: dict[str, Any], top_k: int) -> dict[str, Any]:
+def _call_project_grounded_fetcher(
+    fetcher,
+    message: str,
+    intent: dict[str, Any],
+    top_k: int,
+    trace_id: str | None = None,
+    session_id: str | None = None,
+    user_id: str | None = None,
+) -> dict[str, Any]:
     try:
+        if trace_id or session_id or user_id:
+            return fetcher(
+                message,
+                intent,
+                top_k,
+                trace_id=trace_id,
+                session_id=session_id,
+                user_id=user_id,
+            )
         return fetcher(message, intent, top_k)
     except TypeError:
         try:
+            if trace_id or session_id or user_id:
+                return fetcher(
+                    message,
+                    json.dumps(intent, ensure_ascii=False),
+                    top_k,
+                    trace_id=trace_id,
+                    session_id=session_id,
+                    user_id=user_id,
+                )
             return fetcher(message, json.dumps(intent, ensure_ascii=False), top_k)
         except TypeError:
             legacy = fetcher(message, top_k)
@@ -311,11 +418,20 @@ def _is_single_project_mode(project_cards: list[dict], proximity_facts: list[dic
     return len(ids) == 1
 
 
-def _normalize_response_mode(raw: Any, fallback: str = "inform_only") -> str:
+def _normalize_engagement_state(raw: Any, fallback: str = "cold") -> str:
     value = str(raw or "").strip().lower()
+    if value in _ENGAGEMENT_STATES:
+        return value
+    return fallback if fallback in _ENGAGEMENT_STATES else "cold"
+
+
+def _normalize_response_mode(raw: Any, fallback: str = "warm_welcome") -> str:
+    value = str(raw or "").strip().lower()
+    if value in _LEGACY_RESPONSE_MODE_MAP:
+        value = _LEGACY_RESPONSE_MODE_MAP[value]
     if value in _RESPONSE_MODES:
         return value
-    return fallback if fallback in _RESPONSE_MODES else "inform_only"
+    return fallback if fallback in _RESPONSE_MODES else "warm_welcome"
 
 
 def _normalize_ask_policy(raw: Any, fallback: str = "avoid_question") -> str:
@@ -323,6 +439,225 @@ def _normalize_ask_policy(raw: Any, fallback: str = "avoid_question") -> str:
     if value in _ASK_POLICIES:
         return value
     return fallback if fallback in _ASK_POLICIES else "avoid_question"
+
+
+def _normalize_sales_state(raw: Any, fallback: str = "unknown") -> str:
+    value = str(raw or "").strip().lower()
+    if value in _SALES_STATES:
+        return value
+    return fallback if fallback in _SALES_STATES else "unknown"
+
+
+def _normalize_conversation_goal(raw: Any, fallback: str = "build_trust") -> str:
+    value = str(raw or "").strip().lower()
+    if value in _CONVERSATION_GOALS:
+        return value
+    return fallback if fallback in _CONVERSATION_GOALS else "build_trust"
+
+
+def _normalize_next_best_action(raw: Any, fallback: str = "continue_discovery") -> str:
+    value = str(raw or "").strip().lower()
+    if value in _NEXT_BEST_ACTIONS:
+        return value
+    return fallback if fallback in _NEXT_BEST_ACTIONS else "continue_discovery"
+
+
+def _derive_lead_level(sales_state: str) -> str:
+    state = _normalize_sales_state(sales_state)
+    if state in {"unknown", "exploring"}:
+        return "exploratory"
+    if state in {"need_identified", "nurture"}:
+        return "interested"
+    if state in {"qualified", "interested"}:
+        return "qualified"
+    return "hot"
+
+
+def _has_structured_need(lead_state: LeadState) -> bool:
+    return bool(
+        lead_state.need.summary.strip()
+        or lead_state.painpoint.summary.strip()
+        or lead_state.need.topics
+        or lead_state.painpoint.topics
+    )
+
+
+def _has_grounded_fit(grounded_result: dict[str, Any] | None) -> bool:
+    if not grounded_result:
+        return False
+    cards = grounded_result.get("project_cards", []) or []
+    return bool(cards and not bool(grounded_result.get("low_confidence", False)))
+
+
+def _promote_engagement_state(current: str, candidate: str) -> str:
+    ranking = {"cold": 0, "warm": 1, "interested": 2, "ready": 3}
+    current_norm = _normalize_engagement_state(current)
+    candidate_norm = _normalize_engagement_state(candidate, fallback=current_norm)
+    if ranking[candidate_norm] >= ranking[current_norm]:
+        return candidate_norm
+    return current_norm
+
+
+def update_engagement_state(
+    previous_state: str,
+    query_type: str,
+    lead_state: LeadState,
+    grounded_result: dict[str, Any] | None,
+    recent_history: list[HistoryTurn],
+    routed_to_project: bool,
+    suggested_state: str | None = None,
+) -> str:
+    state = _normalize_engagement_state(previous_state)
+    suggestion = _normalize_engagement_state(suggested_state, fallback=state) if suggested_state else None
+    grounded_fit = _has_grounded_fit(grounded_result)
+    low_confidence = bool(grounded_result.get("low_confidence", False)) if grounded_result else False
+    has_state_context = _has_structured_need(lead_state)
+
+    if query_type == "advisory_strategy":
+        if has_state_context or len(recent_history) >= 1:
+            state = _promote_engagement_state(state, "warm")
+    elif query_type == "project_matching":
+        state = _promote_engagement_state(state, "warm")
+        if routed_to_project or grounded_fit:
+            state = _promote_engagement_state(state, "interested")
+    elif query_type == "project_specific":
+        state = _promote_engagement_state(state, "interested")
+    elif query_type == "clarification":
+        if has_state_context:
+            state = _promote_engagement_state(state, "warm")
+
+    if grounded_fit and query_type in _PROJECT_QUERY_TYPES:
+        state = _promote_engagement_state(state, "interested")
+    if has_state_context and len(recent_history) >= 3:
+        state = _promote_engagement_state(state, "interested")
+    if lead_state.sales_state in {"appointment_ready", "handoff"}:
+        state = _promote_engagement_state(state, "ready")
+    if lead_state.next_best_action in {"invite_call", "invite_site_visit", "handoff_human"}:
+        state = _promote_engagement_state(state, "ready")
+
+    if low_confidence and routed_to_project and state == "ready":
+        state = "interested"
+
+    if suggestion:
+        state = _promote_engagement_state(state, suggestion)
+    return _normalize_engagement_state(state)
+
+
+def update_sales_state(
+    previous_state: str,
+    query_type: str,
+    lead_state: LeadState,
+    grounded_result: dict[str, Any] | None,
+    recent_history: list[HistoryTurn],
+    routed_to_project: bool,
+    suggested_state: str | None = None,
+) -> str:
+    state = _normalize_sales_state(previous_state)
+    suggestion = _normalize_sales_state(suggested_state, fallback=state) if suggested_state else None
+    low_confidence = bool(grounded_result.get("low_confidence", False)) if grounded_result else False
+    grounded_fit = _has_grounded_fit(grounded_result)
+
+    if suggestion == "handoff":
+        return "handoff"
+    if routed_to_project and low_confidence and query_type in _PROJECT_QUERY_TYPES:
+        return "handoff"
+    if query_type == "project_specific" and routed_to_project and not grounded_fit:
+        return "handoff"
+
+    if query_type == "advisory_strategy":
+        if state == "unknown":
+            state = "exploring"
+        if _has_structured_need(lead_state):
+            state = "need_identified"
+    elif query_type == "project_matching":
+        if state in {"unknown", "exploring"}:
+            state = "need_identified"
+        if routed_to_project and grounded_fit:
+            state = "qualified"
+    elif query_type == "project_specific":
+        if state in {"unknown", "exploring"}:
+            state = "need_identified"
+        if routed_to_project:
+            state = "interested" if grounded_fit else "qualified"
+    elif query_type == "clarification":
+        if state == "unknown":
+            state = "exploring"
+
+    if state == "qualified" and grounded_fit and len(recent_history) >= 2:
+        state = "interested"
+    if state == "interested" and grounded_fit and _has_structured_need(lead_state):
+        state = "appointment_ready"
+    if state in {"exploring", "need_identified"} and len(recent_history) >= 4 and not _has_grounded_fit(grounded_result):
+        state = "nurture"
+
+    if suggestion and suggestion in {"appointment_ready", "handoff"}:
+        state = suggestion
+    return _normalize_sales_state(state)
+
+
+def select_conversation_goal(
+    sales_state: str,
+    engagement_state: str,
+    query_type: str,
+    grounded_result: dict[str, Any] | None,
+    suggested_goal: str | None = None,
+) -> str:
+    state = _normalize_sales_state(sales_state)
+    engagement = _normalize_engagement_state(engagement_state)
+    suggestion = _normalize_conversation_goal(suggested_goal, fallback="build_trust") if suggested_goal else None
+    if suggestion == "handoff_to_human":
+        return "handoff_to_human"
+
+    if engagement == "ready":
+        return "invite_next_step"
+    if engagement == "interested" and query_type in _PROJECT_QUERY_TYPES:
+        return "invite_next_step" if _has_grounded_fit(grounded_result) else "handle_concern"
+
+    if state == "unknown":
+        goal = "build_trust"
+    elif state == "exploring":
+        goal = "discover_need"
+    elif state == "need_identified":
+        goal = "show_fit" if query_type in _PROJECT_QUERY_TYPES else "surface_priority"
+    elif state == "qualified":
+        goal = "show_fit"
+    elif state == "interested":
+        goal = "invite_next_step" if _has_grounded_fit(grounded_result) else "handle_concern"
+    elif state == "appointment_ready":
+        goal = "invite_next_step"
+    elif state == "nurture":
+        goal = "nurture_lead"
+    else:
+        goal = "handoff_to_human"
+    return _normalize_conversation_goal(goal)
+
+
+def select_next_best_action(
+    sales_state: str,
+    engagement_state: str,
+    conversation_goal: str,
+    grounded_result: dict[str, Any] | None,
+) -> str:
+    state = _normalize_sales_state(sales_state)
+    engagement = _normalize_engagement_state(engagement_state)
+    goal = _normalize_conversation_goal(conversation_goal)
+    if state == "handoff" or goal == "handoff_to_human":
+        return "handoff_human"
+    if engagement == "ready":
+        return "invite_site_visit"
+    if state == "appointment_ready":
+        return "invite_site_visit"
+    if goal == "invite_next_step":
+        return "invite_call"
+    if goal == "nurture_lead":
+        return "invite_brochure"
+    if goal == "handle_concern":
+        return "handle_concern"
+    if goal == "show_fit":
+        return "show_project_fit"
+    if _has_grounded_fit(grounded_result):
+        return "show_project_fit"
+    return "continue_discovery"
 
 
 def _ends_with_question(text: str) -> bool:
@@ -357,16 +692,88 @@ def _is_short_user_reply_after_assistant_question(message: str, recent_history: 
     return _ends_with_question(last_turn.message)
 
 
-def _select_question_focus(query_type: str, final_route: str) -> str:
-    if query_type == "project_matching":
-        return "mức ưu tiên quan tâm"
-    if query_type == "advisory_strategy":
+def _select_question_focus(conversation_goal: str, next_best_action: str, query_type: str) -> str:
+    goal = _normalize_conversation_goal(conversation_goal)
+    action = _normalize_next_best_action(next_best_action)
+    if goal == "discover_need":
         return "mục tiêu sử dụng"
+    if goal == "surface_priority":
+        return "ưu tiên quan trọng nhất"
+    if goal == "invite_next_step":
+        if action == "invite_site_visit":
+            return "thời điểm đi xem thực tế"
+        if action == "invite_call":
+            return "khung thời gian trao đổi"
+        return "mức sẵn sàng bước tiếp theo"
+    if goal == "handle_concern":
+        return "băn khoăn lớn nhất"
     if query_type == "project_specific":
-        return "thời điểm mua"
-    if final_route == "project_grounded":
-        return "mức chấp nhận rủi ro"
+        return "điểm muốn làm rõ sâu hơn"
     return "điểm ưu tiên chính"
+
+
+def _select_response_mode(
+    query_type: str,
+    engagement_state: str,
+    conversation_goal: str,
+    grounded_result: dict[str, Any] | None,
+) -> str:
+    qtype = _normalize_query_type(query_type)
+    engagement = _normalize_engagement_state(engagement_state)
+    goal = _normalize_conversation_goal(conversation_goal)
+    has_grounded_result = _has_grounded_fit(grounded_result)
+    low_confidence = bool(grounded_result.get("low_confidence", False)) if grounded_result else False
+
+    if goal == "handoff_to_human":
+        return "meeting_invite"
+
+    if qtype == "clarification":
+        if goal == "invite_next_step":
+            return "meeting_invite" if engagement == "ready" else "soft_next_step"
+        if goal == "handle_concern":
+            return "handle_concern"
+        if goal == "nurture_lead":
+            return "nurture_followup"
+        if has_grounded_result:
+            return "grounded_recommendation"
+        if engagement == "cold":
+            return "warm_welcome"
+        if engagement == "warm":
+            return "discover_need"
+        if engagement == "interested":
+            return "consultive_recommendation"
+        return "soft_next_step"
+
+    if qtype == "advisory_strategy":
+        if engagement == "cold":
+            return "warm_welcome"
+        if engagement == "warm":
+            return "discover_need"
+        if engagement == "interested":
+            return "consultive_recommendation"
+        return "soft_next_step"
+
+    if qtype == "project_matching":
+        if engagement == "cold":
+            return "value_teaser"
+        if engagement == "warm":
+            return "consultive_recommendation"
+        if engagement == "interested":
+            return "grounded_recommendation" if has_grounded_result else "consultive_recommendation"
+        return "soft_next_step"
+
+    # project_specific
+    if engagement == "cold":
+        return "value_teaser"
+    if engagement == "warm":
+        return "grounded_recommendation" if has_grounded_result else "consultive_recommendation"
+    if engagement == "interested":
+        if low_confidence:
+            return "handle_concern"
+        return "grounded_recommendation" if has_grounded_result else "consultive_recommendation"
+    if goal == "nurture_lead":
+        return "nurture_followup"
+    return "meeting_invite"
 
 
 def _build_reply_focus(
@@ -397,48 +804,62 @@ def build_reply_plan(
     recent_history: list[HistoryTurn],
     lead_state: LeadState,
     analysis: TurnAnalysis,
-    final_route: str,
+    conversation_goal: str,
+    next_best_action: str,
     grounded_result: dict[str, Any] | None,
 ) -> ReplyPlan:
-    has_grounded_result = bool(grounded_result and (grounded_result.get("project_cards", []) or []))
-    low_confidence = bool(grounded_result.get("low_confidence", False)) if grounded_result else False
-
-    if has_grounded_result and not low_confidence:
-        response_mode = "recommendation"
-    elif has_grounded_result and low_confidence:
-        response_mode = "meeting_invite"
-    elif analysis.query_type == "advisory_strategy":
-        response_mode = "inform_only"
-    elif final_route == "consult_discovery":
-        response_mode = "clarify_light"
-    else:
-        response_mode = "inform_only"
-
-    has_state_context = bool(
-        lead_state.need.summary.strip()
-        or lead_state.painpoint.summary.strip()
-        or lead_state.need.topics
-        or lead_state.painpoint.topics
+    sales_state = _normalize_sales_state(lead_state.sales_state)
+    engagement_state = _normalize_engagement_state(lead_state.engagement_state)
+    query_type = _normalize_query_type(analysis.query_type)
+    goal = _normalize_conversation_goal(conversation_goal)
+    action = _normalize_next_best_action(next_best_action)
+    response_mode = _normalize_response_mode(
+        _select_response_mode(
+            query_type=query_type,
+            engagement_state=engagement_state,
+            conversation_goal=goal,
+            grounded_result=grounded_result,
+        )
     )
-    if response_mode in {"recommendation", "inform_only", "meeting_invite"}:
+    has_grounded_result = _has_grounded_fit(grounded_result=grounded_result)
+    has_state_context = _has_structured_need(lead_state)
+
+    if engagement_state == "ready":
         ask_policy = "avoid_question"
-    else:
+    elif engagement_state == "interested":
+        ask_policy = "avoid_question" if has_grounded_result else "allow_question"
+    elif engagement_state == "warm":
         ask_policy = "allow_question"
-    if response_mode == "clarify_light" and not has_state_context:
-        ask_policy = "must_clarify"
-    if has_grounded_result and not low_confidence:
+    else:
         ask_policy = "avoid_question"
 
-    if _recent_assistant_question_count(recent_history=recent_history, take_last_assistant_turns=2) >= 1:
+    if response_mode in {"meeting_invite", "soft_next_step", "grounded_recommendation", "value_teaser", "warm_welcome"}:
         ask_policy = "avoid_question"
-    if _is_short_user_reply_after_assistant_question(message=message, recent_history=recent_history):
+    elif response_mode in {"discover_need", "consultive_recommendation", "nurture_followup", "handle_concern"}:
+        ask_policy = "allow_question"
+
+    if response_mode == "discover_need" and not has_state_context and engagement_state in {"cold", "warm"}:
+        ask_policy = "must_clarify"
+    if has_grounded_result and response_mode in {"grounded_recommendation", "soft_next_step"}:
+        ask_policy = "avoid_question"
+    if _recent_assistant_question_count(recent_history=recent_history, take_last_assistant_turns=2) >= 1 and ask_policy != "must_clarify":
+        ask_policy = "avoid_question"
+    if _is_short_user_reply_after_assistant_question(message=message, recent_history=recent_history) and ask_policy != "must_clarify":
+        ask_policy = "avoid_question"
+    if engagement_state == "ready":
         ask_policy = "avoid_question"
 
     return ReplyPlan(
-        response_mode=_normalize_response_mode(response_mode),
+        response_mode=response_mode,
         ask_policy=_normalize_ask_policy(ask_policy),
         focus=_build_reply_focus(message=message, lead_state=lead_state, grounded_result=grounded_result),
-        question_focus=_select_question_focus(query_type=analysis.query_type, final_route=final_route),
+        question_focus=_select_question_focus(
+            conversation_goal=goal,
+            next_best_action=action,
+            query_type=analysis.query_type,
+        ),
+        conversation_goal=goal,
+        next_best_action=action,
     )
 
 
@@ -509,6 +930,10 @@ def _build_reply_synthesis_prompt(
     final_route: str,
     query_type: str,
     decision_reason: str,
+    sales_state: str,
+    engagement_state: str,
+    conversation_goal: str,
+    next_best_action: str,
     response_mode: str,
     ask_policy: str,
     focus: str,
@@ -522,6 +947,12 @@ def _build_reply_synthesis_prompt(
         "painpoint_summary": lead_state.painpoint.summary,
         "painpoint_topics": [{"label": t.label, "weight": t.weight} for t in lead_state.painpoint.topics[:6]],
         "name": lead_state.name,
+        "sales_state": lead_state.sales_state,
+        "engagement_state": lead_state.engagement_state,
+        "engagement_confidence": lead_state.engagement_confidence,
+        "lead_level": lead_state.lead_level,
+        "last_conversation_goal": lead_state.last_conversation_goal,
+        "next_best_action": lead_state.next_best_action,
     }
     grounded_snapshot = _build_grounded_snapshot(grounded_result=grounded_result)
     return (
@@ -544,9 +975,19 @@ def _build_reply_synthesis_prompt(
         "- Không dùng câu hỏi nhị phân theo mẫu 'ở hay đầu tư'.\n"
         "Ràng buộc do orchestrator cung cấp:\n"
         "- Bạn KHÔNG tự quyết hỏi hay không, phải làm theo ask_policy.\n"
-        "- response_mode=inform_only: tập trung cung cấp nhận định ngắn gọn, không kéo hội thoại vòng lặp.\n"
-        "- response_mode=recommendation: nêu điểm phù hợp, nhận định grounded và gợi ý hành động ngắn.\n"
-        "- response_mode=clarify_light: tư vấn trước 1-2 nhận định rồi mới làm rõ nhẹ nếu cần.\n"
+        "- Mỗi lượt phải theo nhịp reflect -> insight -> invite.\n"
+        "- Nếu user vừa bộc lộ need/painpoint thì phải phản chiếu ngắn trước khi đưa insight.\n"
+        "- Mỗi lượt phải mở ra 1 góc tư vấn mới, không lặp intro brochure qua nhiều lượt.\n"
+        "- engagement_state=cold/warm thì không CTA mạnh.\n"
+        "- engagement_state=interested/ready mới được mời bước tiếp theo rõ hơn.\n"
+        "- response_mode=warm_welcome: tạo thiện cảm tự nhiên, không ép chốt.\n"
+        "- response_mode=value_teaser: nêu 1-2 điểm hợp nổi bật để tạo hứng thú tìm hiểu tiếp.\n"
+        "- response_mode=discover_need: tư vấn trước, sau đó mới làm rõ nhẹ nếu cần.\n"
+        "- response_mode=consultive_recommendation: tư vấn như consultant, nêu logic vì sao phù hợp.\n"
+        "- response_mode=grounded_recommendation: nêu điểm phù hợp dựa trên grounded_context, ngắn và chắc.\n"
+        "- response_mode=handle_concern: giải tỏa băn khoăn nhẹ, không tranh cãi.\n"
+        "- response_mode=soft_next_step: mời bước tiếp theo mềm, không gây áp lực.\n"
+        "- response_mode=nurture_followup: nuôi lead, không gây áp lực.\n"
         "- response_mode=meeting_invite: tư vấn ngắn gọn và đề xuất buổi hẹn trực tiếp.\n"
         "- ask_policy=avoid_question: kết thúc KHÔNG có dấu hỏi.\n"
         "- ask_policy=allow_question: có thể không hỏi, hoặc hỏi tối đa 1 câu mở.\n"
@@ -556,6 +997,10 @@ def _build_reply_synthesis_prompt(
         f"final_route={json.dumps(final_route, ensure_ascii=False)}\n"
         f"query_type={json.dumps(query_type, ensure_ascii=False)}\n"
         f"decision_reason={json.dumps(decision_reason, ensure_ascii=False)}\n"
+        f"sales_state={json.dumps(_normalize_sales_state(sales_state), ensure_ascii=False)}\n"
+        f"engagement_state={json.dumps(_normalize_engagement_state(engagement_state), ensure_ascii=False)}\n"
+        f"conversation_goal={json.dumps(_normalize_conversation_goal(conversation_goal), ensure_ascii=False)}\n"
+        f"next_best_action={json.dumps(_normalize_next_best_action(next_best_action), ensure_ascii=False)}\n"
         f"focus={json.dumps(focus, ensure_ascii=False)}\n"
         f"response_mode={json.dumps(_normalize_response_mode(response_mode), ensure_ascii=False)}\n"
         f"ask_policy={json.dumps(_normalize_ask_policy(ask_policy), ensure_ascii=False)}\n"
@@ -572,20 +1017,45 @@ def _call_model_generate(
     temperature: float,
     response_format: str | None = "json",
 ) -> Any:
-    payload: dict[str, Any] = {
-        "model": settings.decider_model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"temperature": temperature},
-    }
-    if response_format:
-        payload["format"] = response_format
-    if settings.decider_keep_alive:
-        payload["keep_alive"] = settings.decider_keep_alive
+    api_format = str(settings.decider_api_format or "ollama").strip().lower()
+    model_name = str(settings.decider_model or "").strip().lower()
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if settings.decider_api_key:
+        header_name = settings.decider_api_key_header or "Authorization"
+        if header_name.lower() == "authorization":
+            headers[header_name] = f"Bearer {settings.decider_api_key}"
+        else:
+            headers[header_name] = settings.decider_api_key
+
+    if api_format == "openai":
+        payload: dict[str, Any] = {
+            "model": settings.decider_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        }
+        # Kimi k2.5 supports thinking/non-thinking modes; disable thinking for faster routing/synthesis turns.
+        if model_name.startswith("kimi-k2.5"):
+            payload["thinking"] = {"type": "disabled"}
+        else:
+            payload["temperature"] = temperature
+        if response_format == "json":
+            payload["response_format"] = {"type": "json_object"}
+    else:
+        payload = {
+            "model": settings.decider_model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": temperature},
+        }
+        if response_format:
+            payload["format"] = response_format
+        if settings.decider_keep_alive:
+            payload["keep_alive"] = settings.decider_keep_alive
+
     req = urllib.request.Request(
         settings.decider_api_url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=settings.decider_timeout_sec) as resp:
@@ -593,6 +1063,24 @@ def _call_model_generate(
     parsed = json.loads(raw)
     if not isinstance(parsed, dict):
         raise RuntimeError("model response is not a JSON object")
+    if api_format == "openai":
+        choices = parsed.get("choices", [])
+        if not isinstance(choices, list) or not choices:
+            raise RuntimeError("openai response missing choices")
+        first = choices[0] if isinstance(choices[0], dict) else {}
+        message = first.get("message", {})
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str) and text:
+                        parts.append(text)
+            return "".join(parts)
+        return ""
     return parsed.get("response", "")
 
 
@@ -768,6 +1256,10 @@ def synthesize_assistant_reply(
         final_route=final_route,
         query_type=analysis.query_type,
         decision_reason=decision_reason,
+        sales_state=lead_state.sales_state,
+        engagement_state=lead_state.engagement_state,
+        conversation_goal=reply_plan.conversation_goal,
+        next_best_action=reply_plan.next_best_action,
         response_mode=reply_plan.response_mode,
         ask_policy=reply_plan.ask_policy,
         focus=reply_plan.focus,
@@ -858,11 +1350,18 @@ def _build_decider_prompt(message: str, lead_state: LeadState, recent_history: l
             "topics": [{"label": t.label, "weight": t.weight} for t in lead_state.painpoint.topics[:6]],
             "evidence": lead_state.painpoint.evidence[:5],
         },
+        "sales_state": lead_state.sales_state,
+        "engagement_state": lead_state.engagement_state,
+        "engagement_confidence": lead_state.engagement_confidence,
+        "lead_level": lead_state.lead_level,
+        "last_conversation_goal": lead_state.last_conversation_goal,
+        "next_best_action": lead_state.next_best_action,
     }
     compact_history = [{"role": turn.role, "message": turn.message} for turn in recent_history[-6:]]
     return (
         "Ban la bo phan decider route cho tro ly tu van bat dong san.\n"
         "Nhiem vu duy nhat cua agent: tro chuyen tu van va gioi thieu du an cho khach hang.\n"
+        "Ngoai route, ban phai de xuat sales_state_after va conversation_goal cho luot hien tai.\n"
         "Khi nguoi dung can phan tich qua chi tiet (tai chinh, phap ly, phuong an can cu the), huong dan de xuat buoi hen gap truc tiep.\n"
         "Data scope hien tai: collection dang co 1 du an chinh la Noble Palace Tay Thang Long.\n"
         "Vi vay, consult_reply khong duoc dat cau hoi kieu form nhu 'quan nao/khu vuc nao' de bat user dien thong tin.\n"
@@ -895,13 +1394,17 @@ def _build_decider_prompt(message: str, lead_state: LeadState, recent_history: l
         "- Khong dat cau hoi dang thu thap form nhu 'ban o quan nao', 'ban muon khu vuc nao'.\n"
         "- Khong hoi lai thong tin user vua noi.\n"
         "- Neu can phan tich sau hon, uu tien de xuat buoi hen gap truc tiep thay vi co gang phan tich qua sau trong chat.\n"
-        "- Neu query la project_matching, consult_reply chi la cau bridge ngan de chain sang project route, khong dong request o consult.\n\n"
+        "- Neu query la project_matching, consult_reply chi la cau bridge ngan de chain sang project route, khong dong request o consult.\n"
+        "- Khong lap lai brochure intro qua nhieu luot lien tiep.\n\n"
         "Bat buoc tra ve 1 JSON object theo schema:\n"
         "{\n"
         '  "query_type": "advisory_strategy|project_matching|project_specific|clarification",\n'
         '  "retrieval_readiness": "not_ready|soft_ready|ready",\n'
         '  "start_route": "consult_discovery|project_grounded",\n'
         '  "route": "consult_discovery|project_grounded",\n'
+        '  "engagement_state_after": "cold|warm|interested|ready",\n'
+        '  "sales_state_after": "unknown|exploring|need_identified|qualified|interested|appointment_ready|nurture|handoff",\n'
+        '  "conversation_goal": "build_trust|discover_need|surface_priority|show_fit|handle_concern|invite_next_step|nurture_lead|handoff_to_human",\n'
         '  "decision_reason": "string",\n'
         '  "should_route_project": true|false,\n'
         '  "project_query_hint": "string|null",\n'
@@ -929,29 +1432,12 @@ def _analyze_turn_with_model(
     recent_history: list[HistoryTurn],
     settings: Settings,
 ) -> TurnAnalysis:
-    payload: dict[str, Any] = {
-        "model": settings.decider_model,
-        "prompt": _build_decider_prompt(message=message, lead_state=lead_state, recent_history=recent_history),
-        "stream": False,
-        "format": "json",
-        "options": {"temperature": settings.decider_temperature},
-    }
-    if settings.decider_keep_alive:
-        payload["keep_alive"] = settings.decider_keep_alive
-
-    req = urllib.request.Request(
-        settings.decider_api_url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    response_payload = _call_model_generate(
+        settings=settings,
+        prompt=_build_decider_prompt(message=message, lead_state=lead_state, recent_history=recent_history),
+        temperature=settings.decider_temperature,
+        response_format="json",
     )
-    with urllib.request.urlopen(req, timeout=settings.decider_timeout_sec) as resp:
-        raw = resp.read().decode("utf-8")
-    parsed = json.loads(raw)
-    if not isinstance(parsed, dict):
-        raise RuntimeError("decider response is not a JSON object")
-
-    response_payload = parsed.get("response", "")
     if isinstance(response_payload, dict):
         result_obj = response_payload
     else:
@@ -973,6 +1459,12 @@ def _analyze_turn_with_model(
         project_query_hint_raw = ""
     project_query_hint = project_query_hint_raw or (message.strip() if should_route_project else None)
     routing_reason = str(result_obj.get("decision_reason", "")).strip() or "llm_decider"
+    engagement_state_hint = _normalize_engagement_state(
+        result_obj.get("engagement_state_after"),
+        fallback=lead_state.engagement_state,
+    )
+    sales_state_hint = _normalize_sales_state(result_obj.get("sales_state_after"), fallback=lead_state.sales_state)
+    conversation_goal_hint = _normalize_conversation_goal(result_obj.get("conversation_goal"), fallback="build_trust")
 
     consult_reply = _compact_text(str(result_obj.get("consult_reply", "")).strip(), max_words=95)
     return TurnAnalysis(
@@ -989,6 +1481,9 @@ def _analyze_turn_with_model(
         query_type=query_type,
         retrieval_readiness=retrieval_readiness,
         route_source="llm_decider",
+        engagement_state_after_hint=engagement_state_hint,
+        sales_state_after_hint=sales_state_hint,
+        conversation_goal_hint=conversation_goal_hint,
     )
 
 
@@ -1030,6 +1525,9 @@ def _analyze_turn_fallback(message: str, lead_state: LeadState, recent_history: 
         query_type="clarification",
         retrieval_readiness="not_ready",
         route_source="fallback",
+        engagement_state_after_hint=lead_state.engagement_state,
+        sales_state_after_hint=lead_state.sales_state,
+        conversation_goal_hint=lead_state.last_conversation_goal or "build_trust",
     )
 
 
@@ -1085,6 +1583,9 @@ def run_project_grounded(
     retrieval_fetcher,
     need_update: NeedPainpointDelta,
     painpoint_update: NeedPainpointDelta,
+    trace_id: str | None = None,
+    session_id: str | None = None,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     retrieval_intent = _build_retrieval_intent(
         message=message,
@@ -1092,7 +1593,15 @@ def run_project_grounded(
         query_type=query_type,
         retrieval_readiness=retrieval_readiness,
     )
-    retrieval_raw = _call_project_grounded_fetcher(retrieval_fetcher, message, retrieval_intent, top_k)
+    retrieval_raw = _call_project_grounded_fetcher(
+        retrieval_fetcher,
+        message,
+        retrieval_intent,
+        top_k,
+        trace_id=trace_id,
+        session_id=session_id,
+        user_id=user_id,
+    )
     project_cards = retrieval_raw.get("project_cards", []) or []
     trait_tags = retrieval_raw.get("trait_tags", []) or []
     proximity_facts = retrieval_raw.get("proximity_facts", []) or []
@@ -1151,187 +1660,410 @@ def create_app(
 
     @app.post("/sales/query", response_model=QueryResponse)
     def query(payload: QueryRequest) -> QueryResponse:
-        # Phase 1 - Analyze
         message = payload.message.strip()
         lead_state = payload.lead_state or LeadState()
         top_k = payload.top_k or settings.default_top_k
         extracted_name = _extract_name(message)
         extracted_phone = _extract_phone_contact(message)
-
-        analysis = turn_analyzer(message, lead_state, payload.recent_history)
-        start_route = analysis.route
-        reason = analysis.decision_reason
-        route_source = analysis.route_source or "turn_analyzer"
-
-        if payload.force_route is not None:
-            start_route = payload.force_route
-            reason = f"force_route={payload.force_route}"
-            route_source = "force_route_debug"
-
-        # Phase 2 - Execute
-        consult_result: dict[str, Any] | None = None
-        grounded_result: dict[str, Any] | None = None
-        final_state: LeadState
-        final_route = start_route
-        chained_from_consult = False
-        active_need_update = analysis.need_update
-        active_painpoint_update = analysis.painpoint_update
-        routing_signal: RoutingSignal | None = None
-
-        if start_route == "consult_discovery":
-            consult_result = run_consult_discovery(message=message, lead_state=lead_state, analysis=analysis)
-            routing_signal = consult_result.get("routing_signal")
-            after_consult_state = merge_lead_state(
-                lead_state=lead_state,
-                need_update=consult_result["need_update"],
-                painpoint_update=consult_result["painpoint_update"],
-                extracted_name=extracted_name,
-                extracted_phone=extracted_phone,
-            )
-            active_need_update = consult_result["need_update"]
-            active_painpoint_update = consult_result["painpoint_update"]
-
-            should_chain_project = bool(routing_signal and routing_signal.should_route_project)
-            if payload.force_route == "consult_discovery":
-                should_chain_project = False
-
-            if should_chain_project:
-                chained_from_consult = True
-                final_route = "project_grounded"
-                project_message = str(routing_signal.project_query_hint or message).strip() or message
-                try:
-                    grounded_result = run_project_grounded(
-                        message=project_message,
-                        lead_state=after_consult_state,
-                        query_type=analysis.query_type,
-                        retrieval_readiness=analysis.retrieval_readiness,
-                        top_k=top_k,
-                        retrieval_fetcher=project_grounded_fetcher,
-                        need_update=active_need_update,
-                        painpoint_update=active_painpoint_update,
-                    )
-                except Exception as exc:
-                    log.exception("project_grounded retrieval failed after consult chain: %s", exc)
-                    raise HTTPException(status_code=502, detail=f"retrieval service error: {exc}") from exc
-                active_need_update = grounded_result["need_update"]
-                active_painpoint_update = grounded_result["painpoint_update"]
-                final_state = merge_lead_state(
-                    lead_state=after_consult_state,
-                    need_update=active_need_update,
-                    painpoint_update=active_painpoint_update,
-                    extracted_name=extracted_name,
-                    extracted_phone=extracted_phone,
-                )
-            else:
-                final_state = after_consult_state
-        else:
-            final_route = "project_grounded"
-            try:
-                grounded_result = run_project_grounded(
-                    message=message,
-                    lead_state=lead_state,
-                    query_type=analysis.query_type,
-                    retrieval_readiness=analysis.retrieval_readiness,
-                    top_k=top_k,
-                    retrieval_fetcher=project_grounded_fetcher,
-                    need_update=analysis.need_update,
-                    painpoint_update=analysis.painpoint_update,
-                )
-            except Exception as exc:
-                log.exception("project_grounded retrieval failed: %s", exc)
-                raise HTTPException(status_code=502, detail=f"retrieval service error: {exc}") from exc
-            active_need_update = grounded_result["need_update"]
-            active_painpoint_update = grounded_result["painpoint_update"]
-            final_state = merge_lead_state(
-                lead_state=lead_state,
-                need_update=active_need_update,
-                painpoint_update=active_painpoint_update,
-                extracted_name=extracted_name,
-                extracted_phone=extracted_phone,
-            )
-
-        # Phase 3 - Finalize
-        trace = DecisionTrace(
-            query_type=_normalize_query_type(analysis.query_type),
-            retrieval_readiness=_normalize_retrieval_readiness(analysis.retrieval_readiness),
-            start_route=start_route,
-            final_route=final_route,
-            chained_from_consult=chained_from_consult,
-            route_source=route_source,
-            decision_reason=reason,
-        )
-        reply_plan = build_reply_plan(
-            message=message,
-            recent_history=payload.recent_history,
-            lead_state=final_state,
-            analysis=analysis,
-            final_route=final_route,
-            grounded_result=grounded_result,
-        )
-        assistant_reply = synthesize_assistant_reply(
-            message=message,
-            recent_history=payload.recent_history,
-            lead_state=final_state,
-            analysis=analysis,
-            final_route=final_route,
-            decision_reason=reason,
-            reply_plan=reply_plan,
-            grounded_result=grounded_result,
-            settings=settings,
-        )
-
-        if final_route == "project_grounded" and grounded_result is not None:
-            response = QueryResponse(
-                route="project_grounded",
-                assistant_reply=assistant_reply,
-                decision_reason=reason,
-                lead_state=final_state,
-                need_update=active_need_update,
-                painpoint_update=active_painpoint_update,
-                routing_signal=routing_signal,
-                project_grounded_payload={
-                    "used_projects": grounded_result["used_projects"],
-                    "project_cards": grounded_result["project_cards"],
-                    "trait_tags": grounded_result["trait_tags"],
-                    "proximity_facts": grounded_result["proximity_facts"],
-                    "evidence_chunks": grounded_result["evidence_chunks"],
-                    "retrieval_intent": grounded_result["retrieval_intent"],
-                    "confidence": grounded_result["confidence"],
-                    "low_confidence": grounded_result["low_confidence"],
+        langfuse_enabled = bool(settings.langfuse_enabled)
+        session_id = _derive_observability_session_id(payload=payload, lead_state=lead_state)
+        user_id = _derive_observability_user_id(lead_state=lead_state)
+        trace_metadata = {
+            "service": "sales-orchestrator",
+            "endpoint": "/sales/query",
+        }
+        try:
+            with start_observation(
+                langfuse_enabled,
+                name="orchestrator.sales.query",
+                as_type="span",
+                input={
+                    "message": message[:500],
+                    "top_k": top_k,
+                    "force_route": payload.force_route,
+                    "history_turns": len(payload.recent_history),
                 },
-                decision_trace=trace,
-            )
-        else:
-            if consult_result is None:
-                consult_result = run_consult_discovery(message=message, lead_state=lead_state, analysis=analysis)
-            response = QueryResponse(
-                route="consult_discovery",
-                assistant_reply=assistant_reply,
-                decision_reason=reason,
-                lead_state=final_state,
-                need_update=active_need_update,
-                painpoint_update=active_painpoint_update,
-                routing_signal=consult_result.get("routing_signal"),
-                project_grounded_payload=None,
-                decision_trace=trace,
-            )
+                metadata=trace_metadata,
+            ) as request_obs:
+                trace_id = str(getattr(request_obs, "trace_id", "") or "")
+                trace_id_for_header = trace_id if trace_id else None
+                with propagate_context(
+                    langfuse_enabled,
+                    session_id=session_id,
+                    user_id=user_id,
+                    metadata=trace_metadata,
+                ):
+                    with start_observation(
+                        langfuse_enabled,
+                        name="orchestrator.analyze_turn",
+                        as_type="generation",
+                        model=settings.decider_model,
+                        input={
+                            "message": message[:500],
+                            "lead_state_sales": lead_state.sales_state,
+                            "history_turns": len(payload.recent_history),
+                        },
+                    ) as analyze_obs:
+                        analysis = turn_analyzer(message, lead_state, payload.recent_history)
+                        analyze_obs.update(
+                            output={
+                                "start_route": analysis.route,
+                                "query_type": analysis.query_type,
+                                "retrieval_readiness": analysis.retrieval_readiness,
+                                "should_route_project": bool(analysis.routing_signal.should_route_project),
+                                "route_source": analysis.route_source,
+                            }
+                        )
 
-        log.info(
-            (
-                "decision start_route=%s final_route=%s chained_from_consult=%s "
-                "query_type=%s retrieval_readiness=%s route_source=%s response_mode=%s ask_policy=%s reason=%s"
-            ),
-            trace.start_route,
-            trace.final_route,
-            trace.chained_from_consult,
-            trace.query_type,
-            trace.retrieval_readiness,
-            trace.route_source,
-            reply_plan.response_mode,
-            reply_plan.ask_policy,
-            trace.decision_reason,
-        )
-        return response
+                    start_route = analysis.route
+                    reason = analysis.decision_reason
+                    route_source = analysis.route_source or "turn_analyzer"
+
+                    if payload.force_route is not None:
+                        start_route = payload.force_route
+                        reason = f"force_route={payload.force_route}"
+                        route_source = "force_route_debug"
+
+                    consult_result: dict[str, Any] | None = None
+                    grounded_result: dict[str, Any] | None = None
+                    final_state: LeadState
+                    final_route = start_route
+                    chained_from_consult = False
+                    active_need_update = analysis.need_update
+                    active_painpoint_update = analysis.painpoint_update
+                    routing_signal: RoutingSignal | None = None
+
+                    if start_route == "consult_discovery":
+                        with start_observation(
+                            langfuse_enabled,
+                            name="orchestrator.consult_discovery",
+                            as_type="span",
+                            input={"query_type": analysis.query_type},
+                        ) as consult_obs:
+                            consult_result = run_consult_discovery(message=message, lead_state=lead_state, analysis=analysis)
+                            routing_signal = consult_result.get("routing_signal")
+                            after_consult_state = merge_lead_state(
+                                lead_state=lead_state,
+                                need_update=consult_result["need_update"],
+                                painpoint_update=consult_result["painpoint_update"],
+                                extracted_name=extracted_name,
+                                extracted_phone=extracted_phone,
+                            )
+                            active_need_update = consult_result["need_update"]
+                            active_painpoint_update = consult_result["painpoint_update"]
+
+                            should_chain_project = bool(routing_signal and routing_signal.should_route_project)
+                            if payload.force_route == "consult_discovery":
+                                should_chain_project = False
+                            consult_obs.update(
+                                output={
+                                    "should_chain_project": should_chain_project,
+                                    "project_query_hint": (
+                                        str(routing_signal.project_query_hint)[:200] if routing_signal else None
+                                    ),
+                                }
+                            )
+
+                        if should_chain_project:
+                            chained_from_consult = True
+                            final_route = "project_grounded"
+                            project_message = str(routing_signal.project_query_hint or message).strip() or message
+                            try:
+                                with start_observation(
+                                    langfuse_enabled,
+                                    name="orchestrator.project_grounded.chain",
+                                    as_type="span",
+                                    input={"query": project_message[:500], "top_k": top_k},
+                                ) as grounded_obs:
+                                    grounded_result = run_project_grounded(
+                                        message=project_message,
+                                        lead_state=after_consult_state,
+                                        query_type=analysis.query_type,
+                                        retrieval_readiness=analysis.retrieval_readiness,
+                                        top_k=top_k,
+                                        retrieval_fetcher=project_grounded_fetcher,
+                                        need_update=active_need_update,
+                                        painpoint_update=active_painpoint_update,
+                                        trace_id=trace_id_for_header,
+                                        session_id=session_id,
+                                        user_id=user_id,
+                                    )
+                                    grounded_obs.update(
+                                        output={
+                                            "project_cards": len(grounded_result.get("project_cards", []) or []),
+                                            "trait_tags": len(grounded_result.get("trait_tags", []) or []),
+                                            "evidence_chunks": len(grounded_result.get("evidence_chunks", []) or []),
+                                            "confidence": grounded_result.get("confidence"),
+                                            "low_confidence": bool(grounded_result.get("low_confidence", False)),
+                                        }
+                                    )
+                            except Exception as exc:
+                                log.exception("project_grounded retrieval failed after consult chain: %s", exc)
+                                raise HTTPException(status_code=502, detail=f"retrieval service error: {exc}") from exc
+                            active_need_update = grounded_result["need_update"]
+                            active_painpoint_update = grounded_result["painpoint_update"]
+                            final_state = merge_lead_state(
+                                lead_state=after_consult_state,
+                                need_update=active_need_update,
+                                painpoint_update=active_painpoint_update,
+                                extracted_name=extracted_name,
+                                extracted_phone=extracted_phone,
+                            )
+                        else:
+                            final_state = after_consult_state
+                    else:
+                        final_route = "project_grounded"
+                        try:
+                            with start_observation(
+                                langfuse_enabled,
+                                name="orchestrator.project_grounded.direct",
+                                as_type="span",
+                                input={"query": message[:500], "top_k": top_k},
+                            ) as grounded_obs:
+                                grounded_result = run_project_grounded(
+                                    message=message,
+                                    lead_state=lead_state,
+                                    query_type=analysis.query_type,
+                                    retrieval_readiness=analysis.retrieval_readiness,
+                                    top_k=top_k,
+                                    retrieval_fetcher=project_grounded_fetcher,
+                                    need_update=analysis.need_update,
+                                    painpoint_update=analysis.painpoint_update,
+                                    trace_id=trace_id_for_header,
+                                    session_id=session_id,
+                                    user_id=user_id,
+                                )
+                                grounded_obs.update(
+                                    output={
+                                        "project_cards": len(grounded_result.get("project_cards", []) or []),
+                                        "trait_tags": len(grounded_result.get("trait_tags", []) or []),
+                                        "evidence_chunks": len(grounded_result.get("evidence_chunks", []) or []),
+                                        "confidence": grounded_result.get("confidence"),
+                                        "low_confidence": bool(grounded_result.get("low_confidence", False)),
+                                    }
+                                )
+                        except Exception as exc:
+                            log.exception("project_grounded retrieval failed: %s", exc)
+                            raise HTTPException(status_code=502, detail=f"retrieval service error: {exc}") from exc
+                        active_need_update = grounded_result["need_update"]
+                        active_painpoint_update = grounded_result["painpoint_update"]
+                        final_state = merge_lead_state(
+                            lead_state=lead_state,
+                            need_update=active_need_update,
+                            painpoint_update=active_painpoint_update,
+                            extracted_name=extracted_name,
+                            extracted_phone=extracted_phone,
+                        )
+
+                    with start_observation(
+                        langfuse_enabled,
+                        name="orchestrator.sales_state_engine",
+                        as_type="span",
+                        input={
+                            "sales_state_before": lead_state.sales_state,
+                            "engagement_state_before": lead_state.engagement_state,
+                            "query_type": analysis.query_type,
+                            "final_route": final_route,
+                        },
+                    ) as state_obs:
+                        sales_state_before = _normalize_sales_state(lead_state.sales_state)
+                        engagement_state_before = _normalize_engagement_state(lead_state.engagement_state)
+                        engagement_state_after = update_engagement_state(
+                            previous_state=engagement_state_before,
+                            query_type=_normalize_query_type(analysis.query_type),
+                            lead_state=final_state,
+                            grounded_result=grounded_result,
+                            recent_history=payload.recent_history,
+                            routed_to_project=(final_route == "project_grounded"),
+                            suggested_state=analysis.engagement_state_after_hint,
+                        )
+                        sales_state_after = update_sales_state(
+                            previous_state=sales_state_before,
+                            query_type=_normalize_query_type(analysis.query_type),
+                            lead_state=final_state,
+                            grounded_result=grounded_result,
+                            recent_history=payload.recent_history,
+                            routed_to_project=(final_route == "project_grounded"),
+                            suggested_state=analysis.sales_state_after_hint,
+                        )
+                        conversation_goal = select_conversation_goal(
+                            sales_state=sales_state_after,
+                            engagement_state=engagement_state_after,
+                            query_type=_normalize_query_type(analysis.query_type),
+                            grounded_result=grounded_result,
+                            suggested_goal=analysis.conversation_goal_hint,
+                        )
+                        next_best_action = _normalize_next_best_action(
+                            select_next_best_action(
+                                sales_state=sales_state_after,
+                                engagement_state=engagement_state_after,
+                                conversation_goal=conversation_goal,
+                                grounded_result=grounded_result,
+                            )
+                        )
+                        final_state = final_state.model_copy(
+                            update={
+                                "engagement_state": engagement_state_after,
+                                "engagement_confidence": 0.75,
+                                "sales_state": sales_state_after,
+                                "lead_level": _derive_lead_level(sales_state_after),
+                                "last_conversation_goal": conversation_goal,
+                                "next_best_action": next_best_action,
+                            }
+                        )
+                        state_obs.update(
+                            output={
+                                "engagement_state_after": engagement_state_after,
+                                "sales_state_after": sales_state_after,
+                                "conversation_goal": conversation_goal,
+                                "next_best_action": next_best_action,
+                            }
+                        )
+
+                    with start_observation(
+                        langfuse_enabled,
+                        name="orchestrator.reply_planning",
+                        as_type="span",
+                        input={"sales_state": final_state.sales_state, "conversation_goal": conversation_goal},
+                    ) as plan_obs:
+                        reply_plan = build_reply_plan(
+                            message=message,
+                            recent_history=payload.recent_history,
+                            lead_state=final_state,
+                            analysis=analysis,
+                            conversation_goal=conversation_goal,
+                            next_best_action=next_best_action,
+                            grounded_result=grounded_result,
+                        )
+                        trace = DecisionTrace(
+                            query_type=_normalize_query_type(analysis.query_type),
+                            retrieval_readiness=_normalize_retrieval_readiness(analysis.retrieval_readiness),
+                            start_route=start_route,
+                            final_route=final_route,
+                            chained_from_consult=chained_from_consult,
+                            route_source=route_source,
+                            decision_reason=reason,
+                            engagement_state_before=engagement_state_before,
+                            engagement_state_after=engagement_state_after,
+                            sales_state_before=sales_state_before,
+                            sales_state_after=sales_state_after,
+                            conversation_goal=conversation_goal,
+                            response_mode=reply_plan.response_mode,
+                            ask_policy=reply_plan.ask_policy,
+                        )
+                        plan_obs.update(
+                            output={
+                                "response_mode": reply_plan.response_mode,
+                                "ask_policy": reply_plan.ask_policy,
+                                "question_focus": reply_plan.question_focus,
+                            }
+                        )
+
+                    with start_observation(
+                        langfuse_enabled,
+                        name="orchestrator.reply_synthesis",
+                        as_type="generation",
+                        model=settings.decider_model,
+                        input={
+                            "final_route": final_route,
+                            "response_mode": reply_plan.response_mode,
+                            "ask_policy": reply_plan.ask_policy,
+                        },
+                    ) as reply_obs:
+                        assistant_reply = synthesize_assistant_reply(
+                            message=message,
+                            recent_history=payload.recent_history,
+                            lead_state=final_state,
+                            analysis=analysis,
+                            final_route=final_route,
+                            decision_reason=reason,
+                            reply_plan=reply_plan,
+                            grounded_result=grounded_result,
+                            settings=settings,
+                        )
+                        reply_obs.update(
+                            output={
+                                "assistant_reply_chars": len(assistant_reply),
+                                "assistant_reply_preview": assistant_reply[:240],
+                            }
+                        )
+
+                    if final_route == "project_grounded" and grounded_result is not None:
+                        response = QueryResponse(
+                            route="project_grounded",
+                            assistant_reply=assistant_reply,
+                            decision_reason=reason,
+                            lead_state=final_state,
+                            need_update=active_need_update,
+                            painpoint_update=active_painpoint_update,
+                            routing_signal=routing_signal,
+                            project_grounded_payload={
+                                "used_projects": grounded_result["used_projects"],
+                                "project_cards": grounded_result["project_cards"],
+                                "trait_tags": grounded_result["trait_tags"],
+                                "proximity_facts": grounded_result["proximity_facts"],
+                                "evidence_chunks": grounded_result["evidence_chunks"],
+                                "retrieval_intent": grounded_result["retrieval_intent"],
+                                "confidence": grounded_result["confidence"],
+                                "low_confidence": grounded_result["low_confidence"],
+                            },
+                            decision_trace=trace,
+                        )
+                    else:
+                        if consult_result is None:
+                            consult_result = run_consult_discovery(message=message, lead_state=lead_state, analysis=analysis)
+                        response = QueryResponse(
+                            route="consult_discovery",
+                            assistant_reply=assistant_reply,
+                            decision_reason=reason,
+                            lead_state=final_state,
+                            need_update=active_need_update,
+                            painpoint_update=active_painpoint_update,
+                            routing_signal=consult_result.get("routing_signal"),
+                            project_grounded_payload=None,
+                            decision_trace=trace,
+                        )
+
+                    request_obs.update(
+                        output={
+                            "final_route": final_route,
+                            "chained_from_consult": chained_from_consult,
+                            "response_mode": reply_plan.response_mode,
+                            "ask_policy": reply_plan.ask_policy,
+                            "low_confidence": bool(grounded_result.get("low_confidence", False))
+                            if grounded_result
+                            else None,
+                        }
+                    )
+
+                    log.info(
+                        (
+                            "decision start_route=%s final_route=%s chained_from_consult=%s "
+                            "query_type=%s retrieval_readiness=%s route_source=%s "
+                            "engagement_before=%s engagement_after=%s "
+                            "sales_state_before=%s sales_state_after=%s conversation_goal=%s next_best_action=%s "
+                            "response_mode=%s ask_policy=%s reason=%s"
+                        ),
+                        trace.start_route,
+                        trace.final_route,
+                        trace.chained_from_consult,
+                        trace.query_type,
+                        trace.retrieval_readiness,
+                        trace.route_source,
+                        trace.engagement_state_before,
+                        trace.engagement_state_after,
+                        trace.sales_state_before,
+                        trace.sales_state_after,
+                        trace.conversation_goal,
+                        next_best_action,
+                        reply_plan.response_mode,
+                        reply_plan.ask_policy,
+                        trace.decision_reason,
+                    )
+                    return response
+        finally:
+            if settings.langfuse_flush_at_request_end:
+                flush_observability(langfuse_enabled)
 
     return app
 

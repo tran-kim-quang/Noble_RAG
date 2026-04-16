@@ -43,6 +43,8 @@ class Settings:
     llm_warm_prompt: str = os.getenv("LLM_WARM_PROMPT", "warmup ping").strip()
     llm_warm_timeout_sec: float = float(os.getenv("LLM_WARM_TIMEOUT_SEC", "20"))
     llm_warm_keep_alive: str = os.getenv("LLM_WARM_KEEP_ALIVE", "").strip()
+    langfuse_enabled: bool = _env_bool("LANGFUSE_ENABLED", "false")
+    langfuse_flush_at_request_end: bool = _env_bool("LANGFUSE_FLUSH_AT_REQUEST_END", "false")
 
     host: str = os.getenv("HOST", "0.0.0.0")
     port: int = int(os.getenv("PORT", "8000"))

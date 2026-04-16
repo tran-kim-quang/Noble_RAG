@@ -98,6 +98,7 @@ def _percentile(values: list[float], p: float) -> float:
 class SessionState:
     lead_state: dict[str, Any]
     recent_history: list[dict[str, str]]
+    session_id: str
 
 
 class RollingMetrics:
@@ -215,7 +216,14 @@ def run_continuous_inference_test(
     orch_query_url = orchestrator_base_url.rstrip("/") + "/sales/query"
     retrieval_health_url = retrieval_base_url.rstrip("/") + "/health"
 
-    sessions = [SessionState(lead_state=_default_lead_state(), recent_history=[]) for _ in range(max(1, session_count))]
+    sessions = [
+        SessionState(
+            lead_state=_default_lead_state(),
+            recent_history=[],
+            session_id=f"continuous-session-{idx + 1}",
+        )
+        for idx in range(max(1, session_count))
+    ]
     metrics = RollingMetrics()
     sent = 0
 
@@ -236,6 +244,7 @@ def run_continuous_inference_test(
                     "message": message,
                     "lead_state": sess.lead_state,
                     "recent_history": sess.recent_history[-8:],
+                    "session_id": sess.session_id,
                 }
                 if force_project_every > 0 and (sent + 1) % force_project_every == 0:
                     payload["force_route"] = "project_grounded"
@@ -330,14 +339,18 @@ def run_interactive_chat_test(
     orch_query_url = orchestrator_base_url.rstrip("/") + "/sales/query"
     retrieval_health_url = retrieval_base_url.rstrip("/") + "/health"
 
-    sess = SessionState(lead_state=_default_lead_state(), recent_history=[])
+    sess = SessionState(
+        lead_state=_default_lead_state(),
+        recent_history=[],
+        session_id=str(session_id).strip() or "manual-chat-01",
+    )
     metrics = RollingMetrics()
     sent = 0
 
     report_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
     with report_jsonl_path.open("a", encoding="utf-8") as report_file:
         print(f"[{_now_iso()}] start interactive chat test")
-        print(f"session_id={session_id} orchestrator={orchestrator_base_url} retrieval={retrieval_base_url}")
+        print(f"session_id={sess.session_id} orchestrator={orchestrator_base_url} retrieval={retrieval_base_url}")
         print(f"report={report_jsonl_path}")
         print("commands: /exit | /summary | /state | /project <message>")
         print("-" * 90)
@@ -373,6 +386,7 @@ def run_interactive_chat_test(
                 "message": message,
                 "lead_state": sess.lead_state,
                 "recent_history": sess.recent_history[-8:],
+                "session_id": sess.session_id,
             }
             if force_project:
                 payload["force_route"] = "project_grounded"
@@ -418,7 +432,7 @@ def run_interactive_chat_test(
                 "ts": _now_iso(),
                 "mode": "interactive",
                 "idx": sent,
-                "session_id": session_id,
+                "session_id": sess.session_id,
                 "query": message,
                 "status": status,
                 "latency_ms": round(latency_ms, 2),

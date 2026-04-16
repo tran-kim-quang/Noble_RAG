@@ -78,48 +78,52 @@ def fake_project_grounded_error(query: str, retrieval_intent: str, top_k: int):
 def fake_turn_analyzer(message: str, lead_state, recent_history):
     _ = lead_state
     _ = recent_history
-    text = (message or "").lower()
-    if "gan truong hoc" in text or "project" in text or "phap ly" in text:
-        return TurnAnalysis(
-            route="project_grounded",
-            decision_reason="fake_context_decider_project",
-            need_update=NeedPainpointDelta(
-                summary_delta="Nhu cau duoc bo sung: lua chon du an phu hop.",
-                topics=[TopicWeight(label="lua chon du an", weight=0.86)],
-                evidence=[message],
-            ),
-            painpoint_update=NeedPainpointDelta(
-                summary_delta="Khach can doi chieu thong tin de quyet dinh.",
-                topics=[TopicWeight(label="can doi chieu thong tin", weight=0.79)],
-                evidence=[message],
-            ),
-            routing_signal=RoutingSignal(
-                should_route_project=True,
-                project_query_hint=message,
-                reason="fake_context_decider_project",
-            ),
-            consult_reply="",
-        )
     return TurnAnalysis(
-        route="consult_discovery",
-        decision_reason="fake_context_decider_consult",
+        route="project_grounded",
+        decision_reason="fake_context_decider_project",
         need_update=NeedPainpointDelta(
-            summary_delta="Nhu cau duoc bo sung: can lam ro muc tieu mua.",
-            topics=[TopicWeight(label="lam ro muc tieu mua", weight=0.82)],
+            summary_delta="Nhu cau duoc bo sung: lua chon du an phu hop.",
+            topics=[TopicWeight(label="lua chon du an", weight=0.86)],
             evidence=[message],
         ),
         painpoint_update=NeedPainpointDelta(
-            summary_delta="Painpoint duoc bo sung: chua ro khung tieu chi.",
-            topics=[TopicWeight(label="chua ro khung tieu chi", weight=0.78)],
+            summary_delta="Khach can doi chieu thong tin de quyet dinh.",
+            topics=[TopicWeight(label="can doi chieu thong tin", weight=0.79)],
             evidence=[message],
         ),
         routing_signal=RoutingSignal(
-            should_route_project=False,
-            project_query_hint=None,
-            reason="fake_context_decider_consult",
+            should_route_project=True,
+            project_query_hint=message,
+            reason="fake_context_decider_project",
         ),
-        consult_reply="Minh se hoi tiep de lam ro nhu cau va painpoint truoc khi shortlist.",
+        consult_reply="",
+        query_type="project_matching",
+        retrieval_readiness="soft_ready",
+        sales_state_after_hint="qualified",
+        conversation_goal_hint="show_fit",
     )
+
+
+def assert_sales_schema(payload: dict):
+    lead_state = payload["lead_state"]
+    trace = payload["decision_trace"]
+    assert lead_state["sales_state"] in {
+        "unknown",
+        "exploring",
+        "need_identified",
+        "qualified",
+        "interested",
+        "appointment_ready",
+        "nurture",
+        "handoff",
+    }
+    assert lead_state["lead_level"] in {"exploratory", "interested", "qualified", "hot"}
+    assert lead_state["last_conversation_goal"] is not None
+    assert lead_state["next_best_action"] is not None
+    assert trace["sales_state_before"] is not None
+    assert trace["sales_state_after"] is not None
+    assert trace["conversation_goal"] is not None
+    assert trace["response_mode"] is not None
 
 
 @pytest.mark.skipif(PY313, reason="Known TestClient/anyio instability on Python 3.13 in this environment.")
@@ -139,6 +143,7 @@ def test_02_consult_discovery_route_for_strategy_query():
     assert payload["route"] in {"consult_discovery", "project_grounded"}
     assert "assistant_reply" in payload
     assert payload["need_update"]["topics"]
+    assert_sales_schema(payload)
 
 
 @pytest.mark.skipif(PY313, reason="Known TestClient/anyio instability on Python 3.13 in this environment.")
@@ -149,6 +154,7 @@ def test_03_project_grounded_route_for_filter_query():
     payload = res.json()
     assert payload["route"] == "project_grounded"
     assert payload["project_grounded_payload"]["used_projects"] == ["noble_palace_tay_thang_long"]
+    assert_sales_schema(payload)
 
 
 @pytest.mark.skipif(PY313, reason="Known TestClient/anyio instability on Python 3.13 in this environment.")
@@ -159,6 +165,7 @@ def test_04_project_grounded_low_confidence_path():
     payload = res.json()
     assert payload["route"] == "project_grounded"
     assert payload["project_grounded_payload"]["low_confidence"] is True
+    assert_sales_schema(payload)
 
 
 @pytest.mark.skipif(PY313, reason="Known TestClient/anyio instability on Python 3.13 in this environment.")
@@ -189,6 +196,7 @@ def test_06_state_merge_name_phone_and_need():
     assert payload["lead_state"]["name"] is not None
     assert payload["lead_state"]["phone_contact"] == "0912345678"
     assert payload["lead_state"]["need"]["topics"]
+    assert_sales_schema(payload)
 
 
 @pytest.mark.skipif(PY313, reason="Known TestClient/anyio instability on Python 3.13 in this environment.")

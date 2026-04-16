@@ -37,6 +37,38 @@ class LeadState(BaseModel):
     phone_contact: str | None = None
     need: NeedPainpointState = Field(default_factory=NeedPainpointState)
     painpoint: NeedPainpointState = Field(default_factory=NeedPainpointState)
+    engagement_state: Literal["cold", "warm", "interested", "ready"] = "cold"
+    engagement_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    sales_state: Literal[
+        "unknown",
+        "exploring",
+        "need_identified",
+        "qualified",
+        "interested",
+        "appointment_ready",
+        "nurture",
+        "handoff",
+    ] = "unknown"
+    lead_level: Literal["exploratory", "interested", "qualified", "hot"] | None = None
+    last_conversation_goal: Literal[
+        "build_trust",
+        "discover_need",
+        "surface_priority",
+        "show_fit",
+        "handle_concern",
+        "invite_next_step",
+        "nurture_lead",
+        "handoff_to_human",
+    ] | None = None
+    next_best_action: Literal[
+        "continue_discovery",
+        "show_project_fit",
+        "handle_concern",
+        "invite_brochure",
+        "invite_call",
+        "invite_site_visit",
+        "handoff_human",
+    ] | None = None
 
 
 class NeedPainpointDelta(BaseModel):
@@ -114,6 +146,50 @@ class DecisionTrace(BaseModel):
     chained_from_consult: bool = False
     route_source: str = "unknown"
     decision_reason: str = ""
+    engagement_state_before: Literal["cold", "warm", "interested", "ready"] | None = None
+    engagement_state_after: Literal["cold", "warm", "interested", "ready"] | None = None
+    sales_state_before: Literal[
+        "unknown",
+        "exploring",
+        "need_identified",
+        "qualified",
+        "interested",
+        "appointment_ready",
+        "nurture",
+        "handoff",
+    ] | None = None
+    sales_state_after: Literal[
+        "unknown",
+        "exploring",
+        "need_identified",
+        "qualified",
+        "interested",
+        "appointment_ready",
+        "nurture",
+        "handoff",
+    ] | None = None
+    conversation_goal: Literal[
+        "build_trust",
+        "discover_need",
+        "surface_priority",
+        "show_fit",
+        "handle_concern",
+        "invite_next_step",
+        "nurture_lead",
+        "handoff_to_human",
+    ] | None = None
+    response_mode: Literal[
+        "warm_welcome",
+        "value_teaser",
+        "discover_need",
+        "consultive_recommendation",
+        "grounded_recommendation",
+        "handle_concern",
+        "soft_next_step",
+        "nurture_followup",
+        "meeting_invite",
+    ] | None = None
+    ask_policy: Literal["avoid_question", "allow_question", "must_clarify"] | None = None
 
 
 class HistoryTurn(BaseModel):
@@ -134,6 +210,7 @@ class QueryRequest(BaseModel):
     lead_state: LeadState | None = None
     recent_history: list[HistoryTurn] = Field(default_factory=list)
     top_k: int | None = Field(default=None, ge=1, le=20)
+    session_id: str | None = Field(default=None, min_length=1, max_length=128)
     force_route: Literal["consult_discovery", "project_grounded"] | None = None
 
     @field_validator("message")
