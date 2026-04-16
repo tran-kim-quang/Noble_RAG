@@ -15,6 +15,24 @@ DEFAULT_FILES = [
 ]
 
 HEADING_RE = re.compile(r"(?m)^#{1,6}\s+")
+NEAR_SIGNAL_RE = re.compile(
+    r"(gần|gan|thuận tiện|tiep can|tiếp cận|di chuyển|di chuyen|walking|drive)",
+    re.IGNORECASE,
+)
+
+POI_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "hospital": ("benh vien", "bệnh viện", "hospital", "medical"),
+    "school": ("truong hoc", "trường học", "school", "giao duc", "giáo dục"),
+    "park": ("cong vien", "công viên", "park", "green"),
+    "mall": ("mall", "tttm", "trung tam thuong mai", "trung tâm thương mại"),
+}
+
+POI_TO_TOPIC = {
+    "hospital": "hospital_access",
+    "school": "school_access",
+    "park": "green_space",
+    "mall": "daily_convenience",
+}
 
 
 def split_sections(markdown_text: str) -> list[str]:
@@ -56,6 +74,75 @@ def chunk_text(text: str, chunk_size: int, chunk_overlap: int) -> list[str]:
     return chunks
 
 
+def detect_poi_types(text: str) -> list[str]:
+    lowered = text.lower()
+    poi_types: list[str] = []
+    for poi_type, keywords in POI_KEYWORDS.items():
+        if any(token in lowered for token in keywords):
+            poi_types.append(poi_type)
+    return list(dict.fromkeys(poi_types))
+
+
+def extract_distance_text(text: str) -> str | None:
+    match = re.search(r"(\d+(?:[.,]\d+)?\s*(?:m|km|phut|phút|min))", text.lower())
+    if match:
+        return match.group(1)
+    return None
+
+
+def infer_travel_mode(text: str) -> str:
+    lowered = text.lower()
+    if any(token in lowered for token in ("di bo", "đi bộ", "walk")):
+        return "walk"
+    if any(token in lowered for token in ("o to", "ô tô", "lai xe", "drive")):
+        return "drive"
+    return "unspecified"
+
+
+def build_proximity_documents(
+    piece: str,
+    *,
+    file_name: str,
+    section_idx: int,
+    piece_idx: int,
+    project_id: str,
+) -> list[dict]:
+    if not NEAR_SIGNAL_RE.search(piece):
+        return []
+    poi_types = detect_poi_types(piece)
+    if not poi_types:
+        return []
+
+    docs: list[dict] = []
+    for local_idx, poi_type in enumerate(poi_types, start=1):
+        topic = POI_TO_TOPIC.get(poi_type, "general")
+        semantic_tags = [f"near_{poi_type}"]
+        if poi_type in {"hospital", "school", "park"}:
+            semantic_tags.append("family_friendly")
+        doc_id = f"md::{Path(file_name).stem}::s{section_idx:03d}::c{piece_idx:03d}::p{local_idx:02d}"
+        source = f"{file_name}#s{section_idx:03d}-c{piece_idx:03d}-p{local_idx:02d}"
+        docs.append(
+            {
+                "doc_id": doc_id,
+                "source": source,
+                "text": piece,
+                "metadata": {
+                    "project_id": project_id,
+                    "origin_file": file_name,
+                    "section_index": section_idx,
+                    "chunk_index": piece_idx,
+                    "type": "proximity_fact",
+                    "topic": topic,
+                    "poi_type": poi_type,
+                    "distance_text": extract_distance_text(piece),
+                    "travel_mode": infer_travel_mode(piece),
+                    "semantic_tags": semantic_tags,
+                },
+            }
+        )
+    return docs
+
+
 def build_documents(
     data_dir: Path,
     markdown_files: list[str],
@@ -89,6 +176,15 @@ def build_documents(
                             "type": "evidence_chunk",
                         },
                     }
+                )
+                documents.extend(
+                    build_proximity_documents(
+                        piece,
+                        file_name=file_path.name,
+                        section_idx=section_idx,
+                        piece_idx=piece_idx,
+                        project_id=project_id,
+                    )
                 )
     return documents
 

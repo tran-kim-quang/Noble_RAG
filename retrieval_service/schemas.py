@@ -70,7 +70,13 @@ class ProjectCard(BaseModel):
     summary: str
     strengths: list[str] = Field(default_factory=list)
     tradeoffs: list[str] = Field(default_factory=list)
+    area: str | None = None
+    product_types: list[str] = Field(default_factory=list)
     fit_personas: list[str] = Field(default_factory=list)
+    family_fit_score: float | None = None
+    investor_fit_score: float | None = None
+    proximity_tags: list[str] = Field(default_factory=list)
+    key_pois: list[str] = Field(default_factory=list)
     score: float = 0.0
 
 
@@ -90,9 +96,28 @@ class EvidenceChunk(BaseModel):
     topic: str | None = None
 
 
+class ProximityFact(BaseModel):
+    project_id: str
+    poi_type: Literal["hospital", "school", "park", "mall", "unknown"] = "unknown"
+    poi_name: str | None = None
+    proximity_text: str = ""
+    distance_text: str | None = None
+    travel_mode: Literal["walk", "drive", "unspecified"] = "unspecified"
+    evidence_source: str = "unknown"
+    semantic_tags: list[str] = Field(default_factory=list)
+
+
+class RetrievalIntent(BaseModel):
+    goal: str | None = None
+    semantic_focus: list[str] = Field(default_factory=list)
+    persona_hint: list[str] = Field(default_factory=list)
+    poi_types: list[str] = Field(default_factory=list)
+    filters: dict[str, Any] = Field(default_factory=dict)
+
+
 class ProjectGroundedRetrieveRequest(BaseModel):
     query: str = Field(min_length=1)
-    retrieval_intent: str | None = None
+    retrieval_intent: RetrievalIntent | str | None = None
     top_k: int | None = Field(default=None, ge=1, le=20)
 
     @field_validator("query")
@@ -108,6 +133,7 @@ class ProjectGroundedRetrieveResponse(BaseModel):
     route: Literal["project_grounded"] = "project_grounded"
     project_cards: list[ProjectCard]
     trait_tags: list[TraitTag]
+    proximity_facts: list[ProximityFact] = Field(default_factory=list)
     evidence_chunks: list[EvidenceChunk]
     confidence: float | None = None
     low_confidence: bool = False

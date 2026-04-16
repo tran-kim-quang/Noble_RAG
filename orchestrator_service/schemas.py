@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -55,7 +56,13 @@ class ProjectCardPayload(BaseModel):
     summary: str
     strengths: list[str] = Field(default_factory=list)
     tradeoffs: list[str] = Field(default_factory=list)
+    area: str | None = None
+    product_types: list[str] = Field(default_factory=list)
     fit_personas: list[str] = Field(default_factory=list)
+    family_fit_score: float | None = None
+    investor_fit_score: float | None = None
+    proximity_tags: list[str] = Field(default_factory=list)
+    key_pois: list[str] = Field(default_factory=list)
     score: float = 0.0
 
 
@@ -75,13 +82,38 @@ class EvidenceChunkPayload(BaseModel):
     topic: str | None = None
 
 
+class ProximityFactPayload(BaseModel):
+    project_id: str
+    poi_type: Literal["hospital", "school", "park", "mall", "unknown"] = "unknown"
+    poi_name: str | None = None
+    proximity_text: str = ""
+    distance_text: str | None = None
+    travel_mode: Literal["walk", "drive", "unspecified"] = "unspecified"
+    evidence_source: str = "unknown"
+    semantic_tags: list[str] = Field(default_factory=list)
+
+
 class ProjectGroundedPayload(BaseModel):
     used_projects: list[str] = Field(default_factory=list)
     project_cards: list[ProjectCardPayload] = Field(default_factory=list)
     trait_tags: list[TraitTagPayload] = Field(default_factory=list)
+    proximity_facts: list[ProximityFactPayload] = Field(default_factory=list)
     evidence_chunks: list[EvidenceChunkPayload] = Field(default_factory=list)
+    retrieval_intent: dict[str, Any] | str | None = None
     confidence: float | None = None
     low_confidence: bool = False
+
+
+class DecisionTrace(BaseModel):
+    query_type: Literal["advisory_strategy", "project_matching", "project_specific", "clarification"] = (
+        "clarification"
+    )
+    retrieval_readiness: Literal["not_ready", "soft_ready", "ready"] = "not_ready"
+    start_route: Literal["consult_discovery", "project_grounded"] = "consult_discovery"
+    final_route: Literal["consult_discovery", "project_grounded"] = "consult_discovery"
+    chained_from_consult: bool = False
+    route_source: str = "unknown"
+    decision_reason: str = ""
 
 
 class HistoryTurn(BaseModel):
@@ -122,4 +154,5 @@ class QueryResponse(BaseModel):
     painpoint_update: NeedPainpointDelta = Field(default_factory=NeedPainpointDelta)
     routing_signal: RoutingSignal | None = None
     project_grounded_payload: ProjectGroundedPayload | None = None
+    decision_trace: DecisionTrace | None = None
     timestamp: str = Field(default_factory=_now_iso)

@@ -1,0 +1,348 @@
+[
+  {
+    "query": "bạn có những căn hộ nào gần trường học không",
+    "response": {
+      "route": "project_grounded",
+      "assistant_reply": "Dạ, việc tìm căn hộ gần trường học là tiêu chí rất quan trọng khi an cư. Em xin giới thiệu Noble Palace Tây Thăng Long, vì dự án này có các tiện ích nổi bật là Trường học và Bệnh viện ngay trong khu vực. Anh/chị quan tâm đến việc ở thực hay đầu tư để em tư vấn chi tiết hơn ạ?",
+      "decision_reason": "Người dùng hỏi về căn hộ gần trường học, đây là yêu cầu tìm kiếm dự án cụ thể (project_matching). Cần chuyển sang luồng project_grounded để cung cấp thông tin dự án. Vì là yêu cầu tìm kiếm, nên thiết lập should_route_project=true.",
+      "lead_state": {
+        "name": null,
+        "phone_contact": null,
+        "need": {
+          "summary": "Người dùng quan tâm đến căn hộ gần trường học.",
+          "topics": [
+            {
+              "label": "vị trí gần trường học",
+              "weight": 0.2
+            }
+          ],
+          "evidence": [
+            "bạn có những căn hộ nào gần trường học không"
+          ],
+          "last_updated_at": "2026-04-16T11:50:16.432509+00:00"
+        },
+        "painpoint": {
+          "summary": "Người dùng đang tìm kiếm căn hộ có tiện ích gần trường học.",
+          "topics": [
+            {
+              "label": "tiện ích giáo dục",
+              "weight": 0.2
+            }
+          ],
+          "evidence": [
+            "bạn có những căn hộ nào gần trường học không"
+          ],
+          "last_updated_at": "2026-04-16T11:50:16.432533+00:00"
+        }
+      },
+      "need_update": {
+        "summary_delta": "Người dùng quan tâm đến căn hộ gần trường học.",
+        "topics": [
+          {
+            "label": "vị trí gần trường học",
+            "weight": 0.2
+          }
+        ],
+        "evidence": [
+          "bạn có những căn hộ nào gần trường học không"
+        ]
+      },
+      "painpoint_update": {
+        "summary_delta": "Người dùng đang tìm kiếm căn hộ có tiện ích gần trường học.",
+        "topics": [
+          {
+            "label": "tiện ích giáo dục",
+            "weight": 0.2
+          }
+        ],
+        "evidence": [
+          "bạn có những căn hộ nào gần trường học không"
+        ]
+      },
+      "routing_signal": null,
+      "project_grounded_payload": {
+        "used_projects": [
+          "noble_palace_tay_thang_long"
+        ],
+        "project_cards": [
+          {
+            "project_id": "noble_palace_tay_thang_long",
+            "summary": "noble_palace_tay_thang_long: dữ liệu hiện tại cho thấy dự án có thể phù hợp khi ưu tiên general va lens near_hospital. Bằng chứng nổi bật: ## 1. Tổng quan",
+            "strengths": [
+              "có dữ liệu nền tảng để phân tích theo nhu cầu cụ thể."
+            ],
+            "tradeoffs": [
+              "cần đối chiếu thêm ngân sách, nhu cầu ở thực và kỳ vọng đầu tư trước khi chốt."
+            ],
+            "area": null,
+            "product_types": [
+              "unspecified"
+            ],
+            "fit_personas": [
+              "khách cần shortlist theo tiêu chí cụ thể"
+            ],
+            "family_fit_score": 0.6,
+            "investor_fit_score": 0.4,
+            "proximity_tags": [
+              "near_hospital"
+            ],
+            "key_pois": [
+              "Bệnh viện, Trường học, Shophouse"
+            ],
+            "score": 0.4798
+          }
+        ],
+        "trait_tags": [],
+        "proximity_facts": [
+          {
+            "project_id": "noble_palace_tay_thang_long",
+            "poi_type": "hospital",
+            "poi_name": "Bệnh viện, Trường học, Shophouse",
+            "proximity_text": "### NỘI DUNG\nMặt bằng Bệnh viện, Trường học, Shophouse",
+            "distance_text": null,
+            "travel_mode": "unspecified",
+            "evidence_source": "CONCEPT_THIET_KE_08_02_2025_only_hang_muc_noi_dung.md#s043-c001",
+            "semantic_tags": [
+              "near_hospital",
+              "family_living"
+            ]
+          }
+        ],
+        "evidence_chunks": [
+          {
+            "text": "## 1. Tổng quan",
+            "score": 0.47128427,
+            "source": "CONCEPT_THIET_KE_08_02_2025_only_hang_muc_noi_dung.md#s002-c001",
+            "doc_id": "md::CONCEPT_THIET_KE_08_02_2025_only_hang_muc_noi_dung::s002::c001",
+            "project_id": "noble_palace_tay_thang_long",
+            "topic": "general"
+          },
+          {
+            "text": "### NỘI DUNG\nVị trí dự án",
+            "score": 0.46831357,
+            "source": "CONCEPT_THIET_KE_08_02_2025_only_hang_muc_noi_dung.md#s049-c001",
+            "doc_id": "md::CONCEPT_THIET_KE_08_02_2025_only_hang_muc_noi_dung::s049::c001",
+            "project_id": "noble_palace_tay_thang_long",
+            "topic": "general"
+          },
+          {
+            "text": "### NỘI DUNG\nTổng hợp",
+            "score": 0.45496488,
+            "source": "CONCEPT_THIET_KE_08_02_2025_only_hang_muc_noi_dung.md#s011-c001",
+            "doc_id": "md::CONCEPT_THIET_KE_08_02_2025_only_hang_muc_noi_dung::s011::c001",
+            "project_id": "noble_palace_tay_thang_long",
+            "topic": "general"
+          },
+          {
+            "text": "## 6. Quy hoạch",
+            "score": 0.45383883,
+            "source": "CONCEPT_THIET_KE_08_02_2025_only_hang_muc_noi_dung.md#s012-c001",
+            "doc_id": "md::CONCEPT_THIET_KE_08_02_2025_only_hang_muc_noi_dung::s012::c001",
+            "project_id": "noble_palace_tay_thang_long",
+            "topic": "general"
+          },
+          {
+            "text": "## III. PHƯƠNG THỨC THANH TOÁN",
+            "score": 0.45049936,
+            "source": "02_12_2025_CSBH_574_NOBLE_PALACE_TAY_THANG_LONG_HDBM.md#s010-c001",
+            "doc_id": "md::02_12_2025_CSBH_574_NOBLE_PALACE_TAY_THANG_LONG_HDBM::s010::c001",
+            "project_id": "noble_palace_tay_thang_long",
+            "topic": "general"
+          }
+        ],
+        "retrieval_intent": {
+          "goal": "project_matching",
+          "semantic_focus": [],
+          "persona_hint": [],
+          "poi_types": [],
+          "filters": {},
+          "retrieval_readiness": "soft_ready",
+          "raw_user_query": "bạn có những căn hộ nào gần trường học không"
+        },
+        "confidence": 0.49800873,
+        "low_confidence": false
+      },
+      "decision_trace": {
+        "query_type": "project_matching",
+        "retrieval_readiness": "soft_ready",
+        "start_route": "project_grounded",
+        "final_route": "project_grounded",
+        "chained_from_consult": false,
+        "route_source": "llm_decider",
+        "decision_reason": "Người dùng hỏi về căn hộ gần trường học, đây là yêu cầu tìm kiếm dự án cụ thể (project_matching). Cần chuyển sang luồng project_grounded để cung cấp thông tin dự án. Vì là yêu cầu tìm kiếm, nên thiết lập should_route_project=true."
+      },
+      "timestamp": "2026-04-16T11:50:36.555599+00:00"
+    }
+  },
+  {
+    "query": "mình đang có 5 tỷ, tư vấn giúp mình các căn hộ thích hợp trong tâm giá này",
+    "response": {
+      "route": "project_grounded",
+      "assistant_reply": "Chào bạn, với ngân sách 5 tỷ đồng thì Noble Palace Tây Thăng Long là một lựa chọn rất tiềm năng. Dự án này định vị ở phân khúc cao cấp, nên bạn cần cân đối ngân sách theo tầng và view để chọn được sản phẩm ưng ý nhất. Bạn quan tâm đến việc ở hay đầu tư để mình tư vấn chính xác hơn ạ?",
+      "decision_reason": "Người dùng yêu cầu tìm căn hộ phù hợp với ngân sách (5 tỷ), đây là một yêu cầu tìm kiếm dự án (project_matching). Tuy nhiên, vì chưa có thông tin cụ thể về khu vực hay tiêu chí sống, nên bắt đầu bằng giai đoạn tư vấn khám phá (consult_discovery) để thu thập thêm bối cảnh trước khi chuyển sang tìm kiếm dự án.",
+      "lead_state": {
+        "name": null,
+        "phone_contact": null,
+        "need": {
+          "summary": "Ngân sách hiện tại là 5 tỷ đồng.",
+          "topics": [
+            {
+              "label": "ngân sách",
+              "weight": 1.0
+            }
+          ],
+          "evidence": [
+            "5 tỷ"
+          ],
+          "last_updated_at": "2026-04-16T11:50:57.175575+00:00"
+        },
+        "painpoint": {
+          "summary": "Chưa xác định được các vấn đề/nhu cầu cụ thể ngoài ngân sách.",
+          "topics": [
+            {
+              "label": "nhu cầu nhà ở",
+              "weight": 0.5
+            }
+          ],
+          "evidence": [
+            "mình đang có 5 tỷ, tư vấn giúp mình các căn hộ thích hợp trong tâm giá này"
+          ],
+          "last_updated_at": "2026-04-16T11:50:57.175599+00:00"
+        }
+      },
+      "need_update": {
+        "summary_delta": "Ngân sách hiện tại là 5 tỷ đồng.",
+        "topics": [
+          {
+            "label": "ngân sách",
+            "weight": 1.0
+          }
+        ],
+        "evidence": [
+          "5 tỷ"
+        ]
+      },
+      "painpoint_update": {
+        "summary_delta": "Chưa xác định được các vấn đề/nhu cầu cụ thể ngoài ngân sách.",
+        "topics": [
+          {
+            "label": "nhu cầu nhà ở",
+            "weight": 0.5
+          }
+        ],
+        "evidence": [
+          "mình đang có 5 tỷ, tư vấn giúp mình các căn hộ thích hợp trong tâm giá này"
+        ]
+      },
+      "routing_signal": {
+        "should_route_project": true,
+        "project_query_hint": "Căn hộ trong tầm giá 5 tỷ đồng.",
+        "reason": "Người dùng yêu cầu tìm căn hộ phù hợp với ngân sách (5 tỷ), đây là một yêu cầu tìm kiếm dự án (project_matching). Tuy nhiên, vì chưa có thông tin cụ thể về khu vực hay tiêu chí sống, nên bắt đầu bằng giai đoạn tư vấn khám phá (consult_discovery) để thu thập thêm bối cảnh trước khi chuyển sang tìm kiếm dự án."
+      },
+      "project_grounded_payload": {
+        "used_projects": [
+          "noble_palace_tay_thang_long"
+        ],
+        "project_cards": [
+          {
+            "project_id": "noble_palace_tay_thang_long",
+            "summary": "noble_palace_tay_thang_long: dữ liệu hiện tại cho thấy dự án có thể phù hợp khi ưu tiên general, price va lens không gian sống tổng hợp. Bằng chứng nổi bật: ## 5. Key dự án",
+            "strengths": [
+              "khung giá và sản phẩm được công bố rõ ràng"
+            ],
+            "tradeoffs": [
+              "cần cân đối ngân sách theo tầng, view và tiến độ thanh toán"
+            ],
+            "area": "tay_thang_long",
+            "product_types": [
+              "shophouse"
+            ],
+            "fit_personas": [
+              "người mua ở lâu dài cần kế hoạch tài chính rõ"
+            ],
+            "family_fit_score": 0.45,
+            "investor_fit_score": 0.7,
+            "proximity_tags": [],
+            "key_pois": [],
+            "score": 0.5122
+          }
+        ],
+        "trait_tags": [
+          {
+            "tag": "premium_pricing",
+            "weight": 0.5982,
+            "reason": "Khung giá thể hiện phân khúc giá trị cao hơn mức phổ thông.",
+            "project_id": "noble_palace_tay_thang_long"
+          }
+        ],
+        "proximity_facts": [],
+        "evidence_chunks": [
+          {
+            "text": "## 5. Key dự án",
+            "score": 0.55896354,
+            "source": "CONCEPT_THIET_KE_08_02_2025_only_hang_muc_noi_dung.md#s010-c001",
+            "doc_id": "md::CONCEPT_THIET_KE_08_02_2025_only_hang_muc_noi_dung::s010::c001",
+            "project_id": "noble_palace_tay_thang_long",
+            "topic": "general"
+          },
+          {
+            "text": "## I. PHẠM VI ÁP DỤNG\n\n- **Thời gian áp dụng:** Áp dụng từ ngày 02/12/2025 đến khi có thông báo hoặc Chính sách bán hàng mới thay thế.\n- **Đối tượng áp dụng:** Khách hàng (\"KH\") mua Sản phẩm Bất động sản tại **Dự án Noble Palace Tây Thăng Long** thỏa mãn điều kiện quy định tại chính sách bán hàng.\n- **Sản phẩm áp dụng:** Các sản phẩm thuộc Dự án Noble Palace Tây Thăng Long.\n- **Tiêu chuẩn bàn giao:** Xây thô, hoàn thiện mặt ngoài.\n- **Điều kiện áp dụng:** Chính sách này chỉ áp dụng đối với khách hàng ký Phiếu Đặt Cọc/Thỏa Thuận Đặt Cọc/Xác nhận Đặt Cọc trên Noble App (gọi chung là TTĐC) trong thời gian có hiệu lực của chính sách bán hàng.\n\n---",
+            "score": 0.5182071,
+            "source": "02_12_2025_CSBH_574_NOBLE_PALACE_TAY_THANG_LONG_HDBM.md#s003-c001",
+            "doc_id": "md::02_12_2025_CSBH_574_NOBLE_PALACE_TAY_THANG_LONG_HDBM::s003::c001",
+            "project_id": "noble_palace_tay_thang_long",
+            "topic": "price"
+          },
+          {
+            "text": "### 1. Quà tặng thẻ Debit\n\nKhách hàng khi mua sản phẩm nhận ngay thẻ Debit trị giá lên tới **300.000.000 VND**:\n\n| Sản phẩm | Hạn mức thẻ |\n|---|---:|\n| Lớn hơn 90m2 | 300.000.000 VND |\n| Từ 75m2 đến 90m2 | 200.000.000 VND |\n| Nhỏ hơn 75m2 | 180.000.000 VND |\n\n**Lưu ý:** Khách hàng có thể nhận quà tặng thẻ debit (khách hàng chịu các chi phí về thuế, phí phát sinh) hoặc trừ trực tiếp vào giá bán.",
+            "score": 0.49688682,
+            "source": "02_12_2025_CSBH_574_NOBLE_PALACE_TAY_THANG_LONG_HDBM.md#s005-c001",
+            "doc_id": "md::02_12_2025_CSBH_574_NOBLE_PALACE_TAY_THANG_LONG_HDBM::s005::c001",
+            "project_id": "noble_palace_tay_thang_long",
+            "topic": "general"
+          },
+          {
+            "text": "### NỘI DUNG\n- Tên thương mại: Noble Palace Tay Thang Long Worldhotels Residences (29/10/2026) - Tên pháp lý: Dự án đầu tư xây dựng Khu đô thị Nhịp sống mới - Sunshine Grand Capital (QĐ 6555, 12/2023) - Vị trí: Thuộc Khu đô thị mới Tây Nam, xã Ô Diên, TP Hà Nội - Định vị: THÀNH PHỐ CỦA VĂN HOÁ, ÁNH SÁNG VÀ NGHỆ THUẬT ĐÔ THỊ THÔNG MINH TIÊN PHONG SỬ DỤNG TỐI ĐA CÔNG NGHỆ AI (2 ý này có thể dùng chính - phụ tùy từng trường hợp) (Cập nhật 19/3/2025) - Tagline: Tinh hoa tạo tác tinh hoa (7/2024) - Slogan: Where Art Meets High-End Living (Nơi nghệ thuật chạm đến tầm cao) - Quy mô: + Tổng diện tích quy hoạch toàn dự án KĐT mới Tây Nam: 77 ha + Diện tích dự án Noble Palace Tay Thang Long: 42,04 ha (420.353 m2 ~ 42,04 ha) Trong đó: . Diện tích đất nhà ở thấp tầng: 17,69 ha . Đất cây xanh: 19.572 m2 + Loại hình: Nhà liền kề, Shophouse + Số căn: 2.448 căn - Tổng mức đầu tư: khoảng 13.629 tỷ (Tổng mức đầu tư theo pháp lý: 12.225 tỷ đồng) 2.448 căn (Shophouse 5 tầng: 952 lô; Shophouse 4 tầng: 1.496 lô) Số lô đất hai bên đường nối vào đường Hoàng Quốc Việt: 284 lô (Shophouse 5 tầng) Số lô đất ven sông: 93 lô (Shophouse 4 tầng và 6 lô Shophouse 5 tầng) • Shophouse 4 tầng: diện tích sàn XD 144,6 m2 - 371,1 m2/căn. DT lô đất: 50-117,3m2/căn • Shophouse 5 tầng: diện tích sàn XD 211m2 - 561,4 m2/căn. DT lô đất: 50 -168m2/căn\nDân số: khoảng 9.057 người",
+            "score": 0.4949566,
+            "source": "CONCEPT_THIET_KE_08_02_2025_only_hang_muc_noi_dung.md#s003-c001",
+            "doc_id": "md::CONCEPT_THIET_KE_08_02_2025_only_hang_muc_noi_dung::s003::c001",
+            "project_id": "noble_palace_tay_thang_long",
+            "topic": "general"
+          },
+          {
+            "text": "## 1. Tổng quan",
+            "score": 0.49201167,
+            "source": "CONCEPT_THIET_KE_08_02_2025_only_hang_muc_noi_dung.md#s002-c001",
+            "doc_id": "md::CONCEPT_THIET_KE_08_02_2025_only_hang_muc_noi_dung::s002::c001",
+            "project_id": "noble_palace_tay_thang_long",
+            "topic": "general"
+          }
+        ],
+        "retrieval_intent": {
+          "goal": "project_matching",
+          "semantic_focus": [
+            "ngân sách",
+            "nhu cầu nhà ở"
+          ],
+          "persona_hint": [],
+          "poi_types": [],
+          "filters": {},
+          "retrieval_readiness": "soft_ready",
+          "raw_user_query": "Căn hộ trong tầm giá 5 tỷ đồng."
+        },
+        "confidence": 0.55896354,
+        "low_confidence": false
+      },
+      "decision_trace": {
+        "query_type": "project_matching",
+        "retrieval_readiness": "soft_ready",
+        "start_route": "consult_discovery",
+        "final_route": "project_grounded",
+        "chained_from_consult": true,
+        "route_source": "llm_decider",
+        "decision_reason": "Người dùng yêu cầu tìm căn hộ phù hợp với ngân sách (5 tỷ), đây là một yêu cầu tìm kiếm dự án (project_matching). Tuy nhiên, vì chưa có thông tin cụ thể về khu vực hay tiêu chí sống, nên bắt đầu bằng giai đoạn tư vấn khám phá (consult_discovery) để thu thập thêm bối cảnh trước khi chuyển sang tìm kiếm dự án."
+      },
+      "timestamp": "2026-04-16T11:51:17.737863+00:00"
+    }
+  }
+]

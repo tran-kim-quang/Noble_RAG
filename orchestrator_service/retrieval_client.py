@@ -21,7 +21,7 @@ class RetrievalClient:
             "low_confidence": bool(parsed.get("low_confidence", False)),
         }
 
-    def retrieve_project_grounded(self, query: str, retrieval_intent: str | None, top_k: int) -> dict[str, Any]:
+    def retrieve_project_grounded(self, query: str, retrieval_intent: Any, top_k: int) -> dict[str, Any]:
         payload = {
             "query": query,
             "retrieval_intent": retrieval_intent,
@@ -31,6 +31,7 @@ class RetrievalClient:
         return {
             "project_cards": parsed.get("project_cards", []) or [],
             "trait_tags": parsed.get("trait_tags", []) or [],
+            "proximity_facts": parsed.get("proximity_facts", []) or [],
             "evidence_chunks": parsed.get("evidence_chunks", []) or [],
             "confidence": parsed.get("confidence", 0.0),
             "low_confidence": bool(parsed.get("low_confidence", False)),

@@ -226,14 +226,18 @@ def create_app(service=None) -> FastAPI:
     def retrieve_project_grounded(payload: ProjectGroundedRetrieveRequest) -> ProjectGroundedRetrieveResponse:
         svc = get_service_instance()
         try:
+            retrieval_intent = payload.retrieval_intent
+            if hasattr(retrieval_intent, "model_dump"):
+                retrieval_intent = retrieval_intent.model_dump()
             raw = svc.retrieve_project_grounded(
                 query=payload.query,
-                retrieval_intent=payload.retrieval_intent,
+                retrieval_intent=retrieval_intent,
                 top_k=payload.top_k,
             )
             response = ProjectGroundedRetrieveResponse(
                 project_cards=raw.get("project_cards", []) or [],
                 trait_tags=raw.get("trait_tags", []) or [],
+                proximity_facts=raw.get("proximity_facts", []) or [],
                 evidence_chunks=raw.get("evidence_chunks", []) or [],
                 confidence=raw.get("confidence"),
                 low_confidence=bool(raw.get("low_confidence", False)),
@@ -241,12 +245,13 @@ def create_app(service=None) -> FastAPI:
             log.info(
                 (
                     "project-grounded retrieve query_len=%s top_k=%s project_cards=%s "
-                    "trait_tags=%s evidence_chunks=%s confidence=%.4f low_confidence=%s"
+                    "trait_tags=%s proximity_facts=%s evidence_chunks=%s confidence=%.4f low_confidence=%s"
                 ),
                 len(payload.query),
                 payload.top_k or getattr(getattr(svc, "settings", object()), "default_top_k", 5),
                 len(response.project_cards),
                 len(response.trait_tags),
+                len(response.proximity_facts),
                 len(response.evidence_chunks),
                 response.confidence or 0.0,
                 response.low_confidence,
