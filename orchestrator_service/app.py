@@ -96,6 +96,7 @@ _FASTPATH_CONSULT_RESPONSE_MODES = {
     "warm_welcome",
     "value_teaser",
     "discover_need",
+    "consultive_recommendation",
 }
 
 
@@ -1005,6 +1006,36 @@ def _looks_unaccented_vietnamese(text: str) -> bool:
     return all(ord(ch) < 128 for ch in letters)
 
 
+def _has_money_signal(text: str) -> bool:
+    content = str(text or "").strip().lower()
+    if not content:
+        return False
+    return bool(re.search(r"\b\d+(?:[.,]\d+)?\s*(?:tỷ|ty|tỉ|ti|triệu|trieu)\b", content))
+
+
+def _has_personal_budget_phrase(text: str) -> bool:
+    content = str(text or "").strip().lower()
+    if not content:
+        return False
+    patterns = [
+        r"\bvới\s+\d+(?:[.,]\d+)?\s*(?:tỷ|ty|tỉ|ti|triệu|trieu)\b",
+        r"\bngân\s*sách\s+\d+(?:[.,]\d+)?\s*(?:tỷ|ty|tỉ|ti|triệu|trieu)\b",
+        r"\btầm\s+\d+(?:[.,]\d+)?\s*(?:tỷ|ty|tỉ|ti|triệu|trieu)\b",
+    ]
+    return any(re.search(pattern, content) for pattern in patterns)
+
+
+def _user_context_has_budget_signal(message: str, recent_history: list[HistoryTurn]) -> bool:
+    if _has_money_signal(message):
+        return True
+    for turn in recent_history[-6:]:
+        if str(turn.role).strip().lower() != "user":
+            continue
+        if _has_money_signal(turn.message):
+            return True
+    return False
+
+
 def _build_grounded_snapshot(grounded_result: dict[str, Any] | None) -> dict[str, Any]:
     if not grounded_result:
         return {}
@@ -1098,8 +1129,10 @@ def _build_reply_synthesis_prompt(
         "Quy tắc bắt buộc:\n"
         "- Dùng tiếng Việt có dấu, rõ ràng, tự nhiên, không máy móc.\n"
         "- Không dùng cụm từ kỹ thuật như route/retrieval/metadata/payload/confidence/vector/schema.\n"
-        "- Phản hồi 2-4 câu ngắn, tối đa 75 từ.\n"
+        "- Phản hồi 2-4 câu ngắn, ưu tiên dưới 90 từ.\n"
         "- Luôn nêu ít nhất 1 nhận định cụ thể bám dữ liệu đã có.\n"
+        "- Không tự suy diễn ngân sách cá nhân cụ thể (ví dụ 'với 5 tỷ...') nếu người dùng chưa nêu ngân sách.\n"
+        "- Khi nhắc con số tài chính, chỉ dùng số đã có trong grounded_context hoặc user_message/recent_history.\n"
         "- Nếu người dùng cần phân tích quá sâu (tài chính chi tiết, pháp lý sâu, phương án căn cụ thể), đề xuất 1 buổi hẹn trực tiếp.\n"
         "- Không trả lời theo mẫu form/checklist; không hỏi dồn nhiều câu.\n"
         "- Không bịa thông tin ngoài dữ liệu cung cấp.\n"
@@ -1109,7 +1142,7 @@ def _build_reply_synthesis_prompt(
         "- Không dùng câu hỏi nhị phân theo mẫu 'ở hay đầu tư'.\n"
         "Ràng buộc do orchestrator cung cấp:\n"
         "- Bạn KHÔNG tự quyết hỏi hay không, phải làm theo ask_policy.\n"
-        "- Mỗi lượt phải theo nhịp reflect -> insight -> invite.\n"
+        "- Mỗi lượt ưu tiên reflect và insight; invite chỉ dùng khi phù hợp với response_mode và conversation_goal.\n"
         "- Nếu user vừa bộc lộ need/painpoint thì phải phản chiếu ngắn trước khi đưa insight.\n"
         "- Mỗi lượt phải mở ra 1 góc tư vấn mới, không lặp intro brochure qua nhiều lượt.\n"
         "- engagement_state=cold/warm thì không CTA mạnh.\n"
@@ -1223,92 +1256,43 @@ def _call_model_generate(
 
 
 def _normalize_reply_to_accented_vietnamese(reply: str, settings: Settings) -> str:
-    normalized = (reply or "").strip()
-    if not normalized or not _looks_unaccented_vietnamese(normalized):
-        return normalized
-    prompt = (
-        "Chuyển đoạn sau sang tiếng Việt có dấu, giữ nguyên ý, giữ văn phong tư vấn ngắn gọn, "
-        "không thêm thông tin mới. Trả về duy nhất JSON: {\"assistant_reply\":\"...\"}.\n"
-        f"text={json.dumps(normalized, ensure_ascii=False)}"
-    )
-    response_payload = _call_model_generate(
-        settings=settings,
-        prompt=prompt,
-        temperature=max(0.0, min(1.0, settings.decider_temperature)),
-        response_format="json",
-    )
-    if isinstance(response_payload, dict):
-        rewritten = str(response_payload.get("assistant_reply", "")).strip()
-    else:
-        rewritten_obj = _extract_json_object(str(response_payload))
-        rewritten = str(rewritten_obj.get("assistant_reply", "")).strip()
-    return rewritten or normalized
-
-
-def _needs_policy_rewrite(reply: str, single_project_mode: bool, ask_policy: str) -> bool:
-    cleaned = (reply or "").strip()
-    if not cleaned:
-        return False
-    normalized_ask_policy = _normalize_ask_policy(ask_policy)
-    question_marks = cleaned.count("?")
-    if normalized_ask_policy == "avoid_question" and question_marks > 0:
-        return True
-    if normalized_ask_policy == "must_clarify" and question_marks == 0:
-        return True
-    if question_marks > 1:
-        return True
-    lowered = cleaned.lower()
-    technical_terms = ["route", "retrieval", "metadata", "payload", "confidence", "schema", "vector"]
-    if any(term in lowered for term in technical_terms):
-        return True
-    if re.search(r"\bở\b.{0,25}\bđầu tư\b|\bđầu tư\b.{0,25}\bở\b", lowered):
-        return True
-    if single_project_mode and re.search(r"\bnhiều\s+(lựa chọn|dự án|căn hộ)\b", lowered):
-        return True
-    if single_project_mode and re.search(r"\bkhu\s*vực\b|\bquận\b", lowered):
-        return True
-    return False
+    _ = settings
+    return (reply or "").strip()
 
 
 def _reply_needs_retry(reply: str, single_project_mode: bool, ask_policy: str) -> bool:
     cleaned = (reply or "").strip()
     if not cleaned:
         return True
-    return _needs_policy_rewrite(
-        reply=cleaned,
-        single_project_mode=single_project_mode,
-        ask_policy=ask_policy,
-    )
+
+    normalized_ask_policy = _normalize_ask_policy(ask_policy)
+    question_marks = cleaned.count("?")
+
+    if normalized_ask_policy == "avoid_question" and question_marks > 0:
+        return True
+    if normalized_ask_policy == "must_clarify" and question_marks == 0:
+        return True
+    if question_marks > 1:
+        return True
+
+    lowered = cleaned.lower()
+    technical_terms = ["route", "retrieval", "metadata", "payload", "confidence", "schema", "vector"]
+    if any(term in lowered for term in technical_terms):
+        return True
+
+    if single_project_mode and re.search(r"\bnhiều\s+(lựa chọn|dự án|căn hộ)\b", lowered):
+        return True
+    if single_project_mode and re.search(r"\bkhu\s*vực\b|\bquận\b", lowered):
+        return True
+
+    return False
 
 
 def _rewrite_reply_by_policy(reply: str, single_project_mode: bool, ask_policy: str, settings: Settings) -> str:
-    mode_text = "true" if single_project_mode else "false"
-    normalized_ask_policy = _normalize_ask_policy(ask_policy)
-    prompt = (
-        "Viết lại phản hồi sau để đúng các quy tắc:\n"
-        "- 2-4 câu ngắn, tối đa 75 từ.\n"
-        "- Tiếng Việt tự nhiên, không kỹ thuật.\n"
-        "- Nếu cần phân tích sâu thì gợi ý hẹn gặp trực tiếp.\n"
-        f"- single_project_mode={mode_text}; nếu true thì không nói 'nhiều lựa chọn' hay 'nhiều dự án'.\n"
-        "- Nếu single_project_mode=true thì không hỏi khu vực/quận.\n"
-        "- Không dùng cùng một khuôn câu hỏi lặp lại máy móc; đổi góc hỏi theo phần thông tin còn thiếu.\n"
-        "- Không dùng câu hỏi nhị phân theo mẫu 'ở hay đầu tư'.\n"
-        f"- ask_policy={normalized_ask_policy}: avoid_question=không hỏi; allow_question=tối đa 1 câu hỏi; must_clarify=đúng 1 câu hỏi.\n"
-        "Trả về duy nhất JSON: {\"assistant_reply\":\"...\"}\n"
-        f"reply={json.dumps(reply, ensure_ascii=False)}"
-    )
-    response_payload = _call_model_generate(
-        settings=settings,
-        prompt=prompt,
-        temperature=max(0.0, min(1.0, settings.decider_temperature)),
-        response_format="json",
-    )
-    if isinstance(response_payload, dict):
-        rewritten = str(response_payload.get("assistant_reply", "")).strip()
-    else:
-        rewritten_obj = _extract_json_object(str(response_payload))
-        rewritten = str(rewritten_obj.get("assistant_reply", "")).strip()
-    return rewritten
+    _ = single_project_mode
+    _ = ask_policy
+    _ = settings
+    return (reply or "").strip()
 
 
 def _sanitize_reply_for_policy(
@@ -1432,6 +1416,7 @@ def synthesize_assistant_reply(
     grounded_result: dict[str, Any] | None,
     settings: Settings,
 ) -> str:
+    user_has_budget_context = _user_context_has_budget_signal(message=message, recent_history=recent_history)
     prompt = _build_reply_synthesis_prompt(
         message=message,
         lead_state=lead_state,
@@ -1467,37 +1452,15 @@ def synthesize_assistant_reply(
         else:
             parsed_obj = _extract_json_object(str(response_payload))
             reply = str(parsed_obj.get("assistant_reply", "")).strip()
-        reply = _normalize_reply_to_accented_vietnamese(reply=reply, settings=settings)
         reply = _sanitize_reply_for_policy(
             reply=reply,
             ask_policy=reply_plan.ask_policy,
             single_project_mode=single_project_mode,
             question_focus=reply_plan.question_focus,
         )
-        needs_retry = _reply_needs_retry(
-            reply=reply,
-            single_project_mode=single_project_mode,
-            ask_policy=reply_plan.ask_policy,
-        )
-        if needs_retry and _needs_policy_rewrite(
-            reply=reply,
-            single_project_mode=single_project_mode,
-            ask_policy=reply_plan.ask_policy,
-        ):
-            rewritten = _rewrite_reply_by_policy(
-                reply=reply,
-                single_project_mode=single_project_mode,
-                ask_policy=reply_plan.ask_policy,
-                settings=settings,
-            )
-            if rewritten:
-                reply = _normalize_reply_to_accented_vietnamese(reply=rewritten, settings=settings)
-                reply = _sanitize_reply_for_policy(
-                    reply=reply,
-                    ask_policy=reply_plan.ask_policy,
-                    single_project_mode=single_project_mode,
-                    question_focus=reply_plan.question_focus,
-                )
+        if _has_personal_budget_phrase(reply) and not user_has_budget_context:
+            log.info("reply synthesis dropped unsupported personal budget phrase")
+            reply = ""
         if _reply_needs_retry(
             reply=reply,
             single_project_mode=single_project_mode,
@@ -1578,7 +1541,10 @@ def _build_decider_prompt(message: str, lead_state: LeadState, recent_history: l
         "- Dung tieng Viet tu nhien, uu tien co dau, khong dung cum ky thuat.\n"
         "- consult_reply phai du dung nhu cau tra loi cuoi cho consult turn don gian.\n"
         "- Voi advisory_strategy hoac clarification nhe, consult_reply can usable ngay khong can rewrite.\n"
-        "- Tranh noi dung mo ho phu thuoc vao grounded_context hoac buoc rewrite phia sau.\n"
+        "- Khong tu suy dien ngan sach ca nhan cu the (vi du 'voi 5 ty...') neu user chua neu ngan sach.\n"
+        "- Voi consultive_recommendation, consult_reply phai usable ngay nhu cau tra loi cuoi cho consult-only turn.\n"
+        "- Neu khong can grounding du an hoac khong can xin contact/hen gap, consult_reply phai du de tra thang cho user.\n"
+        "- Tranh noi dung mo ho phu thuoc vao grounded_context hoac buoc reply_synthesis phia sau.\n"
         "- Bat buoc co it nhat 1 nhan dinh huu ich truoc.\n"
         "- Chi dat cau hoi khi thieu 1 thong tin quan trong; khong mac dinh ket thuc bang cau hoi.\n"
         "- Toi da 3-4 cau ngan; neu hoi thi toi da 1 cau hoi.\n"
@@ -2229,6 +2195,8 @@ def create_app(
                                 output={
                                     "assistant_reply_chars": len(assistant_reply),
                                     "assistant_reply_preview": assistant_reply[:240],
+                                    "used_model_rewrite": False,
+                                    "used_model_accent_normalize": False,
                                 }
                             )
 
