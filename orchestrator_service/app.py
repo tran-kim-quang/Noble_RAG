@@ -92,6 +92,11 @@ _LEGACY_RESPONSE_MODE_MAP = {
     "handle_objection": "handle_concern",
     "next_step_invite": "soft_next_step",
 }
+_FASTPATH_CONSULT_RESPONSE_MODES = {
+    "warm_welcome",
+    "value_teaser",
+    "discover_need",
+}
 
 
 @dataclass(frozen=True)
@@ -108,6 +113,8 @@ class TurnAnalysis:
     engagement_state_after_hint: str | None = None
     sales_state_after_hint: str | None = None
     conversation_goal_hint: str | None = None
+    extracted_name: str | None = None
+    extracted_phone: str | None = None
 
 
 @dataclass(frozen=True)
@@ -161,8 +168,8 @@ def _normalize_retrieval_readiness(raw: Any) -> str:
 
 def _extract_name(message: str) -> str | None:
     patterns = [
-        r"(?:mình|toi|tôi|em|anh|chi|chị)\s+là\s+([a-zA-ZÀ-ỹ][a-zA-ZÀ-ỹ\s]{1,30})",
-        r"tên\s+(?:mình|toi|tôi|em|anh|chi|chị)\s+là\s+([a-zA-ZÀ-ỹ][a-zA-ZÀ-ỹ\s]{1,30})",
+        r"(?:mình|toi|tôi|em|anh|chi|chị)\s+(?:là|la)\s+([a-zA-ZÀ-ỹ][a-zA-ZÀ-ỹ\s]{1,30})",
+        r"(?:tên|ten)\s+(?:mình|toi|tôi|em|anh|chi|chị)\s+(?:là|la)\s+([a-zA-ZÀ-ỹ][a-zA-ZÀ-ỹ\s]{1,30})",
     ]
     for pattern in patterns:
         match = re.search(pattern, message, re.IGNORECASE)
@@ -177,6 +184,26 @@ def _extract_phone_contact(message: str) -> str | None:
         return None
     phone = re.sub(r"\s+", "", match.group(0))
     return phone
+
+
+def _coerce_extracted_name(raw: Any) -> str | None:
+    cleaned = " ".join(str(raw or "").strip().split())
+    if not cleaned:
+        return None
+    if cleaned.lower() in {"none", "null", "n/a"}:
+        return None
+    if not re.search(r"[a-zA-ZÀ-ỹ]", cleaned):
+        return None
+    return cleaned[:64]
+
+
+def _coerce_extracted_phone(raw: Any) -> str | None:
+    cleaned = str(raw or "").strip()
+    if not cleaned:
+        return None
+    if cleaned.lower() in {"none", "null", "n/a"}:
+        return None
+    return _extract_phone_contact(cleaned)
 
 
 def _merge_summaries(old_summary: str, summary_delta: str) -> str:
@@ -1218,12 +1245,10 @@ def _normalize_reply_to_accented_vietnamese(reply: str, settings: Settings) -> s
     return rewritten or normalized
 
 
-def _reply_needs_retry(reply: str, single_project_mode: bool, ask_policy: str) -> bool:
+def _needs_policy_rewrite(reply: str, single_project_mode: bool, ask_policy: str) -> bool:
     cleaned = (reply or "").strip()
     if not cleaned:
-        return True
-    if len(cleaned.split()) > 90:
-        return True
+        return False
     normalized_ask_policy = _normalize_ask_policy(ask_policy)
     question_marks = cleaned.count("?")
     if normalized_ask_policy == "avoid_question" and question_marks > 0:
@@ -1243,6 +1268,17 @@ def _reply_needs_retry(reply: str, single_project_mode: bool, ask_policy: str) -
     if single_project_mode and re.search(r"\bkhu\s*vực\b|\bquận\b", lowered):
         return True
     return False
+
+
+def _reply_needs_retry(reply: str, single_project_mode: bool, ask_policy: str) -> bool:
+    cleaned = (reply or "").strip()
+    if not cleaned:
+        return True
+    return _needs_policy_rewrite(
+        reply=cleaned,
+        single_project_mode=single_project_mode,
+        ask_policy=ask_policy,
+    )
 
 
 def _rewrite_reply_by_policy(reply: str, single_project_mode: bool, ask_policy: str, settings: Settings) -> str:
@@ -1313,6 +1349,42 @@ def _sanitize_reply_for_policy(
         cleaned = cleaned[: first_q + 1].strip()
 
     return cleaned
+
+
+def _evaluate_consult_reply_fastpath(
+    final_route: str,
+    chained_from_consult: bool,
+    grounded_result: dict[str, Any] | None,
+    reply_plan: ReplyPlan,
+) -> tuple[bool, str]:
+    if final_route != "consult_discovery":
+        return False, "final_route_not_consult_discovery"
+    if chained_from_consult:
+        return False, "chained_from_consult"
+    if grounded_result is not None:
+        return False, "grounded_result_present"
+    if _normalize_ask_policy(reply_plan.ask_policy) == "must_clarify":
+        return False, "ask_policy_must_clarify"
+    response_mode = _normalize_response_mode(reply_plan.response_mode)
+    if response_mode not in _FASTPATH_CONSULT_RESPONSE_MODES:
+        return False, f"response_mode_not_safe:{response_mode}"
+    return True, "eligible"
+
+
+def _prepare_fastpath_consult_reply(
+    analysis: TurnAnalysis,
+    reply_plan: ReplyPlan,
+) -> str:
+    reply = (analysis.consult_reply or "").strip()
+    if not reply:
+        return ""
+    reply = _sanitize_reply_for_policy(
+        reply=reply,
+        ask_policy=reply_plan.ask_policy,
+        single_project_mode=True,
+        question_focus=reply_plan.question_focus,
+    )
+    return _compact_text(reply, max_words=120)
 
 
 def _build_reply_fallback(
@@ -1402,7 +1474,12 @@ def synthesize_assistant_reply(
             single_project_mode=single_project_mode,
             question_focus=reply_plan.question_focus,
         )
-        if _reply_needs_retry(
+        needs_retry = _reply_needs_retry(
+            reply=reply,
+            single_project_mode=single_project_mode,
+            ask_policy=reply_plan.ask_policy,
+        )
+        if needs_retry and _needs_policy_rewrite(
             reply=reply,
             single_project_mode=single_project_mode,
             ask_policy=reply_plan.ask_policy,
@@ -1499,6 +1576,9 @@ def _build_decider_prompt(message: str, lead_state: LeadState, recent_history: l
         "Quy tac consult_reply:\n"
         "- Giong consultant, khong giong form checklist.\n"
         "- Dung tieng Viet tu nhien, uu tien co dau, khong dung cum ky thuat.\n"
+        "- consult_reply phai du dung nhu cau tra loi cuoi cho consult turn don gian.\n"
+        "- Voi advisory_strategy hoac clarification nhe, consult_reply can usable ngay khong can rewrite.\n"
+        "- Tranh noi dung mo ho phu thuoc vao grounded_context hoac buoc rewrite phia sau.\n"
         "- Bat buoc co it nhat 1 nhan dinh huu ich truoc.\n"
         "- Chi dat cau hoi khi thieu 1 thong tin quan trong; khong mac dinh ket thuc bang cau hoi.\n"
         "- Toi da 3-4 cau ngan; neu hoi thi toi da 1 cau hoi.\n"
@@ -1507,6 +1587,10 @@ def _build_decider_prompt(message: str, lead_state: LeadState, recent_history: l
         "- Neu can phan tich sau hon, uu tien de xuat buoi hen gap truc tiep thay vi co gang phan tich qua sau trong chat.\n"
         "- Neu query la project_matching, consult_reply chi la cau bridge ngan de chain sang project route, khong dong request o consult.\n"
         "- Khong lap lai brochure intro qua nhieu luot lien tiep.\n\n"
+        "Quy tac trich xuat thong tin lien he:\n"
+        "- extracted_name: ten khach hang neu message/history vua neu ro rang; neu khong chac chan thi null.\n"
+        "- extracted_phone: so dien thoai neu user neu ro rang; neu khong chac chan thi null.\n"
+        "- Khong duoc suy dien ten/so dien thoai neu user chua noi.\n\n"
         "Bat buoc tra ve 1 JSON object theo schema:\n"
         "{\n"
         '  "query_type": "advisory_strategy|project_matching|project_specific|clarification",\n'
@@ -1529,7 +1613,9 @@ def _build_decider_prompt(message: str, lead_state: LeadState, recent_history: l
         '    "topics": [{"label":"string","weight":0.0}],\n'
         '    "evidence": ["string"]\n'
         "  },\n"
-        '  "consult_reply": "string"\n'
+        '  "consult_reply": "string",\n'
+        '  "extracted_name": "string|null",\n'
+        '  "extracted_phone": "string|null"\n'
         "}\n\n"
         f"message={json.dumps(message, ensure_ascii=False)}\n"
         f"lead_state={json.dumps(compact_state, ensure_ascii=False)}\n"
@@ -1576,6 +1662,8 @@ def _analyze_turn_with_model(
     )
     sales_state_hint = _normalize_sales_state(result_obj.get("sales_state_after"), fallback=lead_state.sales_state)
     conversation_goal_hint = _normalize_conversation_goal(result_obj.get("conversation_goal"), fallback="build_trust")
+    extracted_name = _coerce_extracted_name(result_obj.get("extracted_name"))
+    extracted_phone = _coerce_extracted_phone(result_obj.get("extracted_phone"))
 
     consult_reply = _compact_text(str(result_obj.get("consult_reply", "")).strip(), max_words=95)
     return TurnAnalysis(
@@ -1595,6 +1683,8 @@ def _analyze_turn_with_model(
         engagement_state_after_hint=engagement_state_hint,
         sales_state_after_hint=sales_state_hint,
         conversation_goal_hint=conversation_goal_hint,
+        extracted_name=extracted_name,
+        extracted_phone=extracted_phone,
     )
 
 
@@ -1639,6 +1729,8 @@ def _analyze_turn_fallback(message: str, lead_state: LeadState, recent_history: 
         engagement_state_after_hint=lead_state.engagement_state,
         sales_state_after_hint=lead_state.sales_state,
         conversation_goal_hint=lead_state.last_conversation_goal or "build_trust",
+        extracted_name=_extract_name(message),
+        extracted_phone=_extract_phone_contact(message),
     )
 
 
@@ -1774,8 +1866,6 @@ def create_app(
         message = payload.message.strip()
         lead_state = payload.lead_state or LeadState()
         top_k = payload.top_k or settings.default_top_k
-        extracted_name = _extract_name(message)
-        extracted_phone = _extract_phone_contact(message)
         langfuse_enabled = bool(settings.langfuse_enabled)
         session_id = _derive_observability_session_id(payload=payload, lead_state=lead_state)
         user_id = _derive_observability_user_id(lead_state=lead_state)
@@ -1823,12 +1913,18 @@ def create_app(
                                 "retrieval_readiness": analysis.retrieval_readiness,
                                 "should_route_project": bool(analysis.routing_signal.should_route_project),
                                 "route_source": analysis.route_source,
+                                "extracted_name_from_decider": bool(analysis.extracted_name),
+                                "extracted_phone_from_decider": bool(analysis.extracted_phone),
                             }
                         )
 
                     start_route = analysis.route
                     reason = analysis.decision_reason
                     route_source = analysis.route_source or "turn_analyzer"
+                    extracted_name_fallback = _extract_name(message)
+                    extracted_phone_fallback = _extract_phone_contact(message)
+                    extracted_name = analysis.extracted_name or extracted_name_fallback
+                    extracted_phone = analysis.extracted_phone or extracted_phone_fallback
 
                     if payload.force_route is not None:
                         start_route = payload.force_route
@@ -2083,34 +2179,58 @@ def create_app(
                             }
                         )
 
-                    with start_observation(
-                        langfuse_enabled,
-                        name="orchestrator.reply_synthesis",
-                        as_type="generation",
-                        model=settings.decider_model,
-                        input={
-                            "final_route": final_route,
-                            "response_mode": reply_plan.response_mode,
-                            "ask_policy": reply_plan.ask_policy,
-                        },
-                    ) as reply_obs:
-                        assistant_reply = synthesize_assistant_reply(
-                            message=message,
-                            recent_history=payload.recent_history,
-                            lead_state=final_state,
+                    used_fastpath_consult_reply = False
+                    reply_source = "reply_synthesis"
+                    fastpath_gate_reason = "not_evaluated"
+                    assistant_reply = ""
+
+                    can_fastpath_consult_reply, fastpath_gate_reason = _evaluate_consult_reply_fastpath(
+                        final_route=final_route,
+                        chained_from_consult=chained_from_consult,
+                        grounded_result=grounded_result,
+                        reply_plan=reply_plan,
+                    )
+                    if can_fastpath_consult_reply:
+                        assistant_reply = _prepare_fastpath_consult_reply(
                             analysis=analysis,
-                            final_route=final_route,
-                            decision_reason=reason,
                             reply_plan=reply_plan,
-                            grounded_result=grounded_result,
-                            settings=settings,
                         )
-                        reply_obs.update(
-                            output={
-                                "assistant_reply_chars": len(assistant_reply),
-                                "assistant_reply_preview": assistant_reply[:240],
-                            }
-                        )
+                        if assistant_reply:
+                            used_fastpath_consult_reply = True
+                            reply_source = "consult_reply_fastpath"
+                        else:
+                            fastpath_gate_reason = "consult_reply_empty_after_prepare"
+
+                    if not assistant_reply:
+                        with start_observation(
+                            langfuse_enabled,
+                            name="orchestrator.reply_synthesis",
+                            as_type="generation",
+                            model=settings.decider_model,
+                            input={
+                                "final_route": final_route,
+                                "response_mode": reply_plan.response_mode,
+                                "ask_policy": reply_plan.ask_policy,
+                                "fastpath_gate_reason": fastpath_gate_reason,
+                            },
+                        ) as reply_obs:
+                            assistant_reply = synthesize_assistant_reply(
+                                message=message,
+                                recent_history=payload.recent_history,
+                                lead_state=final_state,
+                                analysis=analysis,
+                                final_route=final_route,
+                                decision_reason=reason,
+                                reply_plan=reply_plan,
+                                grounded_result=grounded_result,
+                                settings=settings,
+                            )
+                            reply_obs.update(
+                                output={
+                                    "assistant_reply_chars": len(assistant_reply),
+                                    "assistant_reply_preview": assistant_reply[:240],
+                                }
+                            )
 
                     if final_route == "project_grounded" and grounded_result is not None:
                         response = QueryResponse(
@@ -2154,6 +2274,23 @@ def create_app(
                             "chained_from_consult": chained_from_consult,
                             "response_mode": reply_plan.response_mode,
                             "ask_policy": reply_plan.ask_policy,
+                            "used_fastpath_consult_reply": used_fastpath_consult_reply,
+                            "reply_source": reply_source,
+                            "fastpath_gate_reason": fastpath_gate_reason,
+                            "name_extract_source": (
+                                "decider"
+                                if analysis.extracted_name
+                                else "regex_fallback"
+                                if extracted_name_fallback
+                                else "none"
+                            ),
+                            "phone_extract_source": (
+                                "decider"
+                                if analysis.extracted_phone
+                                else "regex_fallback"
+                                if extracted_phone_fallback
+                                else "none"
+                            ),
                             "low_confidence": bool(grounded_result.get("low_confidence", False))
                             if grounded_result
                             else None,
@@ -2166,7 +2303,7 @@ def create_app(
                             "query_type=%s retrieval_readiness=%s route_source=%s "
                             "engagement_before=%s engagement_after=%s "
                             "sales_state_before=%s sales_state_after=%s conversation_goal=%s next_best_action=%s "
-                            "response_mode=%s ask_policy=%s reason=%s"
+                            "response_mode=%s ask_policy=%s reply_source=%s fastpath_gate=%s reason=%s"
                         ),
                         trace.start_route,
                         trace.final_route,
@@ -2182,6 +2319,8 @@ def create_app(
                         next_best_action,
                         reply_plan.response_mode,
                         reply_plan.ask_policy,
+                        reply_source,
+                        fastpath_gate_reason,
                         trace.decision_reason,
                     )
                     return response
