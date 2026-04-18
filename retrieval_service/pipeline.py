@@ -271,6 +271,12 @@ class RetrievalService:
         intent = self._normalize_retrieval_intent(retrieval_intent)
         k = top_k or self.settings.default_top_k
         k = max(1, min(k, self.settings.max_top_k))
+        if self.settings.project_grounded_mode == "single_pass":
+            return self._retrieve_project_grounded_single_pass(
+                query=query,
+                retrieval_intent=intent,
+                top_k=k,
+            )
 
         with start_observation(
             self.settings.langfuse_enabled,
@@ -399,6 +405,93 @@ class RetrievalService:
             "confidence": confidence,
             "low_confidence": low_confidence,
         }
+
+    def _retrieve_project_grounded_single_pass(
+        self,
+        query: str,
+        retrieval_intent: dict[str, Any],
+        top_k: int,
+    ) -> dict:
+        single_k = max(top_k, self.settings.project_grounded_single_pass_top_k)
+        with start_observation(
+            self.settings.langfuse_enabled,
+            name="retrieval.project_grounded.single_pass",
+            as_type="span",
+            input={"query": query[:500], "goal": retrieval_intent.get("goal"), "top_k": single_k},
+            metadata={"service": "retrieval-service", "project_grounded_mode": "single_pass"},
+        ) as obs:
+            grounded_query = self._build_grounded_query(query=query, retrieval_intent=retrieval_intent)
+            raw = self.retrieve(grounded_query, top_k=single_k)
+            raw_results = raw.get("results", []) or []
+            evidence_chunks = self._build_evidence_chunks(raw_results)
+            if not evidence_chunks:
+                response = {
+                    "route": "project_grounded",
+                    "project_cards": [],
+                    "trait_tags": [],
+                    "proximity_facts": [],
+                    "evidence_chunks": [],
+                    "confidence": float(raw.get("confidence", 0.0) or 0.0),
+                    "low_confidence": bool(raw.get("low_confidence", False)),
+                }
+                obs.update(
+                    output={
+                        "query": grounded_query[:500],
+                        "single_pass_results": len(raw_results),
+                        "single_pass_confidence": response["confidence"],
+                        "project_cards": 0,
+                        "trait_tags": 0,
+                        "proximity_facts": 0,
+                        "evidence_chunks": 0,
+                        "low_confidence": response["low_confidence"],
+                    }
+                )
+                return response
+
+            candidate_project_ids = self._dedupe_keep_order(
+                [
+                    str(chunk.get("project_id") or self.settings.project_grounded_single_project_id)
+                    for chunk in evidence_chunks
+                ],
+                max_items=4,
+            )
+            proximity_facts = self._build_proximity_facts(
+                chunks=evidence_chunks,
+                retrieval_intent=retrieval_intent,
+                candidate_project_ids=candidate_project_ids,
+            )
+            project_cards = self._build_project_cards(
+                evidence_chunks=evidence_chunks,
+                proximity_facts=proximity_facts,
+                retrieval_intent=retrieval_intent,
+            )
+            trait_tags = self._build_trait_tags(
+                evidence_chunks=evidence_chunks,
+                query=grounded_query,
+                retrieval_intent=retrieval_intent,
+            )
+            response = {
+                "route": "project_grounded",
+                "project_cards": project_cards,
+                "trait_tags": trait_tags,
+                "proximity_facts": proximity_facts,
+                "evidence_chunks": evidence_chunks[: max(top_k * 2, 8)],
+                "confidence": float(raw.get("confidence", 0.0) or 0.0),
+                "low_confidence": bool(raw.get("low_confidence", False)) and not project_cards,
+            }
+            obs.update(
+                output={
+                    "query": grounded_query[:500],
+                    "single_pass_results": len(raw_results),
+                    "single_pass_confidence": response["confidence"],
+                    "project_cards": len(project_cards),
+                    "trait_tags": len(trait_tags),
+                    "proximity_facts": len(proximity_facts),
+                    "evidence_chunks": len(response["evidence_chunks"]),
+                    "low_confidence": response["low_confidence"],
+                }
+            )
+            return response
 
     def _normalize_retrieval_intent(self, retrieval_intent: dict[str, Any] | str | None) -> dict[str, Any]:
         base: dict[str, Any] = {

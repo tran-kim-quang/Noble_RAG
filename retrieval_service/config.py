@@ -31,6 +31,11 @@ class Settings:
     low_confidence_empty_results: bool = (
         os.getenv("LOW_CONFIDENCE_EMPTY_RESULTS", "false").strip().lower() in {"1", "true", "yes", "on"}
     )
+    project_grounded_mode: str = os.getenv("PROJECT_GROUNDED_MODE", "single_pass").strip().lower()
+    project_grounded_single_project_id: str = (
+        os.getenv("PROJECT_GROUNDED_SINGLE_PROJECT_ID", "noble_palace_tay_thang_long").strip()
+    )
+    project_grounded_single_pass_top_k: int = int(os.getenv("PROJECT_GROUNDED_SINGLE_PASS_TOP_K", "8"))
 
     model_warm_enabled: bool = _env_bool("MODEL_WARM_ENABLED", "true")
     model_warm_interval_sec: float = float(os.getenv("MODEL_WARM_INTERVAL_SEC", "120"))

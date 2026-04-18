@@ -22,6 +22,13 @@ class Settings:
     decider_timeout_sec: float = float(os.getenv("ORCHESTRATOR_DECIDER_TIMEOUT_SEC", "35"))
     decider_temperature: float = float(os.getenv("ORCHESTRATOR_DECIDER_TEMPERATURE", "0.2"))
     decider_keep_alive: str = os.getenv("ORCHESTRATOR_DECIDER_KEEP_ALIVE", "30m").strip()
+    decider_history_turns: int = int(os.getenv("ORCHESTRATOR_DECIDER_HISTORY_TURNS", "4"))
+    synthesis_history_turns: int = int(os.getenv("ORCHESTRATOR_SYNTHESIS_HISTORY_TURNS", "3"))
+    synthesis_state_topic_limit: int = int(os.getenv("ORCHESTRATOR_SYNTHESIS_STATE_TOPIC_LIMIT", "4"))
+    grounded_card_limit: int = int(os.getenv("ORCHESTRATOR_GROUNDED_CARD_LIMIT", "1"))
+    grounded_trait_limit: int = int(os.getenv("ORCHESTRATOR_GROUNDED_TRAIT_LIMIT", "3"))
+    grounded_proximity_limit: int = int(os.getenv("ORCHESTRATOR_GROUNDED_PROXIMITY_LIMIT", "3"))
+    grounded_evidence_limit: int = int(os.getenv("ORCHESTRATOR_GROUNDED_EVIDENCE_LIMIT", "2"))
     langfuse_enabled: bool = _env_bool("LANGFUSE_ENABLED", "false")
     langfuse_flush_at_request_end: bool = _env_bool("LANGFUSE_FLUSH_AT_REQUEST_END", "false")
 

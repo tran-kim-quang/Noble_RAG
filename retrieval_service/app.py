@@ -324,6 +324,7 @@ def create_app(service=None) -> FastAPI:
                     )
                     obs.update(
                         output={
+                            "project_grounded_mode": svc.settings.project_grounded_mode,
                             "project_cards": len(response.project_cards),
                             "trait_tags": len(response.trait_tags),
                             "proximity_facts": len(response.proximity_facts),
@@ -334,9 +335,10 @@ def create_app(service=None) -> FastAPI:
                     )
                     log.info(
                         (
-                            "project-grounded retrieve query_len=%s top_k=%s project_cards=%s "
+                            "project-grounded retrieve mode=%s query_len=%s top_k=%s project_cards=%s "
                             "trait_tags=%s proximity_facts=%s evidence_chunks=%s confidence=%.4f low_confidence=%s"
                         ),
+                        svc.settings.project_grounded_mode,
                         len(payload.query),
                         payload.top_k or getattr(getattr(svc, "settings", object()), "default_top_k", 5),
                         len(response.project_cards),

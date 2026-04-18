@@ -97,7 +97,10 @@ _FASTPATH_CONSULT_RESPONSE_MODES = {
     "value_teaser",
     "discover_need",
     "consultive_recommendation",
+    "followup_confirm",
 }
+_SYNTHESIS_REPLY_MAX_WORDS = 180
+_DECIDER_CONSULT_REPLY_MAX_WORDS = 140
 
 
 @dataclass(frozen=True)
@@ -1036,7 +1039,7 @@ def _user_context_has_budget_signal(message: str, recent_history: list[HistoryTu
     return False
 
 
-def _build_grounded_snapshot(grounded_result: dict[str, Any] | None) -> dict[str, Any]:
+def _build_grounded_snapshot(grounded_result: dict[str, Any] | None, settings: Settings) -> dict[str, Any]:
     if not grounded_result:
         return {}
     project_cards_raw = grounded_result.get("project_cards", []) or []
@@ -1044,7 +1047,7 @@ def _build_grounded_snapshot(grounded_result: dict[str, Any] | None) -> dict[str
     proximity_facts_raw = grounded_result.get("proximity_facts", []) or []
     evidence_chunks_raw = grounded_result.get("evidence_chunks", []) or []
     snapshot_cards: list[dict[str, Any]] = []
-    for card in project_cards_raw[:2]:
+    for card in project_cards_raw[: settings.grounded_card_limit]:
         snapshot_cards.append(
             {
                 "project_id": card.get("project_id"),
@@ -1056,7 +1059,7 @@ def _build_grounded_snapshot(grounded_result: dict[str, Any] | None) -> dict[str
         )
     snapshot_traits = [
         {"tag": item.get("tag"), "reason": item.get("reason"), "weight": item.get("weight")}
-        for item in trait_tags_raw[:5]
+        for item in trait_tags_raw[: settings.grounded_trait_limit]
     ]
     snapshot_proximity = [
         {
@@ -1065,11 +1068,11 @@ def _build_grounded_snapshot(grounded_result: dict[str, Any] | None) -> dict[str
             "poi_name": item.get("poi_name"),
             "proximity_text": item.get("proximity_text"),
         }
-        for item in proximity_facts_raw[:5]
+        for item in proximity_facts_raw[: settings.grounded_proximity_limit]
     ]
     snapshot_evidence = [
         {"text": item.get("text"), "source": item.get("source"), "topic": item.get("topic")}
-        for item in evidence_chunks_raw[:4]
+        for item in evidence_chunks_raw[: settings.grounded_evidence_limit]
     ]
     return {
         "single_project_mode": _is_single_project_mode(
@@ -1102,13 +1105,23 @@ def _build_reply_synthesis_prompt(
     focus: str,
     question_focus: str,
     grounded_result: dict[str, Any] | None,
+    settings: Settings,
 ) -> str:
-    history = [{"role": turn.role, "message": turn.message} for turn in recent_history[-6:]]
+    history = [
+        {"role": turn.role, "message": turn.message}
+        for turn in recent_history[-settings.synthesis_history_turns :]
+    ]
     state_payload = {
         "need_summary": lead_state.need.summary,
-        "need_topics": [{"label": t.label, "weight": t.weight} for t in lead_state.need.topics[:6]],
+        "need_topics": [
+            {"label": t.label, "weight": t.weight}
+            for t in lead_state.need.topics[: settings.synthesis_state_topic_limit]
+        ],
         "painpoint_summary": lead_state.painpoint.summary,
-        "painpoint_topics": [{"label": t.label, "weight": t.weight} for t in lead_state.painpoint.topics[:6]],
+        "painpoint_topics": [
+            {"label": t.label, "weight": t.weight}
+            for t in lead_state.painpoint.topics[: settings.synthesis_state_topic_limit]
+        ],
         "name": lead_state.name,
         "phone_contact": lead_state.phone_contact,
         "sales_state": lead_state.sales_state,
@@ -1119,7 +1132,7 @@ def _build_reply_synthesis_prompt(
         "next_best_action": lead_state.next_best_action,
         "contact_capture_status": lead_state.contact_capture_status,
     }
-    grounded_snapshot = _build_grounded_snapshot(grounded_result=grounded_result)
+    grounded_snapshot = _build_grounded_snapshot(grounded_result=grounded_result, settings=settings)
     return (
         "Bạn là chuyên viên tư vấn bất động sản.\n"
         "Nhiệm vụ duy nhất: trò chuyện tư vấn và giới thiệu dự án cho khách hàng bằng ngôn ngữ đời thường.\n"
@@ -1129,8 +1142,8 @@ def _build_reply_synthesis_prompt(
         "Quy tắc bắt buộc:\n"
         "- Dùng tiếng Việt có dấu, rõ ràng, tự nhiên, không máy móc.\n"
         "- Không dùng cụm từ kỹ thuật như route/retrieval/metadata/payload/confidence/vector/schema.\n"
-        "- Phản hồi 2-4 câu ngắn, ưu tiên dưới 90 từ.\n"
-        "- Luôn nêu ít nhất 1 nhận định cụ thể bám dữ liệu đã có.\n"
+        "- Độ dài linh hoạt theo nhu cầu câu hỏi: mặc định ngắn gọn (thường 1-3 câu), chỉ dài hơn khi user cần chi tiết.\n"
+        "- Nếu có dữ liệu phù hợp thì nêu nhận định cụ thể; nếu chưa đủ dữ liệu thì nói rõ còn thiếu gì.\n"
         "- Không tự suy diễn ngân sách cá nhân cụ thể (ví dụ 'với 5 tỷ...') nếu người dùng chưa nêu ngân sách.\n"
         "- Khi nhắc con số tài chính, chỉ dùng số đã có trong grounded_context hoặc user_message/recent_history.\n"
         "- Nếu người dùng cần phân tích quá sâu (tài chính chi tiết, pháp lý sâu, phương án căn cụ thể), đề xuất 1 buổi hẹn trực tiếp.\n"
@@ -1368,7 +1381,41 @@ def _prepare_fastpath_consult_reply(
         single_project_mode=True,
         question_focus=reply_plan.question_focus,
     )
-    return _compact_text(reply, max_words=120)
+    return _compact_text(reply, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
+
+
+def _build_grounded_template_reply(
+    grounded_result: dict[str, Any] | None,
+    reply_plan: ReplyPlan,
+) -> str:
+    if not grounded_result:
+        return ""
+    cards = grounded_result.get("project_cards", []) or []
+    if not cards:
+        return ""
+
+    if _normalize_response_mode(reply_plan.response_mode) not in {
+        "grounded_recommendation",
+        "value_teaser",
+        "soft_next_step",
+    }:
+        return ""
+    if _normalize_ask_policy(reply_plan.ask_policy) != "avoid_question":
+        return ""
+
+    first = cards[0]
+    project_name = _friendly_project_name(str(first.get("project_id", "Noble Palace Tây Thăng Long")))
+    strengths = [str(item).strip() for item in (first.get("strengths") or []) if str(item).strip()]
+    summary = str(first.get("summary", "")).strip()
+
+    if strengths:
+        reply = f"{project_name} đang là phương án phù hợp để mình tư vấn trước, nổi bật ở {', '.join(strengths[:2])}."
+    elif summary:
+        reply = summary
+    else:
+        reply = f"{project_name} đang là phương án phù hợp để mình tư vấn trước."
+
+    return _compact_text(reply, max_words=70)
 
 
 def _build_reply_fallback(
@@ -1433,6 +1480,7 @@ def synthesize_assistant_reply(
         focus=reply_plan.focus,
         question_focus=reply_plan.question_focus,
         grounded_result=grounded_result,
+        settings=settings,
     )
     single_project_mode = False
     if grounded_result:
@@ -1474,7 +1522,7 @@ def synthesize_assistant_reply(
                 question_focus=reply_plan.question_focus,
             )
         if reply:
-            return _compact_text(reply, max_words=120)
+            return _compact_text(reply, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="ignore")[:240]
         log.warning("reply synthesis HTTP %s: %s", exc.code, detail)
@@ -1487,7 +1535,12 @@ def synthesize_assistant_reply(
     return _build_reply_fallback(message=message, analysis=analysis, grounded_result=grounded_result)
 
 
-def _build_decider_prompt(message: str, lead_state: LeadState, recent_history: list[HistoryTurn]) -> str:
+def _build_decider_prompt(
+    message: str,
+    lead_state: LeadState,
+    recent_history: list[HistoryTurn],
+    settings: Settings,
+) -> str:
     compact_state = {
         "name": lead_state.name,
         "phone_contact": lead_state.phone_contact,
@@ -1508,7 +1561,10 @@ def _build_decider_prompt(message: str, lead_state: LeadState, recent_history: l
         "last_conversation_goal": lead_state.last_conversation_goal,
         "next_best_action": lead_state.next_best_action,
     }
-    compact_history = [{"role": turn.role, "message": turn.message} for turn in recent_history[-6:]]
+    compact_history = [
+        {"role": turn.role, "message": turn.message}
+        for turn in recent_history[-settings.decider_history_turns :]
+    ]
     return (
         "Ban la bo phan decider route cho tro ly tu van bat dong san.\n"
         "Nhiem vu duy nhat cua agent: tro chuyen tu van va gioi thieu du an cho khach hang.\n"
@@ -1547,7 +1603,7 @@ def _build_decider_prompt(message: str, lead_state: LeadState, recent_history: l
         "- Tranh noi dung mo ho phu thuoc vao grounded_context hoac buoc reply_synthesis phia sau.\n"
         "- Bat buoc co it nhat 1 nhan dinh huu ich truoc.\n"
         "- Chi dat cau hoi khi thieu 1 thong tin quan trong; khong mac dinh ket thuc bang cau hoi.\n"
-        "- Toi da 3-4 cau ngan; neu hoi thi toi da 1 cau hoi.\n"
+        "- Do dai consult_reply linh hoat theo message; uu tien ngan gon, khong ep so cau co dinh; neu hoi thi toi da 1 cau hoi.\n"
         "- Khong dat cau hoi dang thu thap form nhu 'ban o quan nao', 'ban muon khu vuc nao'.\n"
         "- Khong hoi lai thong tin user vua noi.\n"
         "- Neu can phan tich sau hon, uu tien de xuat buoi hen gap truc tiep thay vi co gang phan tich qua sau trong chat.\n"
@@ -1597,7 +1653,12 @@ def _analyze_turn_with_model(
 ) -> TurnAnalysis:
     response_payload = _call_model_generate(
         settings=settings,
-        prompt=_build_decider_prompt(message=message, lead_state=lead_state, recent_history=recent_history),
+        prompt=_build_decider_prompt(
+            message=message,
+            lead_state=lead_state,
+            recent_history=recent_history,
+            settings=settings,
+        ),
         temperature=settings.decider_temperature,
         response_format="json",
     )
@@ -1631,7 +1692,10 @@ def _analyze_turn_with_model(
     extracted_name = _coerce_extracted_name(result_obj.get("extracted_name"))
     extracted_phone = _coerce_extracted_phone(result_obj.get("extracted_phone"))
 
-    consult_reply = _compact_text(str(result_obj.get("consult_reply", "")).strip(), max_words=95)
+    consult_reply = _compact_text(
+        str(result_obj.get("consult_reply", "")).strip(),
+        max_words=_DECIDER_CONSULT_REPLY_MAX_WORDS,
+    )
     return TurnAnalysis(
         route=start_route,
         decision_reason=routing_reason,
@@ -1700,12 +1764,93 @@ def _analyze_turn_fallback(message: str, lead_state: LeadState, recent_history: 
     )
 
 
+def _build_contact_capture_fastpath_analysis(
+    message: str,
+    lead_state: LeadState,
+    recent_history: list[HistoryTurn],
+) -> TurnAnalysis | None:
+    _ = recent_history
+    extracted_name = _extract_name(message)
+    extracted_phone = _extract_phone_contact(message)
+    if not extracted_name and not extracted_phone:
+        return None
+
+    if lead_state.contact_capture_status not in {"requested", "partial"} and lead_state.sales_state not in {
+        "interested",
+        "appointment_ready",
+    }:
+        return None
+
+    merged_name = extracted_name or lead_state.name
+    merged_phone = extracted_phone or lead_state.phone_contact
+    has_complete_contact = bool(merged_name and merged_phone)
+
+    consult_reply_parts: list[str] = []
+    if extracted_name:
+        consult_reply_parts.append(f"Em cảm ơn anh/chị {extracted_name}.")
+    elif extracted_phone:
+        consult_reply_parts.append("Em đã ghi nhận thông tin liên hệ của anh/chị.")
+    if extracted_phone:
+        consult_reply_parts.append(f"Em đã lưu số {extracted_phone}.")
+    consult_reply_parts.append(
+        "Em sẽ dùng thông tin này để sắp xếp tư vấn sâu hơn và chốt khung thời gian phù hợp."
+        if has_complete_contact
+        else "Em đã ghi nhận trước thông tin này để tiếp tục hỗ trợ anh/chị ở bước kế tiếp."
+    )
+
+    evidence = [message.strip()] if message.strip() else []
+    if has_complete_contact:
+        summary_delta = "Khach da cung cap du thong tin lien he de di tiep sang buoc tu van hoac hen lich."
+        topics = [TopicWeight(label="da_cung_cap_du_thong_tin_lien_he", weight=0.95)]
+        engagement_state_after_hint = "ready"
+        sales_state_after_hint = "appointment_ready"
+        conversation_goal_hint = "confirm_followup"
+    else:
+        summary_delta = "Khach da bat dau cung cap thong tin lien he de tiep tuc tu van."
+        topics = [TopicWeight(label="da_cung_cap_mot_phan_thong_tin_lien_he", weight=0.88)]
+        engagement_state_after_hint = "interested"
+        sales_state_after_hint = "interested"
+        conversation_goal_hint = "capture_contact"
+
+    return TurnAnalysis(
+        route="consult_discovery",
+        decision_reason="deterministic_contact_capture_fastpath",
+        need_update=NeedPainpointDelta(
+            summary_delta=summary_delta,
+            topics=topics,
+            evidence=evidence,
+        ),
+        painpoint_update=NeedPainpointDelta(summary_delta="", topics=[], evidence=evidence),
+        routing_signal=RoutingSignal(
+            should_route_project=False,
+            project_query_hint=None,
+            reason="deterministic_contact_capture_fastpath",
+        ),
+        consult_reply=" ".join(consult_reply_parts),
+        query_type="clarification",
+        retrieval_readiness="not_ready",
+        route_source="deterministic_fastpath",
+        engagement_state_after_hint=engagement_state_after_hint,
+        sales_state_after_hint=sales_state_after_hint,
+        conversation_goal_hint=conversation_goal_hint,
+        extracted_name=merged_name,
+        extracted_phone=merged_phone,
+    )
+
+
 def analyze_turn(
     message: str,
     lead_state: LeadState,
     recent_history: list[HistoryTurn],
     settings: Settings,
 ) -> TurnAnalysis:
+    fastpath = _build_contact_capture_fastpath_analysis(
+        message=message,
+        lead_state=lead_state,
+        recent_history=recent_history,
+    )
+    if fastpath is not None:
+        return fastpath
     if not settings.decider_enabled:
         return _analyze_turn_fallback(message=message, lead_state=lead_state, recent_history=recent_history)
     try:
@@ -1877,6 +2022,7 @@ def create_app(
                                 "start_route": analysis.route,
                                 "query_type": analysis.query_type,
                                 "retrieval_readiness": analysis.retrieval_readiness,
+                                "analysis_source": analysis.route_source,
                                 "should_route_project": bool(analysis.routing_signal.should_route_project),
                                 "route_source": analysis.route_source,
                                 "extracted_name_from_decider": bool(analysis.extracted_name),
@@ -2166,6 +2312,15 @@ def create_app(
                             reply_source = "consult_reply_fastpath"
                         else:
                             fastpath_gate_reason = "consult_reply_empty_after_prepare"
+
+                    if not assistant_reply and final_route == "project_grounded":
+                        assistant_reply = _build_grounded_template_reply(
+                            grounded_result=grounded_result,
+                            reply_plan=reply_plan,
+                        )
+                        if assistant_reply:
+                            reply_source = "grounded_template_fastpath"
+                            fastpath_gate_reason = "grounded_template_fastpath"
 
                     if not assistant_reply:
                         with start_observation(
