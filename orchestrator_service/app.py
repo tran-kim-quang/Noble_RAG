@@ -32,6 +32,7 @@ from orchestrator_service.schemas import (
 )
 
 log = logging.getLogger("sales-orchestrator")
+_MODEL_HTTP_USER_AGENT = "Noble-RAG-Orchestrator/1.0"
 
 _QUERY_TYPES = {"advisory_strategy", "project_matching", "project_specific", "clarification"}
 _READINESS_VALUES = {"not_ready", "soft_ready", "ready"}
@@ -1196,24 +1197,34 @@ def _build_reply_synthesis_prompt(
 
 
 def _call_model_generate(
-    settings: Settings,
+    *,
+    api_format: str,
+    api_url: str,
+    api_key: str,
+    api_key_header: str,
+    model: str,
+    timeout_sec: float,
+    keep_alive: str,
     prompt: str,
     temperature: float,
     response_format: str | None = "json",
 ) -> Any:
-    api_format = str(settings.decider_api_format or "ollama").strip().lower()
-    model_name = str(settings.decider_model or "").strip().lower()
-    headers: dict[str, str] = {"Content-Type": "application/json"}
-    if settings.decider_api_key:
-        header_name = settings.decider_api_key_header or "Authorization"
+    api_format = str(api_format or "ollama").strip().lower()
+    model_name = str(model or "").strip().lower()
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "User-Agent": _MODEL_HTTP_USER_AGENT,
+    }
+    if api_key:
+        header_name = api_key_header or "Authorization"
         if header_name.lower() == "authorization":
-            headers[header_name] = f"Bearer {settings.decider_api_key}"
+            headers[header_name] = f"Bearer {api_key}"
         else:
-            headers[header_name] = settings.decider_api_key
+            headers[header_name] = api_key
 
     if api_format == "openai":
         payload: dict[str, Any] = {
-            "model": settings.decider_model,
+            "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
         }
@@ -1226,23 +1237,23 @@ def _call_model_generate(
             payload["response_format"] = {"type": "json_object"}
     else:
         payload = {
-            "model": settings.decider_model,
+            "model": model,
             "prompt": prompt,
             "stream": False,
             "options": {"temperature": temperature},
         }
         if response_format:
             payload["format"] = response_format
-        if settings.decider_keep_alive:
-            payload["keep_alive"] = settings.decider_keep_alive
+        if keep_alive:
+            payload["keep_alive"] = keep_alive
 
     req = urllib.request.Request(
-        settings.decider_api_url,
+        api_url,
         data=json.dumps(payload).encode("utf-8"),
         headers=headers,
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=settings.decider_timeout_sec) as resp:
+    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
         raw = resp.read().decode("utf-8")
     parsed = json.loads(raw)
     if not isinstance(parsed, dict):
@@ -1348,107 +1359,25 @@ def _sanitize_reply_for_policy(
     return cleaned
 
 
-def _evaluate_consult_reply_fastpath(
-    final_route: str,
-    chained_from_consult: bool,
-    grounded_result: dict[str, Any] | None,
-    reply_plan: ReplyPlan,
-) -> tuple[bool, str]:
-    if final_route != "consult_discovery":
-        return False, "final_route_not_consult_discovery"
-    if chained_from_consult:
-        return False, "chained_from_consult"
-    if grounded_result is not None:
-        return False, "grounded_result_present"
-    if _normalize_ask_policy(reply_plan.ask_policy) == "must_clarify":
-        return False, "ask_policy_must_clarify"
-    response_mode = _normalize_response_mode(reply_plan.response_mode)
-    if response_mode not in _FASTPATH_CONSULT_RESPONSE_MODES:
-        return False, f"response_mode_not_safe:{response_mode}"
-    return True, "eligible"
+def _extract_assistant_reply(response_payload: Any) -> str:
+    if isinstance(response_payload, dict):
+        return str(response_payload.get("assistant_reply", "")).strip()
+    parsed_obj = _extract_json_object(str(response_payload))
+    return str(parsed_obj.get("assistant_reply", "")).strip()
 
 
-def _prepare_fastpath_consult_reply(
-    analysis: TurnAnalysis,
-    reply_plan: ReplyPlan,
+def _build_reply_repair_prompt(
+    original_prompt: str,
+    invalid_reply: str,
+    invalid_reason: str,
 ) -> str:
-    reply = (analysis.consult_reply or "").strip()
-    if not reply:
-        return ""
-    reply = _sanitize_reply_for_policy(
-        reply=reply,
-        ask_policy=reply_plan.ask_policy,
-        single_project_mode=True,
-        question_focus=reply_plan.question_focus,
-    )
-    return _compact_text(reply, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
-
-
-def _build_grounded_template_reply(
-    grounded_result: dict[str, Any] | None,
-    reply_plan: ReplyPlan,
-) -> str:
-    if not grounded_result:
-        return ""
-    cards = grounded_result.get("project_cards", []) or []
-    if not cards:
-        return ""
-
-    if _normalize_response_mode(reply_plan.response_mode) not in {
-        "grounded_recommendation",
-        "value_teaser",
-        "soft_next_step",
-    }:
-        return ""
-    if _normalize_ask_policy(reply_plan.ask_policy) != "avoid_question":
-        return ""
-
-    first = cards[0]
-    project_name = _friendly_project_name(str(first.get("project_id", "Noble Palace Tây Thăng Long")))
-    strengths = [str(item).strip() for item in (first.get("strengths") or []) if str(item).strip()]
-    summary = str(first.get("summary", "")).strip()
-
-    if strengths:
-        reply = f"{project_name} đang là phương án phù hợp để mình tư vấn trước, nổi bật ở {', '.join(strengths[:2])}."
-    elif summary:
-        reply = summary
-    else:
-        reply = f"{project_name} đang là phương án phù hợp để mình tư vấn trước."
-
-    return _compact_text(reply, max_words=70)
-
-
-def _build_reply_fallback(
-    message: str,
-    analysis: TurnAnalysis,
-    grounded_result: dict[str, Any] | None,
-) -> str:
-    if grounded_result:
-        cards = grounded_result.get("project_cards", []) or []
-        if cards:
-            first = cards[0]
-            project_name = _friendly_project_name(str(first.get("project_id", "Noble Palace Tây Thăng Long")))
-            summary = _compact_text(str(first.get("summary", "")).strip(), max_words=24)
-            if summary:
-                return (
-                    f"Với thông tin bạn vừa chia sẻ, {project_name} đang là phương án phù hợp để mình tư vấn trước cho bạn. "
-                    f"{summary} Nếu bạn muốn đi sâu theo phương án căn cụ thể, mình đề xuất một buổi hẹn trực tiếp để trao đổi đầy đủ hơn."
-                )
-            return (
-                f"Với nhu cầu bạn vừa nêu, {project_name} là dự án mình có thể tư vấn phù hợp nhất lúc này. "
-                "Nếu bạn muốn phân tích sâu hơn theo phương án cụ thể, mình đề xuất một buổi hẹn trực tiếp."
-            )
-    if analysis.consult_reply.strip():
-        return analysis.consult_reply.strip()
-    focus = _compact_text(message, max_words=18)
-    if focus:
-        return (
-            f"Mình đã ghi nhận nhu cầu chính của bạn là: {focus}. "
-            "Mình sẽ tư vấn ngắn gọn theo dự án hiện có, và nếu cần phân tích sâu hơn mình đề xuất một buổi hẹn trực tiếp."
-        )
     return (
-        "Mình sẽ tư vấn ngắn gọn theo thông tin dự án hiện có. "
-        "Nếu bạn muốn phân tích sâu theo phương án cụ thể, mình đề xuất một buổi hẹn trực tiếp."
+        "Ban vua tao assistant_reply chua dat yeu cau cho tro ly tu van bat dong san.\n"
+        "Hay viet lai va CHI tra ve 1 JSON object hop le theo schema {\"assistant_reply\":\"...\"}.\n"
+        "Khong duoc giai thich them, khong duoc them markdown, khong duoc bo trong assistant_reply.\n"
+        f"invalid_reason={json.dumps(invalid_reason, ensure_ascii=False)}\n"
+        f"invalid_reply={json.dumps(invalid_reply, ensure_ascii=False)}\n"
+        f"original_prompt={json.dumps(original_prompt, ensure_ascii=False)}\n"
     )
 
 
@@ -1464,7 +1393,7 @@ def synthesize_assistant_reply(
     settings: Settings,
 ) -> str:
     user_has_budget_context = _user_context_has_budget_signal(message=message, recent_history=recent_history)
-    prompt = _build_reply_synthesis_prompt(
+    primary_prompt = _build_reply_synthesis_prompt(
         message=message,
         lead_state=lead_state,
         recent_history=recent_history,
@@ -1488,51 +1417,63 @@ def synthesize_assistant_reply(
             project_cards=grounded_result.get("project_cards", []) or [],
             proximity_facts=grounded_result.get("proximity_facts", []) or [],
         )
-    try:
-        response_payload = _call_model_generate(
-            settings=settings,
-            prompt=prompt,
-            temperature=max(0.0, min(1.0, settings.decider_temperature + 0.18)),
-            response_format="json",
-        )
-        if isinstance(response_payload, dict):
-            reply = str(response_payload.get("assistant_reply", "")).strip()
-        else:
-            parsed_obj = _extract_json_object(str(response_payload))
-            reply = str(parsed_obj.get("assistant_reply", "")).strip()
-        reply = _sanitize_reply_for_policy(
-            reply=reply,
-            ask_policy=reply_plan.ask_policy,
-            single_project_mode=single_project_mode,
-            question_focus=reply_plan.question_focus,
-        )
-        if _has_personal_budget_phrase(reply) and not user_has_budget_context:
-            log.info("reply synthesis dropped unsupported personal budget phrase")
-            reply = ""
-        if _reply_needs_retry(
-            reply=reply,
-            single_project_mode=single_project_mode,
-            ask_policy=reply_plan.ask_policy,
-        ):
-            fallback_reply = _build_reply_fallback(message=message, analysis=analysis, grounded_result=grounded_result)
+    attempt_prompt = primary_prompt
+    last_failure_reason = "reply_synthesis_not_attempted"
+    for attempt_index in range(2):
+        try:
+            response_payload = _call_model_generate(
+                api_format=settings.synthesis_api_format,
+                api_url=settings.synthesis_api_url,
+                api_key=settings.synthesis_api_key,
+                api_key_header=settings.synthesis_api_key_header,
+                model=settings.synthesis_model,
+                timeout_sec=settings.synthesis_timeout_sec,
+                keep_alive=settings.synthesis_keep_alive,
+                prompt=attempt_prompt,
+                temperature=max(0.0, min(1.0, settings.synthesis_temperature)),
+                response_format="json",
+            )
             reply = _sanitize_reply_for_policy(
-                reply=fallback_reply,
+                reply=_extract_assistant_reply(response_payload),
                 ask_policy=reply_plan.ask_policy,
                 single_project_mode=single_project_mode,
                 question_focus=reply_plan.question_focus,
             )
-        if reply:
-            return _compact_text(reply, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")[:240]
-        log.warning("reply synthesis HTTP %s: %s", exc.code, detail)
-    except urllib.error.URLError as exc:
-        log.warning("reply synthesis unreachable: %s", exc.reason)
-    except socket.timeout:
-        log.warning("reply synthesis timeout after %ss", settings.decider_timeout_sec)
-    except Exception as exc:
-        log.warning("reply synthesis failed: %s", exc)
-    return _build_reply_fallback(message=message, analysis=analysis, grounded_result=grounded_result)
+            if _has_personal_budget_phrase(reply) and not user_has_budget_context:
+                log.info("reply synthesis rejected unsupported personal budget phrase")
+                last_failure_reason = "unsupported_personal_budget_phrase"
+            elif _reply_needs_retry(
+                reply=reply,
+                single_project_mode=single_project_mode,
+                ask_policy=reply_plan.ask_policy,
+            ):
+                last_failure_reason = "reply_failed_policy_or_quality_gate"
+            elif reply:
+                return _compact_text(reply, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
+            else:
+                last_failure_reason = "empty_reply_after_sanitize"
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")[:240]
+            log.warning("reply synthesis HTTP %s: %s", exc.code, detail)
+            raise RuntimeError(f"reply synthesis HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            log.warning("reply synthesis unreachable: %s", exc.reason)
+            raise RuntimeError(f"reply synthesis unreachable: {exc.reason}") from exc
+        except socket.timeout as exc:
+            log.warning("reply synthesis timeout after %ss", settings.synthesis_timeout_sec)
+            raise RuntimeError(f"reply synthesis timeout after {settings.synthesis_timeout_sec}s") from exc
+        except Exception as exc:
+            log.warning("reply synthesis failed: %s", exc)
+            raise RuntimeError(f"reply synthesis failed: {exc}") from exc
+
+        if attempt_index == 0:
+            attempt_prompt = _build_reply_repair_prompt(
+                original_prompt=primary_prompt,
+                invalid_reply=reply,
+                invalid_reason=last_failure_reason,
+            )
+
+    raise RuntimeError(f"reply synthesis returned unusable output after retries: {last_failure_reason}")
 
 
 def _build_decider_prompt(
@@ -1652,7 +1593,13 @@ def _analyze_turn_with_model(
     settings: Settings,
 ) -> TurnAnalysis:
     response_payload = _call_model_generate(
-        settings=settings,
+        api_format=settings.decider_api_format,
+        api_url=settings.decider_api_url,
+        api_key=settings.decider_api_key,
+        api_key_header=settings.decider_api_key_header,
+        model=settings.decider_model,
+        timeout_sec=settings.decider_timeout_sec,
+        keep_alive=settings.decider_keep_alive,
         prompt=_build_decider_prompt(
             message=message,
             lead_state=lead_state,
@@ -2293,48 +2240,21 @@ def create_app(
 
                     used_fastpath_consult_reply = False
                     reply_source = "reply_synthesis"
-                    fastpath_gate_reason = "not_evaluated"
-                    assistant_reply = ""
+                    fastpath_gate_reason = "forced_model_synthesis"
 
-                    can_fastpath_consult_reply, fastpath_gate_reason = _evaluate_consult_reply_fastpath(
-                        final_route=final_route,
-                        chained_from_consult=chained_from_consult,
-                        grounded_result=grounded_result,
-                        reply_plan=reply_plan,
-                    )
-                    if can_fastpath_consult_reply:
-                        assistant_reply = _prepare_fastpath_consult_reply(
-                            analysis=analysis,
-                            reply_plan=reply_plan,
-                        )
-                        if assistant_reply:
-                            used_fastpath_consult_reply = True
-                            reply_source = "consult_reply_fastpath"
-                        else:
-                            fastpath_gate_reason = "consult_reply_empty_after_prepare"
-
-                    if not assistant_reply and final_route == "project_grounded":
-                        assistant_reply = _build_grounded_template_reply(
-                            grounded_result=grounded_result,
-                            reply_plan=reply_plan,
-                        )
-                        if assistant_reply:
-                            reply_source = "grounded_template_fastpath"
-                            fastpath_gate_reason = "grounded_template_fastpath"
-
-                    if not assistant_reply:
-                        with start_observation(
-                            langfuse_enabled,
-                            name="orchestrator.reply_synthesis",
-                            as_type="generation",
-                            model=settings.decider_model,
-                            input={
-                                "final_route": final_route,
-                                "response_mode": reply_plan.response_mode,
-                                "ask_policy": reply_plan.ask_policy,
-                                "fastpath_gate_reason": fastpath_gate_reason,
-                            },
-                        ) as reply_obs:
+                    with start_observation(
+                        langfuse_enabled,
+                        name="orchestrator.reply_synthesis",
+                        as_type="generation",
+                        model=settings.synthesis_model,
+                        input={
+                            "final_route": final_route,
+                            "response_mode": reply_plan.response_mode,
+                            "ask_policy": reply_plan.ask_policy,
+                            "fastpath_gate_reason": fastpath_gate_reason,
+                        },
+                    ) as reply_obs:
+                        try:
                             assistant_reply = synthesize_assistant_reply(
                                 message=message,
                                 recent_history=payload.recent_history,
@@ -2346,14 +2266,24 @@ def create_app(
                                 grounded_result=grounded_result,
                                 settings=settings,
                             )
-                            reply_obs.update(
-                                output={
-                                    "assistant_reply_chars": len(assistant_reply),
-                                    "assistant_reply_preview": assistant_reply[:240],
-                                    "used_model_rewrite": False,
-                                    "used_model_accent_normalize": False,
-                                }
+                        except Exception as exc:
+                            reply_obs.update(output={"error": str(exc)[:240]})
+                            log.exception(
+                                "reply synthesis error final_route=%s response_mode=%s ask_policy=%s reason=%s",
+                                final_route,
+                                reply_plan.response_mode,
+                                reply_plan.ask_policy,
+                                reason,
                             )
+                            raise HTTPException(status_code=502, detail=f"reply synthesis error: {exc}") from exc
+                        reply_obs.update(
+                            output={
+                                "assistant_reply_chars": len(assistant_reply),
+                                "assistant_reply_preview": assistant_reply[:240],
+                                "used_model_rewrite": False,
+                                "used_model_accent_normalize": False,
+                            }
+                        )
 
                     if final_route == "project_grounded" and grounded_result is not None:
                         response = QueryResponse(
