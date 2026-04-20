@@ -276,6 +276,120 @@ def _coerce_extracted_phone(raw: Any) -> str | None:
     return _extract_phone_contact(cleaned)
 
 
+def _is_trivial_ack_message(message: str) -> bool:
+    lowered = re.sub(r"\s+", " ", str(message or "").strip().lower())
+    if not lowered:
+        return True
+    normalized = re.sub(r"[!,.?]", "", lowered).strip()
+    trivial_tokens = {
+        "ok",
+        "oke",
+        "okay",
+        "vay ha",
+        "vậy hả",
+        "cam on",
+        "cảm ơn",
+        "thanks",
+        "thank you",
+        "vang",
+        "vâng",
+        "da",
+        "dạ",
+        "roi",
+        "rồi",
+        "uh",
+        "uhm",
+        "um",
+    }
+    return normalized in trivial_tokens
+
+
+def _derive_retrieval_readiness(
+    query_type: str,
+    start_route: str,
+    should_route_project: bool,
+) -> str:
+    qtype = _normalize_query_type(query_type)
+    route = _normalize_route(start_route)
+    if not should_route_project:
+        return "not_ready"
+    if qtype == "project_specific":
+        return "ready"
+    if qtype == "project_matching":
+        return "ready" if route == "project_grounded" else "soft_ready"
+    if qtype == "clarification":
+        return "soft_ready"
+    return "not_ready"
+
+
+def _build_lightweight_need_update(message: str, query_type: str) -> NeedPainpointDelta:
+    cleaned = _compact_text(message, max_words=18)
+    evidence = [message.strip()] if str(message or "").strip() else []
+    qtype = _normalize_query_type(query_type)
+    if not cleaned or _is_trivial_ack_message(cleaned):
+        return NeedPainpointDelta(summary_delta="", topics=[], evidence=[])
+    topic_label_map = {
+        "advisory_strategy": "tu_van_chien_luoc",
+        "project_matching": "tim_du_an_phu_hop",
+        "project_specific": "lam_ro_du_an_cu_the",
+        "clarification": "lam_ro_nhu_cau",
+    }
+    topic_weight_map = {
+        "advisory_strategy": 0.68,
+        "project_matching": 0.74,
+        "project_specific": 0.78,
+        "clarification": 0.58,
+    }
+    return NeedPainpointDelta(
+        summary_delta=cleaned,
+        topics=[
+            TopicWeight(
+                label=topic_label_map.get(qtype, "lam_ro_nhu_cau"),
+                weight=topic_weight_map.get(qtype, 0.58),
+            )
+        ],
+        evidence=evidence,
+    )
+
+
+def _build_lightweight_painpoint_update(message: str) -> NeedPainpointDelta:
+    lowered = str(message or "").strip().lower()
+    evidence = [message.strip()] if str(message or "").strip() else []
+    if not lowered or _is_trivial_ack_message(lowered):
+        return NeedPainpointDelta(summary_delta="", topics=[], evidence=[])
+    pain_signals = (
+        "lo",
+        "so",
+        "sợ",
+        "ban khoan",
+        "băn khoăn",
+        "phap ly",
+        "pháp lý",
+        "ngan sach",
+        "ngân sách",
+        "gia",
+        "giá",
+        "rui ro",
+        "rủi ro",
+        "thanh khoan",
+        "thanh khoản",
+        "tien do",
+        "tiến độ",
+        "xa",
+        "ket xe",
+        "kẹt xe",
+        "on ao",
+        "ồn ào",
+    )
+    if not any(token in lowered for token in pain_signals):
+        return NeedPainpointDelta(summary_delta="", topics=[], evidence=[])
+    return NeedPainpointDelta(
+        summary_delta=_compact_text(message, max_words=18),
+        topics=[TopicWeight(label="painpoint_signal", weight=0.66)],
+        evidence=evidence,
+    )
+
+
 def _merge_summaries(old_summary: str, summary_delta: str) -> str:
     parts = _dedupe_keep_order([old_summary, summary_delta], max_items=3)
     return " ".join(parts).strip()
@@ -626,73 +740,31 @@ def _is_basic_consult_greeting(message: str) -> bool:
     lowered = (message or "").strip().lower()
     if not lowered:
         return False
-    has_greeting = any(token in lowered for token in ("xin chao", "chao", "hello", "hi"))
-    has_consult_intent = any(
-        token in lowered for token in ("tu van", "tư vấn", "bat dong san", "bất động sản", "nha dat", "nhà đất")
+    greeting_patterns = (
+        r"^\s*(xin\s+)?ch(?:ao|ào)(?:\s+(anh|chị|chi|em|bạn|ban))?(?:\s+(ạ|a|nhe|nhé|nha|nhá|ơi|oi))*\s*[!,.?]*\s*$",
+        r"^\s*hello(?:\s+(anh|chị|chi|em|bạn|ban))?(?:\s+(ạ|a|nhe|nhé|nha|nhá|ơi|oi))*\s*[!,.?]*\s*$",
+        r"^\s*hi(?:\s+(anh|chị|chi|em|bạn|ban))?(?:\s+(ạ|a|nhe|nhé|nha|nhá|ơi|oi))*\s*[!,.?]*\s*$",
+        r"^\s*alo+\s*[!,.?]*\s*$",
     )
-    # Keep this fastpath narrow to avoid behavioral regressions on complex turns.
-    short_turn = len(lowered) <= 120
-    return has_greeting and has_consult_intent and short_turn
-
-
-def _is_long_term_living_intent(message: str) -> bool:
-    lowered = (message or "").strip().lower()
-    if not lowered:
-        return False
-    intent_tokens = (
-        "song lau dai",
-        "sinh song lau dai",
-        "o lau dai",
-        "ở lâu dài",
-        "an cu",
-        "an cư",
-        "o thuc",
-        "ở thực",
-    )
-    # Keep deterministic path narrow to simple first-turn consult queries.
-    return len(lowered) <= 140 and any(token in lowered for token in intent_tokens)
-
-
-def _is_simple_quick_intent(message: str) -> bool:
-    lowered = (message or "").strip().lower()
-    if not lowered:
-        return False
-    if _is_basic_consult_greeting(lowered):
-        return True
-    if _is_long_term_living_intent(lowered):
-        return True
-    thanks_tokens = ("cam on", "cảm ơn", "ok", "oke", "duoc", "được", "roi", "rồi")
-    return len(lowered) <= 80 and any(token in lowered for token in thanks_tokens)
+    # Keep fastpath reserved for pure greeting turns so substantive requests fall back to LLM synthesis.
+    short_turn = len(lowered) <= 40
+    return short_turn and any(re.match(pattern, lowered) for pattern in greeting_patterns)
 
 
 def _build_quick_intent_response(message: str, ask_policy: str) -> str | None:
     lowered = (message or "").strip().lower()
-    if not _is_simple_quick_intent(lowered):
+    if not _is_basic_consult_greeting(lowered):
         return None
     normalized_ask_policy = _normalize_ask_policy(ask_policy)
-    if _is_basic_consult_greeting(lowered):
-        if normalized_ask_policy == "avoid_question":
-            return (
-                "Chào anh/chị, em sẵn sàng tư vấn bất động sản theo nhu cầu thực tế của mình. "
-                "Hiện em có thể hỗ trợ nhanh về dự án Noble Palace Tây Thăng Long và đề xuất hướng phù hợp cho anh/chị."
-            )
+    if normalized_ask_policy == "avoid_question":
         return (
             "Chào anh/chị, em sẵn sàng tư vấn bất động sản theo nhu cầu thực tế của mình. "
-            "Anh/chị đang ưu tiên nhu cầu ở thực hay đầu tư để em tư vấn sát hơn?"
+            "Hiện em có thể hỗ trợ nhanh về dự án Noble Palace Tây Thăng Long và đề xuất hướng phù hợp cho anh/chị."
         )
-    if _is_long_term_living_intent(lowered):
-        if normalized_ask_policy == "avoid_question":
-            return (
-                "Với mục tiêu ở lâu dài, anh/chị nên ưu tiên pháp lý minh bạch, hạ tầng hoàn chỉnh và tiện ích dùng hằng ngày "
-                "như trường học, y tế, giao thông. Em có thể tư vấn nhanh theo các tiêu chí này cho Noble Palace Tây Thăng Long."
-            )
-        return (
-            "Với mục tiêu ở lâu dài, anh/chị nên ưu tiên pháp lý minh bạch, hạ tầng hoàn chỉnh và tiện ích dùng hằng ngày. "
-            "Anh/chị đang ưu tiên gần trường học hay thuận tiện đi làm để em gợi ý sát hơn?"
-        )
-    if normalized_ask_policy == "avoid_question":
-        return "Em đã ghi nhận, mình cứ tiếp tục theo hướng này và em sẽ tư vấn ngắn gọn, rõ ý để anh/chị theo dõi nhanh."
-    return "Em đã ghi nhận. Anh/chị muốn em đi tiếp theo hướng phân tích nhanh hay chi tiết hơn?"
+    return (
+        "Chào anh/chị, em sẵn sàng tư vấn bất động sản theo nhu cầu thực tế của mình. "
+        "Anh/chị đang ưu tiên nhu cầu ở thực hay đầu tư để em tư vấn sát hơn?"
+    )
 
 
 def _promote_engagement_state(current: str, candidate: str) -> str:
@@ -1772,22 +1844,10 @@ def _build_decider_prompt(
     settings: Settings,
 ) -> str:
     compact_state = {
-        "name": lead_state.name,
-        "phone_contact": lead_state.phone_contact,
-        "need": {
-            "summary": lead_state.need.summary,
-            "topics": [{"label": t.label, "weight": t.weight} for t in lead_state.need.topics[:6]],
-            "evidence": lead_state.need.evidence[:5],
-        },
-        "painpoint": {
-            "summary": lead_state.painpoint.summary,
-            "topics": [{"label": t.label, "weight": t.weight} for t in lead_state.painpoint.topics[:6]],
-            "evidence": lead_state.painpoint.evidence[:5],
-        },
+        "need_summary": lead_state.need.summary,
+        "painpoint_summary": lead_state.painpoint.summary,
         "sales_state": lead_state.sales_state,
         "engagement_state": lead_state.engagement_state,
-        "engagement_confidence": lead_state.engagement_confidence,
-        "lead_level": lead_state.lead_level,
         "last_conversation_goal": lead_state.last_conversation_goal,
         "next_best_action": lead_state.next_best_action,
     }
@@ -1797,77 +1857,25 @@ def _build_decider_prompt(
     ]
     return (
         "Ban la bo phan decider route cho tro ly tu van bat dong san.\n"
-        "Nhiem vu duy nhat cua agent: tro chuyen tu van va gioi thieu du an cho khach hang.\n"
-        "Ngoai route, ban phai de xuat sales_state_after va conversation_goal cho luot hien tai.\n"
-        "Khi nguoi dung can phan tich qua chi tiet (tai chinh, phap ly, phuong an can cu the), huong dan de xuat buoi hen gap truc tiep.\n"
+        "Nhiem vu duy nhat: phan loai query va quyet dinh co can route sang retrieval du an hay khong.\n"
+        "Khong tra loi tu van. Khong cap nhat CRM state. Khong viet consult_reply.\n"
         "Data scope hien tai: collection dang co 1 du an chinh la Noble Palace Tay Thang Long.\n"
-        "Vi vay, consult_reply khong duoc dat cau hoi kieu form nhu 'quan nao/khu vuc nao' de bat user dien thong tin.\n"
-        "Hay uu tien phan tich va goi y tren du lieu hien co truoc, sau do moi hoi 1 cau mo de mo rong trao doi.\n"
-        "Ban phai route theo query_type, khong route theo kieu thieu slot.\n"
         "4 query_type bat buoc: advisory_strategy, project_matching, project_specific, clarification.\n"
-        "retrieval_readiness: not_ready | soft_ready | ready.\n"
         "Quy tac route bat buoc:\n"
-        "- advisory_strategy -> start_route=consult_discovery.\n"
-        "- project_specific -> start_route=project_grounded, should_route_project=true.\n"
-        "- project_matching -> uu tien project_grounded. Neu ban chon start_route=consult_discovery thi van phai should_route_project=true de runtime chain cung request.\n"
-        "- clarification -> dua vao history/state; neu thuc chat la tiep noi cho project query thi can should_route_project=true.\n"
-        "- KHONG duoc de should_route_project=false chi vi thieu budget/khu vuc/timeline.\n"
-        "- KHONG duoc route theo hard keyword rules; phai suy luan tu message + state + recent_history.\n\n"
-        "Few-shot huong dan:\n"
-        "1) 'Mua de dau tu thi nen chon nhu the nao?' => query_type=advisory_strategy, start_route=consult_discovery, should_route_project=false.\n"
-        "2) 'Co can ho nao gan benh vien khong?' => query_type=project_matching, start_route=project_grounded hoac consult_discovery, should_route_project=true.\n"
-        "3) 'Du an A phap ly sao?' => query_type=project_specific, start_route=project_grounded, should_route_project=true.\n"
-        "4) 'U minh thien ve an toan hon' => query_type=clarification, route theo history.\n\n"
-        "Kiem tra tinh nhat quan truoc khi tra ve:\n"
+        "- advisory_strategy: hoi cach chon, chien luoc, so sanh tong quan -> start_route=consult_discovery, should_route_project=false.\n"
+        "- project_matching: tim du an/can phu hop theo tieu chi -> should_route_project=true.\n"
+        "- project_specific: hoi thong tin cu the ve du an, can, phap ly, gia, tien ich, gan POI -> start_route=project_grounded, should_route_project=true.\n"
+        "- clarification: tiep noi ngan theo history/state; neu dang lam ro cho project query thi should_route_project=true.\n"
+        "- Khong duoc de should_route_project=false chi vi thieu budget, khu vuc, timeline.\n"
         "- Neu query_type in {project_matching, project_specific} thi should_route_project bat buoc true.\n"
         "- Neu start_route=project_grounded thi should_route_project bat buoc true.\n"
-        "- decision_reason phai ngan, ro, va giai thich duoc tai sao chon route.\n\n"
-        "Quy tac consult_reply:\n"
-        "- Giong consultant, khong giong form checklist.\n"
-        "- Dung tieng Viet tu nhien, uu tien co dau, khong dung cum ky thuat.\n"
-        "- consult_reply phai du dung nhu cau tra loi cuoi cho consult turn don gian.\n"
-        "- Voi advisory_strategy hoac clarification nhe, consult_reply can usable ngay khong can rewrite.\n"
-        "- Khong tu suy dien ngan sach ca nhan cu the (vi du 'voi 5 ty...') neu user chua neu ngan sach.\n"
-        "- Voi consultive_recommendation, consult_reply phai usable ngay nhu cau tra loi cuoi cho consult-only turn.\n"
-        "- Neu khong can grounding du an hoac khong can xin contact/hen gap, consult_reply phai du de tra thang cho user.\n"
-        "- Tranh noi dung mo ho phu thuoc vao grounded_context hoac buoc reply_synthesis phia sau.\n"
-        "- Bat buoc co it nhat 1 nhan dinh huu ich truoc.\n"
-        "- Chi dat cau hoi khi thieu 1 thong tin quan trong; khong mac dinh ket thuc bang cau hoi.\n"
-        "- Do dai consult_reply linh hoat theo message; uu tien ngan gon, khong ep so cau co dinh; neu hoi thi toi da 1 cau hoi.\n"
-        "- Khong dat cau hoi dang thu thap form nhu 'ban o quan nao', 'ban muon khu vuc nao'.\n"
-        "- Khong hoi lai thong tin user vua noi.\n"
-        "- Neu can phan tich sau hon, uu tien de xuat buoi hen gap truc tiep thay vi co gang phan tich qua sau trong chat.\n"
-        "- Neu query la project_matching, consult_reply chi la cau bridge ngan de chain sang project route, khong dong request o consult.\n"
-        "- Khong lap lai brochure intro qua nhieu luot lien tiep.\n\n"
-        "Quy tac trich xuat thong tin lien he:\n"
-        "- extracted_name: ten khach hang neu message/history vua neu ro rang; neu khong chac chan thi null.\n"
-        "- extracted_phone: so dien thoai neu user neu ro rang; neu khong chac chan thi null.\n"
-        "- Khong duoc suy dien ten/so dien thoai neu user chua noi.\n\n"
+        "- project_query_hint chi can khi should_route_project=true; viet thanh 1 truy van ngan gon, giu lai tieu chi quan trong. Neu khong can thi null.\n\n"
         "Bat buoc tra ve 1 JSON object theo schema:\n"
         "{\n"
         '  "query_type": "advisory_strategy|project_matching|project_specific|clarification",\n'
-        '  "retrieval_readiness": "not_ready|soft_ready|ready",\n'
         '  "start_route": "consult_discovery|project_grounded",\n'
-        '  "route": "consult_discovery|project_grounded",\n'
-        '  "engagement_state_after": "cold|warm|interested|ready",\n'
-        '  "sales_state_after": "unknown|exploring|need_identified|qualified|interested|appointment_ready|nurture|handoff",\n'
-        '  "conversation_goal": "build_trust|discover_need|surface_priority|show_fit|handle_concern|invite_next_step|nurture_lead|handoff_to_human|capture_contact|confirm_followup",\n'
-        '  "decision_reason": "string",\n'
         '  "should_route_project": true|false,\n'
-        '  "project_query_hint": "string|null",\n'
-        '  "need_update": {\n'
-        '    "summary_delta": "string",\n'
-        '    "topics": [{"label":"string","weight":0.0}],\n'
-        '    "evidence": ["string"]\n'
-        "  },\n"
-        '  "painpoint_update": {\n'
-        '    "summary_delta": "string",\n'
-        '    "topics": [{"label":"string","weight":0.0}],\n'
-        '    "evidence": ["string"]\n'
-        "  },\n"
-        '  "consult_reply": "string",\n'
-        '  "extracted_name": "string|null",\n'
-        '  "extracted_phone": "string|null"\n'
+        '  "project_query_hint": "string|null"\n'
         "}\n\n"
         f"message={json.dumps(message, ensure_ascii=False)}\n"
         f"lead_state={json.dumps(compact_state, ensure_ascii=False)}\n"
@@ -1897,6 +1905,7 @@ def _analyze_turn_with_model(
         ),
         temperature=settings.decider_temperature,
         response_format="json",
+        max_tokens=settings.decider_output_max_tokens,
     )
     if isinstance(response_payload, dict):
         result_obj = response_payload
@@ -1904,34 +1913,51 @@ def _analyze_turn_with_model(
         result_obj = _extract_json_object(str(response_payload))
 
     query_type = _normalize_query_type(result_obj.get("query_type"))
-    retrieval_readiness = _normalize_retrieval_readiness(result_obj.get("retrieval_readiness"))
     start_route = _normalize_route(result_obj.get("start_route", result_obj.get("route", "consult_discovery")))
-
-    need_update = _coerce_delta(result_obj.get("need_update"), message)
-    painpoint_update = _coerce_delta(result_obj.get("painpoint_update"), message)
     should_route_default = start_route == "project_grounded"
     should_route_project = bool(result_obj.get("should_route_project", should_route_default))
     if start_route == "project_grounded":
         should_route_project = True
+    retrieval_readiness = _derive_retrieval_readiness(
+        query_type=query_type,
+        start_route=start_route,
+        should_route_project=should_route_project,
+    )
 
     project_query_hint_raw = str(result_obj.get("project_query_hint", "")).strip()
     if project_query_hint_raw.lower() in {"none", "null", "n/a"}:
         project_query_hint_raw = ""
     project_query_hint = project_query_hint_raw or (message.strip() if should_route_project else None)
-    routing_reason = str(result_obj.get("decision_reason", "")).strip() or "llm_decider"
-    engagement_state_hint = _normalize_engagement_state(
-        result_obj.get("engagement_state_after"),
-        fallback=lead_state.engagement_state,
+    routing_reason = str(result_obj.get("decision_reason", "")).strip() or f"llm_decider_minimal:{query_type}:{start_route}"
+    need_update = (
+        _coerce_delta(result_obj.get("need_update"), message)
+        if "need_update" in result_obj
+        else _build_lightweight_need_update(message=message, query_type=query_type)
     )
-    sales_state_hint = _normalize_sales_state(result_obj.get("sales_state_after"), fallback=lead_state.sales_state)
-    conversation_goal_hint = _normalize_conversation_goal(result_obj.get("conversation_goal"), fallback="build_trust")
+    painpoint_update = (
+        _coerce_delta(result_obj.get("painpoint_update"), message)
+        if "painpoint_update" in result_obj
+        else _build_lightweight_painpoint_update(message=message)
+    )
+    engagement_state_hint = (
+        _normalize_engagement_state(result_obj.get("engagement_state_after"), fallback=lead_state.engagement_state)
+        if "engagement_state_after" in result_obj
+        else None
+    )
+    sales_state_hint = (
+        _normalize_sales_state(result_obj.get("sales_state_after"), fallback=lead_state.sales_state)
+        if "sales_state_after" in result_obj
+        else None
+    )
+    conversation_goal_hint = (
+        _normalize_conversation_goal(result_obj.get("conversation_goal"), fallback="build_trust")
+        if "conversation_goal" in result_obj
+        else None
+    )
     extracted_name = _coerce_extracted_name(result_obj.get("extracted_name"))
     extracted_phone = _coerce_extracted_phone(result_obj.get("extracted_phone"))
 
-    consult_reply = _compact_text(
-        str(result_obj.get("consult_reply", "")).strip(),
-        max_words=_DECIDER_CONSULT_REPLY_MAX_WORDS,
-    )
+    consult_reply = ""
     return TurnAnalysis(
         route=start_route,
         decision_reason=routing_reason,
@@ -2090,57 +2116,17 @@ def _build_basic_consult_greeting_fastpath_analysis(
     )
     return TurnAnalysis(
         route="consult_discovery",
-        decision_reason="deterministic_greeting_consult_fastpath",
+        decision_reason="deterministic_greeting_fastpath",
         need_update=NeedPainpointDelta(
-            summary_delta="Khach mo dau nhu cau tu van bat dong san o muc tong quan.",
-            topics=[TopicWeight(label="tu_van_tong_quan", weight=0.82)],
+            summary_delta="Khach mo dau bang loi chao, chua neu nhu cau cu the.",
+            topics=[TopicWeight(label="loi_chao_mo_dau", weight=0.72)],
             evidence=evidence,
         ),
         painpoint_update=NeedPainpointDelta(summary_delta="", topics=[], evidence=evidence),
         routing_signal=RoutingSignal(
             should_route_project=False,
             project_query_hint=None,
-            reason="deterministic_greeting_consult_fastpath",
-        ),
-        consult_reply=consult_reply,
-        query_type="clarification",
-        retrieval_readiness="not_ready",
-        route_source="deterministic_fastpath",
-        engagement_state_after_hint=_promote_engagement_state(lead_state.engagement_state, "warm"),
-        sales_state_after_hint="exploring",
-        conversation_goal_hint="discover_need",
-        extracted_name=lead_state.name,
-        extracted_phone=lead_state.phone_contact,
-    )
-
-
-def _build_long_term_living_fastpath_analysis(
-    message: str,
-    lead_state: LeadState,
-    recent_history: list[HistoryTurn],
-) -> TurnAnalysis | None:
-    _ = recent_history
-    if not _is_long_term_living_intent(message):
-        return None
-
-    evidence = [message.strip()] if message.strip() else []
-    consult_reply = (
-        "Với nhu cầu ở lâu dài, anh/chị nên ưu tiên pháp lý minh bạch, quy hoạch ổn định, tiện ích sống hằng ngày và kết nối giao thông. "
-        "Noble Palace Tây Thăng Long phù hợp để bắt đầu so sánh theo các tiêu chí này trước khi đi sâu vào từng căn cụ thể."
-    )
-    return TurnAnalysis(
-        route="consult_discovery",
-        decision_reason="deterministic_long_term_living_fastpath",
-        need_update=NeedPainpointDelta(
-            summary_delta="Khach the hien nhu cau an cu, uu tien sinh song lau dai.",
-            topics=[TopicWeight(label="an_cu_lau_dai", weight=0.86)],
-            evidence=evidence,
-        ),
-        painpoint_update=NeedPainpointDelta(summary_delta="", topics=[], evidence=evidence),
-        routing_signal=RoutingSignal(
-            should_route_project=False,
-            project_query_hint=None,
-            reason="deterministic_long_term_living_fastpath",
+            reason="deterministic_greeting_fastpath",
         ),
         consult_reply=consult_reply,
         query_type="clarification",
@@ -2174,13 +2160,6 @@ def analyze_turn(
     )
     if greeting_fastpath is not None:
         return greeting_fastpath
-    long_term_living_fastpath = _build_long_term_living_fastpath_analysis(
-        message=message,
-        lead_state=lead_state,
-        recent_history=recent_history,
-    )
-    if long_term_living_fastpath is not None:
-        return long_term_living_fastpath
     if not settings.decider_enabled:
         return _analyze_turn_fallback(message=message, lead_state=lead_state, recent_history=recent_history)
     try:

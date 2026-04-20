@@ -101,6 +101,7 @@ class Settings:
     decider_timeout_sec: float = float(os.getenv("ORCHESTRATOR_DECIDER_TIMEOUT_SEC", "35"))
     decider_temperature: float = float(os.getenv("ORCHESTRATOR_DECIDER_TEMPERATURE", "0.2"))
     decider_keep_alive: str = os.getenv("ORCHESTRATOR_DECIDER_KEEP_ALIVE", "30m").strip()
+    decider_output_max_tokens: int = int(os.getenv("ORCHESTRATOR_DECIDER_OUTPUT_MAX_TOKENS", "140"))
     synthesis_api_format: str = _synthesis_api_format()
     synthesis_api_url: str = _synthesis_api_url()
     synthesis_api_key: str = _synthesis_api_key()
@@ -133,7 +134,7 @@ class Settings:
     # Streaming enables progressive response return (faster perceived latency)
     synthesis_enable_streaming: bool = _env_bool("ORCHESTRATOR_SYNTHESIS_ENABLE_STREAMING", "false")
 
-    # Fast response lane for simple intents (greeting/basic consult) to keep latency low.
+    # Fast response lane for greeting only to keep latency low.
     quick_intent_fast_response_enabled: bool = _env_bool("ORCHESTRATOR_QUICK_INTENT_FAST_RESPONSE_ENABLED", "true")
     quick_intent_response_max_words: int = int(os.getenv("ORCHESTRATOR_QUICK_INTENT_RESPONSE_MAX_WORDS", "48"))
     
