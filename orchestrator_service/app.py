@@ -6,6 +6,8 @@ import json
 import logging
 import re
 import socket
+import threading
+import time
 from typing import Any, Callable
 import urllib.error
 import urllib.request
@@ -18,6 +20,12 @@ from orchestrator_service.config import get_settings
 from orchestrator_service.observability import flush_observability
 from orchestrator_service.observability import propagate_context
 from orchestrator_service.observability import start_observation
+from orchestrator_service.prompt_optimization import (
+    init_optimization,
+    get_synthesis_cache,
+    get_timing_instrument,
+    PromptCompressor,
+)
 from orchestrator_service.retrieval_client import RetrievalClient
 from orchestrator_service.schemas import (
     DecisionTrace,
@@ -200,6 +208,63 @@ def _coerce_extracted_name(raw: Any) -> str | None:
     if not re.search(r"[a-zA-ZÀ-ỹ]", cleaned):
         return None
     return cleaned[:64]
+
+
+def _warmup_decider_model(settings: Settings) -> None:
+    if not settings.decider_enabled or not settings.model_warmup_decider_enabled:
+        return
+    _call_model_generate(
+        api_format=settings.decider_api_format,
+        api_url=settings.decider_api_url,
+        api_key=settings.decider_api_key,
+        api_key_header=settings.decider_api_key_header,
+        model=settings.decider_model,
+        timeout_sec=max(5.0, settings.decider_timeout_sec),
+        keep_alive=settings.decider_keep_alive,
+        prompt="Warmup ping. Reply briefly with OK.",
+        temperature=0.0,
+        response_format=None,
+    )
+
+
+def _warmup_synthesis_model(settings: Settings) -> None:
+    if not settings.model_warmup_synthesis_enabled:
+        return
+    _call_model_generate(
+        api_format=settings.synthesis_api_format,
+        api_url=settings.synthesis_api_url,
+        api_key=settings.synthesis_api_key,
+        api_key_header=settings.synthesis_api_key_header,
+        model=settings.synthesis_model,
+        timeout_sec=max(5.0, settings.synthesis_timeout_sec),
+        keep_alive=settings.synthesis_keep_alive,
+        prompt="Warmup ping. Reply briefly with OK.",
+        temperature=0.0,
+        response_format=None,
+        max_tokens=16,
+        enable_stream=False,
+    )
+
+
+def _run_model_warmup_loop(settings: Settings, stop_event: threading.Event) -> None:
+    interval_sec = max(10.0, float(settings.model_warmup_interval_sec))
+    log.info(
+        "Periodic model warmup started interval_sec=%s decider=%s synthesis=%s",
+        interval_sec,
+        bool(settings.model_warmup_decider_enabled and settings.decider_enabled),
+        bool(settings.model_warmup_synthesis_enabled),
+    )
+    while not stop_event.is_set():
+        t0 = time.time()
+        try:
+            _warmup_decider_model(settings)
+            _warmup_synthesis_model(settings)
+            elapsed_ms = (time.time() - t0) * 1000.0
+            log.info("Periodic model warmup completed elapsed_ms=%.1f", elapsed_ms)
+        except Exception as exc:
+            log.warning("Periodic model warmup failed: %s", exc)
+        if stop_event.wait(interval_sec):
+            break
 
 
 def _coerce_extracted_phone(raw: Any) -> str | None:
@@ -555,6 +620,79 @@ def _message_requests_followup(message: str) -> bool:
         "trao đổi thêm",
     ]
     return any(token in lowered for token in signals)
+
+
+def _is_basic_consult_greeting(message: str) -> bool:
+    lowered = (message or "").strip().lower()
+    if not lowered:
+        return False
+    has_greeting = any(token in lowered for token in ("xin chao", "chao", "hello", "hi"))
+    has_consult_intent = any(
+        token in lowered for token in ("tu van", "tư vấn", "bat dong san", "bất động sản", "nha dat", "nhà đất")
+    )
+    # Keep this fastpath narrow to avoid behavioral regressions on complex turns.
+    short_turn = len(lowered) <= 120
+    return has_greeting and has_consult_intent and short_turn
+
+
+def _is_long_term_living_intent(message: str) -> bool:
+    lowered = (message or "").strip().lower()
+    if not lowered:
+        return False
+    intent_tokens = (
+        "song lau dai",
+        "sinh song lau dai",
+        "o lau dai",
+        "ở lâu dài",
+        "an cu",
+        "an cư",
+        "o thuc",
+        "ở thực",
+    )
+    # Keep deterministic path narrow to simple first-turn consult queries.
+    return len(lowered) <= 140 and any(token in lowered for token in intent_tokens)
+
+
+def _is_simple_quick_intent(message: str) -> bool:
+    lowered = (message or "").strip().lower()
+    if not lowered:
+        return False
+    if _is_basic_consult_greeting(lowered):
+        return True
+    if _is_long_term_living_intent(lowered):
+        return True
+    thanks_tokens = ("cam on", "cảm ơn", "ok", "oke", "duoc", "được", "roi", "rồi")
+    return len(lowered) <= 80 and any(token in lowered for token in thanks_tokens)
+
+
+def _build_quick_intent_response(message: str, ask_policy: str) -> str | None:
+    lowered = (message or "").strip().lower()
+    if not _is_simple_quick_intent(lowered):
+        return None
+    normalized_ask_policy = _normalize_ask_policy(ask_policy)
+    if _is_basic_consult_greeting(lowered):
+        if normalized_ask_policy == "avoid_question":
+            return (
+                "Chào anh/chị, em sẵn sàng tư vấn bất động sản theo nhu cầu thực tế của mình. "
+                "Hiện em có thể hỗ trợ nhanh về dự án Noble Palace Tây Thăng Long và đề xuất hướng phù hợp cho anh/chị."
+            )
+        return (
+            "Chào anh/chị, em sẵn sàng tư vấn bất động sản theo nhu cầu thực tế của mình. "
+            "Anh/chị đang ưu tiên nhu cầu ở thực hay đầu tư để em tư vấn sát hơn?"
+        )
+    if _is_long_term_living_intent(lowered):
+        if normalized_ask_policy == "avoid_question":
+            return (
+                "Với mục tiêu ở lâu dài, anh/chị nên ưu tiên pháp lý minh bạch, hạ tầng hoàn chỉnh và tiện ích dùng hằng ngày "
+                "như trường học, y tế, giao thông. Em có thể tư vấn nhanh theo các tiêu chí này cho Noble Palace Tây Thăng Long."
+            )
+        return (
+            "Với mục tiêu ở lâu dài, anh/chị nên ưu tiên pháp lý minh bạch, hạ tầng hoàn chỉnh và tiện ích dùng hằng ngày. "
+            "Anh/chị đang ưu tiên gần trường học hay thuận tiện đi làm để em gợi ý sát hơn?"
+        )
+    if normalized_ask_policy == "avoid_question":
+        return "Em đã ghi nhận, mình cứ tiếp tục theo hướng này và em sẽ tư vấn ngắn gọn, rõ ý để anh/chị theo dõi nhanh."
+    return "Em đã ghi nhận. Anh/chị muốn em đi tiếp theo hướng phân tích nhanh hay chi tiết hơn?"
 
 
 def _promote_engagement_state(current: str, candidate: str) -> str:
@@ -1134,6 +1272,28 @@ def _build_reply_synthesis_prompt(
         "contact_capture_status": lead_state.contact_capture_status,
     }
     grounded_snapshot = _build_grounded_snapshot(grounded_result=grounded_result, settings=settings)
+    
+    # Apply compression based on settings
+    is_aggressive = settings.synthesis_compression_mode == "aggressive"
+    is_moderate = settings.synthesis_compression_mode == "moderate"
+    
+    if is_moderate or is_aggressive:
+        # Use optimized history depth and apply compression
+        history_turns_limit = settings.synthesis_optimized_history_turns if is_moderate else 1
+        history = [
+            {"role": turn.role, "message": turn.message}
+            for turn in recent_history[-history_turns_limit:]
+        ]
+        # Compress state payload
+        state_payload = PromptCompressor.compress_state_payload(state_payload, aggressive=is_aggressive)
+        # Compress grounded context
+        grounded_snapshot = PromptCompressor.compress_grounded_context(grounded_snapshot, aggressive=is_aggressive)
+    
+    output_constraint = (
+        f"Giữ câu trả lời TÓM TẮT, dưới {settings.synthesis_output_max_tokens // 4} từ "
+        f"(khoảng {settings.synthesis_output_max_tokens // 5}-{settings.synthesis_output_max_tokens // 4} từ).\n"
+    )
+    
     return (
         "Bạn là chuyên viên tư vấn bất động sản.\n"
         "Nhiệm vụ duy nhất: trò chuyện tư vấn và giới thiệu dự án cho khách hàng bằng ngôn ngữ đời thường.\n"
@@ -1141,6 +1301,7 @@ def _build_reply_synthesis_prompt(
         "Hãy trả về DUY NHẤT 1 JSON object theo schema:\n"
         '{ "assistant_reply": "string" }\n'
         "Quy tắc bắt buộc:\n"
+        f"- {output_constraint}"
         "- Dùng tiếng Việt có dấu, rõ ràng, tự nhiên, không máy móc.\n"
         "- Không dùng cụm từ kỹ thuật như route/retrieval/metadata/payload/confidence/vector/schema.\n"
         "- Độ dài linh hoạt theo nhu cầu câu hỏi: mặc định ngắn gọn (thường 1-3 câu), chỉ dài hơn khi user cần chi tiết.\n"
@@ -1208,6 +1369,8 @@ def _call_model_generate(
     prompt: str,
     temperature: float,
     response_format: str | None = "json",
+    max_tokens: int | None = None,
+    enable_stream: bool = False,
 ) -> Any:
     api_format = str(api_format or "ollama").strip().lower()
     model_name = str(model or "").strip().lower()
@@ -1226,11 +1389,14 @@ def _call_model_generate(
         payload: dict[str, Any] = {
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
-            "stream": False,
+            "stream": bool(enable_stream),
         }
         # Kimi k2.5 supports thinking/non-thinking modes; disable thinking for faster routing/synthesis turns.
         if model_name.startswith("kimi-k2.5"):
             payload["thinking"] = {"type": "disabled"}
+            # Add max_tokens constraint to optimize synthesis latency (Kimi responds faster with token limit)
+            if max_tokens:
+                payload["max_tokens"] = max_tokens
         else:
             payload["temperature"] = temperature
         if response_format == "json":
@@ -1239,11 +1405,14 @@ def _call_model_generate(
         payload = {
             "model": model,
             "prompt": prompt,
-            "stream": False,
+            "stream": bool(enable_stream),
             "options": {"temperature": temperature},
         }
         if response_format:
             payload["format"] = response_format
+            # Some reasoning-capable Ollama models return only `thinking` with empty
+            # `response` for JSON tasks unless reasoning is explicitly disabled.
+            payload["think"] = False
         if keep_alive:
             payload["keep_alive"] = keep_alive
 
@@ -1253,6 +1422,60 @@ def _call_model_generate(
         headers=headers,
         method="POST",
     )
+    if enable_stream:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            if api_format == "openai":
+                parts: list[str] = []
+                while True:
+                    line_bytes = resp.readline()
+                    if not line_bytes:
+                        break
+                    line = line_bytes.decode("utf-8", errors="ignore").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data or data == "[DONE]":
+                        continue
+                    try:
+                        event = json.loads(data)
+                    except Exception:
+                        continue
+                    choices = event.get("choices", [])
+                    if not isinstance(choices, list) or not choices:
+                        continue
+                    first = choices[0] if isinstance(choices[0], dict) else {}
+                    delta = first.get("delta") if isinstance(first, dict) else {}
+                    if not isinstance(delta, dict):
+                        continue
+                    content = delta.get("content")
+                    if isinstance(content, str) and content:
+                        parts.append(content)
+                    elif isinstance(content, list):
+                        for item in content:
+                            if isinstance(item, dict):
+                                text = item.get("text")
+                                if isinstance(text, str) and text:
+                                    parts.append(text)
+                return "".join(parts)
+
+            # Ollama streaming: newline-delimited JSON objects with `response` chunks.
+            parts = []
+            while True:
+                line_bytes = resp.readline()
+                if not line_bytes:
+                    break
+                line = line_bytes.decode("utf-8", errors="ignore").strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+                chunk = event.get("response")
+                if isinstance(chunk, str) and chunk:
+                    parts.append(chunk)
+            return "".join(parts)
+
     with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
         raw = resp.read().decode("utf-8")
     parsed = json.loads(raw)
@@ -1276,7 +1499,13 @@ def _call_model_generate(
                         parts.append(text)
             return "".join(parts)
         return ""
-    return parsed.get("response", "")
+    response_text = parsed.get("response", "")
+    if isinstance(response_text, str) and response_text.strip():
+        return response_text
+    thinking_text = parsed.get("thinking", "")
+    if isinstance(thinking_text, str):
+        return thinking_text
+    return ""
 
 
 def _normalize_reply_to_accented_vietnamese(reply: str, settings: Settings) -> str:
@@ -1366,6 +1595,30 @@ def _extract_assistant_reply(response_payload: Any) -> str:
     return str(parsed_obj.get("assistant_reply", "")).strip()
 
 
+def _build_synthesis_cache_key(
+    *,
+    message: str,
+    final_route: str,
+    analysis: TurnAnalysis,
+    reply_plan: ReplyPlan,
+    grounded_result: dict[str, Any] | None,
+) -> str:
+    used_projects = []
+    if grounded_result:
+        used_projects = list(grounded_result.get("used_projects", []) or [])[:2]
+    payload = {
+        "message": re.sub(r"\s+", " ", (message or "").strip().lower()),
+        "final_route": _normalize_route(final_route),
+        "query_type": _normalize_query_type(analysis.query_type),
+        "response_mode": _normalize_response_mode(reply_plan.response_mode),
+        "ask_policy": _normalize_ask_policy(reply_plan.ask_policy),
+        "conversation_goal": _normalize_conversation_goal(reply_plan.conversation_goal),
+        "next_best_action": _normalize_next_best_action(reply_plan.next_best_action),
+        "projects": used_projects,
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
 def _build_reply_repair_prompt(
     original_prompt: str,
     invalid_reply: str,
@@ -1417,10 +1670,32 @@ def synthesize_assistant_reply(
             project_cards=grounded_result.get("project_cards", []) or [],
             proximity_facts=grounded_result.get("proximity_facts", []) or [],
         )
+    
+    # Try to retrieve from cache (before retry loop)
+    synthesis_cache = get_synthesis_cache()
+    timing_inst = get_timing_instrument()
+    cached_response = None
+    cache_key = _build_synthesis_cache_key(
+        message=message,
+        final_route=final_route,
+        analysis=analysis,
+        reply_plan=reply_plan,
+        grounded_result=grounded_result,
+    )
+    if synthesis_cache:
+        cached_response = synthesis_cache.get(cache_key)
+        if cached_response:
+            log.info("synthesis cache hit (stable-key)")
+            return _compact_text(cached_response, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
+    
     attempt_prompt = primary_prompt
     last_failure_reason = "reply_synthesis_not_attempted"
     for attempt_index in range(2):
         try:
+            # Record synthesis timing
+            if timing_inst:
+                timing_inst.start("synthesis_call")
+            
             response_payload = _call_model_generate(
                 api_format=settings.synthesis_api_format,
                 api_url=settings.synthesis_api_url,
@@ -1432,7 +1707,14 @@ def synthesize_assistant_reply(
                 prompt=attempt_prompt,
                 temperature=max(0.0, min(1.0, settings.synthesis_temperature)),
                 response_format="json",
+                max_tokens=settings.synthesis_output_max_tokens,
+                enable_stream=settings.synthesis_enable_streaming,
             )
+            
+            if timing_inst:
+                elapsed_ms = timing_inst.end("synthesis_call")
+                log.debug(f"synthesis stage latency: {elapsed_ms:.1f}ms")
+            
             reply = _sanitize_reply_for_policy(
                 reply=_extract_assistant_reply(response_payload),
                 ask_policy=reply_plan.ask_policy,
@@ -1449,6 +1731,13 @@ def synthesize_assistant_reply(
             ):
                 last_failure_reason = "reply_failed_policy_or_quality_gate"
             elif reply:
+                # Cache the successful response
+                if synthesis_cache and attempt_index == 0:
+                    synthesis_cache.set(
+                        cache_key,
+                        reply,
+                        metadata={"route": final_route, "query_type": analysis.query_type}
+                    )
                 return _compact_text(reply, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
             else:
                 last_failure_reason = "empty_reply_after_sanitize"
@@ -1785,6 +2074,86 @@ def _build_contact_capture_fastpath_analysis(
     )
 
 
+def _build_basic_consult_greeting_fastpath_analysis(
+    message: str,
+    lead_state: LeadState,
+    recent_history: list[HistoryTurn],
+) -> TurnAnalysis | None:
+    _ = recent_history
+    if not _is_basic_consult_greeting(message):
+        return None
+
+    evidence = [message.strip()] if message.strip() else []
+    consult_reply = (
+        "Chào anh/chị, em sẵn sàng tư vấn bất động sản cho mình. "
+        "Hiện bên em tập trung dự án Noble Palace Tây Thăng Long và em có thể tư vấn theo nhu cầu ở thực hoặc đầu tư của anh/chị."
+    )
+    return TurnAnalysis(
+        route="consult_discovery",
+        decision_reason="deterministic_greeting_consult_fastpath",
+        need_update=NeedPainpointDelta(
+            summary_delta="Khach mo dau nhu cau tu van bat dong san o muc tong quan.",
+            topics=[TopicWeight(label="tu_van_tong_quan", weight=0.82)],
+            evidence=evidence,
+        ),
+        painpoint_update=NeedPainpointDelta(summary_delta="", topics=[], evidence=evidence),
+        routing_signal=RoutingSignal(
+            should_route_project=False,
+            project_query_hint=None,
+            reason="deterministic_greeting_consult_fastpath",
+        ),
+        consult_reply=consult_reply,
+        query_type="clarification",
+        retrieval_readiness="not_ready",
+        route_source="deterministic_fastpath",
+        engagement_state_after_hint=_promote_engagement_state(lead_state.engagement_state, "warm"),
+        sales_state_after_hint="exploring",
+        conversation_goal_hint="discover_need",
+        extracted_name=lead_state.name,
+        extracted_phone=lead_state.phone_contact,
+    )
+
+
+def _build_long_term_living_fastpath_analysis(
+    message: str,
+    lead_state: LeadState,
+    recent_history: list[HistoryTurn],
+) -> TurnAnalysis | None:
+    _ = recent_history
+    if not _is_long_term_living_intent(message):
+        return None
+
+    evidence = [message.strip()] if message.strip() else []
+    consult_reply = (
+        "Với nhu cầu ở lâu dài, anh/chị nên ưu tiên pháp lý minh bạch, quy hoạch ổn định, tiện ích sống hằng ngày và kết nối giao thông. "
+        "Noble Palace Tây Thăng Long phù hợp để bắt đầu so sánh theo các tiêu chí này trước khi đi sâu vào từng căn cụ thể."
+    )
+    return TurnAnalysis(
+        route="consult_discovery",
+        decision_reason="deterministic_long_term_living_fastpath",
+        need_update=NeedPainpointDelta(
+            summary_delta="Khach the hien nhu cau an cu, uu tien sinh song lau dai.",
+            topics=[TopicWeight(label="an_cu_lau_dai", weight=0.86)],
+            evidence=evidence,
+        ),
+        painpoint_update=NeedPainpointDelta(summary_delta="", topics=[], evidence=evidence),
+        routing_signal=RoutingSignal(
+            should_route_project=False,
+            project_query_hint=None,
+            reason="deterministic_long_term_living_fastpath",
+        ),
+        consult_reply=consult_reply,
+        query_type="clarification",
+        retrieval_readiness="not_ready",
+        route_source="deterministic_fastpath",
+        engagement_state_after_hint=_promote_engagement_state(lead_state.engagement_state, "warm"),
+        sales_state_after_hint="exploring",
+        conversation_goal_hint="discover_need",
+        extracted_name=lead_state.name,
+        extracted_phone=lead_state.phone_contact,
+    )
+
+
 def analyze_turn(
     message: str,
     lead_state: LeadState,
@@ -1798,6 +2167,20 @@ def analyze_turn(
     )
     if fastpath is not None:
         return fastpath
+    greeting_fastpath = _build_basic_consult_greeting_fastpath_analysis(
+        message=message,
+        lead_state=lead_state,
+        recent_history=recent_history,
+    )
+    if greeting_fastpath is not None:
+        return greeting_fastpath
+    long_term_living_fastpath = _build_long_term_living_fastpath_analysis(
+        message=message,
+        lead_state=lead_state,
+        recent_history=recent_history,
+    )
+    if long_term_living_fastpath is not None:
+        return long_term_living_fastpath
     if not settings.decider_enabled:
         return _analyze_turn_fallback(message=message, lead_state=lead_state, recent_history=recent_history)
     try:
@@ -1895,6 +2278,47 @@ def create_app(
             level=logging.INFO,
             format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
         )
+    
+    # Initialize optimization components
+    init_optimization(
+        enable_cache=settings.synthesis_cache_enabled,
+        cache_max_entries=settings.synthesis_cache_max_entries,
+        cache_ttl_seconds=settings.synthesis_cache_ttl_seconds,
+        enable_timing=settings.enable_timing_instrumentation,
+    )
+    log.info(
+        f"Optimization initialized: cache={settings.synthesis_cache_enabled}, "
+        f"compression={settings.synthesis_compression_mode}, "
+        f"streaming={settings.synthesis_enable_streaming}"
+    )
+
+    app.state.model_warmup_stop_event = None
+    app.state.model_warmup_thread = None
+
+    @app.on_event("startup")
+    def _startup_model_warmup() -> None:
+        if not settings.model_warmup_enabled:
+            log.info("Periodic model warmup disabled")
+            return
+        stop_event = threading.Event()
+        worker = threading.Thread(
+            target=_run_model_warmup_loop,
+            args=(settings, stop_event),
+            name="model-warmup-worker",
+            daemon=True,
+        )
+        app.state.model_warmup_stop_event = stop_event
+        app.state.model_warmup_thread = worker
+        worker.start()
+
+    @app.on_event("shutdown")
+    def _shutdown_model_warmup() -> None:
+        stop_event = getattr(app.state, "model_warmup_stop_event", None)
+        worker = getattr(app.state, "model_warmup_thread", None)
+        if stop_event is not None:
+            stop_event.set()
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=2.0)
 
     client = RetrievalClient(
         base_url=settings.retrieval_service_url,
@@ -2240,50 +2664,73 @@ def create_app(
 
                     used_fastpath_consult_reply = False
                     reply_source = "reply_synthesis"
-                    fastpath_gate_reason = "forced_model_synthesis"
+                    fastpath_gate_reason = (
+                        "deterministic_fastpath_with_llm_synthesis"
+                        if analysis.route_source == "deterministic_fastpath"
+                        else "forced_model_synthesis"
+                    )
 
-                    with start_observation(
-                        langfuse_enabled,
-                        name="orchestrator.reply_synthesis",
-                        as_type="generation",
-                        model=settings.synthesis_model,
-                        input={
-                            "final_route": final_route,
-                            "response_mode": reply_plan.response_mode,
-                            "ask_policy": reply_plan.ask_policy,
-                            "fastpath_gate_reason": fastpath_gate_reason,
-                        },
-                    ) as reply_obs:
-                        try:
-                            assistant_reply = synthesize_assistant_reply(
-                                message=message,
-                                recent_history=payload.recent_history,
-                                lead_state=final_state,
-                                analysis=analysis,
-                                final_route=final_route,
-                                decision_reason=reason,
-                                reply_plan=reply_plan,
-                                grounded_result=grounded_result,
-                                settings=settings,
-                            )
-                        except Exception as exc:
-                            reply_obs.update(output={"error": str(exc)[:240]})
-                            log.exception(
-                                "reply synthesis error final_route=%s response_mode=%s ask_policy=%s reason=%s",
-                                final_route,
-                                reply_plan.response_mode,
-                                reply_plan.ask_policy,
-                                reason,
-                            )
-                            raise HTTPException(status_code=502, detail=f"reply synthesis error: {exc}") from exc
-                        reply_obs.update(
-                            output={
-                                "assistant_reply_chars": len(assistant_reply),
-                                "assistant_reply_preview": assistant_reply[:240],
-                                "used_model_rewrite": False,
-                                "used_model_accent_normalize": False,
-                            }
+                    quick_intent_reply: str | None = None
+                    if (
+                        settings.quick_intent_fast_response_enabled
+                        and final_route == "consult_discovery"
+                        and _normalize_query_type(analysis.query_type) == "clarification"
+                    ):
+                        quick_intent_reply = _build_quick_intent_response(
+                            message=message,
+                            ask_policy=reply_plan.ask_policy,
                         )
+
+                    if quick_intent_reply:
+                        assistant_reply = _compact_text(
+                            quick_intent_reply,
+                            max_words=max(24, settings.quick_intent_response_max_words),
+                        )
+                        reply_source = "quick_intent_fast_response"
+                        fastpath_gate_reason = "quick_intent_template"
+                    else:
+                        with start_observation(
+                            langfuse_enabled,
+                            name="orchestrator.reply_synthesis",
+                            as_type="generation",
+                            model=settings.synthesis_model,
+                            input={
+                                "final_route": final_route,
+                                "response_mode": reply_plan.response_mode,
+                                "ask_policy": reply_plan.ask_policy,
+                                "fastpath_gate_reason": fastpath_gate_reason,
+                            },
+                        ) as reply_obs:
+                            try:
+                                assistant_reply = synthesize_assistant_reply(
+                                    message=message,
+                                    recent_history=payload.recent_history,
+                                    lead_state=final_state,
+                                    analysis=analysis,
+                                    final_route=final_route,
+                                    decision_reason=reason,
+                                    reply_plan=reply_plan,
+                                    grounded_result=grounded_result,
+                                    settings=settings,
+                                )
+                            except Exception as exc:
+                                reply_obs.update(output={"error": str(exc)[:240]})
+                                log.exception(
+                                    "reply synthesis error final_route=%s response_mode=%s ask_policy=%s reason=%s",
+                                    final_route,
+                                    reply_plan.response_mode,
+                                    reply_plan.ask_policy,
+                                    reason,
+                                )
+                                raise HTTPException(status_code=502, detail=f"reply synthesis error: {exc}") from exc
+                            reply_obs.update(
+                                output={
+                                    "assistant_reply_chars": len(assistant_reply),
+                                    "assistant_reply_preview": assistant_reply[:240],
+                                    "used_model_rewrite": False,
+                                    "used_model_accent_normalize": False,
+                                }
+                            )
 
                     if final_route == "project_grounded" and grounded_result is not None:
                         response = QueryResponse(

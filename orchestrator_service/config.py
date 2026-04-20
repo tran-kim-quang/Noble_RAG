@@ -48,7 +48,7 @@ def _decider_api_url() -> str:
             "ORCHESTRATOR_DECIDER_API_URL",
             default=_GROQ_OPENAI_CHAT_COMPLETIONS_URL,
         )
-    return _env_first("ORCHESTRATOR_DECIDER_API_URL", default="http://host.docker.internal:11434/api/generate")
+    return _env_first("ORCHESTRATOR_DECIDER_API_URL", default="http://ollama:11434/api/generate")
 
 
 def _decider_api_key() -> str:
@@ -123,6 +123,39 @@ class Settings:
     grounded_trait_limit: int = int(os.getenv("ORCHESTRATOR_GROUNDED_TRAIT_LIMIT", "3"))
     grounded_proximity_limit: int = int(os.getenv("ORCHESTRATOR_GROUNDED_PROXIMITY_LIMIT", "3"))
     grounded_evidence_limit: int = int(os.getenv("ORCHESTRATOR_GROUNDED_EVIDENCE_LIMIT", "2"))
+    
+    # ===== Optimization Config =====
+    # Synthesis latency optimization flags
+    synthesis_cache_enabled: bool = _env_bool("ORCHESTRATOR_SYNTHESIS_CACHE_ENABLED", "true")
+    synthesis_cache_max_entries: int = int(os.getenv("ORCHESTRATOR_SYNTHESIS_CACHE_MAX_ENTRIES", "1000"))
+    synthesis_cache_ttl_seconds: int = int(os.getenv("ORCHESTRATOR_SYNTHESIS_CACHE_TTL_SECONDS", "3600"))
+    
+    # Streaming enables progressive response return (faster perceived latency)
+    synthesis_enable_streaming: bool = _env_bool("ORCHESTRATOR_SYNTHESIS_ENABLE_STREAMING", "false")
+
+    # Fast response lane for simple intents (greeting/basic consult) to keep latency low.
+    quick_intent_fast_response_enabled: bool = _env_bool("ORCHESTRATOR_QUICK_INTENT_FAST_RESPONSE_ENABLED", "true")
+    quick_intent_response_max_words: int = int(os.getenv("ORCHESTRATOR_QUICK_INTENT_RESPONSE_MAX_WORDS", "48"))
+    
+    # Periodic model warmup to avoid cold-start latency spikes.
+    model_warmup_enabled: bool = _env_bool("ORCHESTRATOR_MODEL_WARMUP_ENABLED", "true")
+    model_warmup_interval_sec: float = float(os.getenv("ORCHESTRATOR_MODEL_WARMUP_INTERVAL_SEC", "60"))
+    model_warmup_decider_enabled: bool = _env_bool("ORCHESTRATOR_MODEL_WARMUP_DECIDER_ENABLED", "true")
+    model_warmup_synthesis_enabled: bool = _env_bool("ORCHESTRATOR_MODEL_WARMUP_SYNTHESIS_ENABLED", "false")
+    
+    # Compression mode: "disabled" (default), "moderate" (reduce history+context), "aggressive" (max reduction)
+    synthesis_compression_mode: str = os.getenv("ORCHESTRATOR_SYNTHESIS_COMPRESSION_MODE", "moderate").strip().lower()
+    
+    # Max output tokens constraint (helps Kimi respond faster with concise answers)
+    synthesis_output_max_tokens: int = int(os.getenv("ORCHESTRATOR_SYNTHESIS_OUTPUT_MAX_TOKENS", "300"))
+    
+    # Timing instrumentation
+    enable_timing_instrumentation: bool = _env_bool("ORCHESTRATOR_ENABLE_TIMING_INSTRUMENTATION", "true")
+    
+    # Optimized history depth (reduce token count)
+    # Can be overridden per-use via compression_mode
+    synthesis_optimized_history_turns: int = int(os.getenv("ORCHESTRATOR_SYNTHESIS_OPTIMIZED_HISTORY_TURNS", "2"))
+    
     langfuse_enabled: bool = _env_bool("LANGFUSE_ENABLED", "false")
     langfuse_flush_at_request_end: bool = _env_bool("LANGFUSE_FLUSH_AT_REQUEST_END", "false")
 
