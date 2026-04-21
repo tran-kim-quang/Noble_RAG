@@ -7,6 +7,7 @@ import random
 from typing import Dict, Optional
 from utils.logger import logger
 from avatars.base_avatar import BaseAvatar
+from server.chat_history import chat_history_manager
 
 def _rand_session_id(n: int = 6) -> int:
     """生成 N 位随机 session ID"""
@@ -29,6 +30,7 @@ class SessionManager:
         if not hasattr(self, "initialized"):
             self.sessions: Dict[int, BaseAvatar] = {}
             self.build_session_fn = None
+            self.chat_history = chat_history_manager
             self.initialized = True
 
     def init_builder(self, build_session_fn):
@@ -63,18 +65,28 @@ class SessionManager:
             None, self.build_session_fn, sessionid, params
         )
         self.sessions[sessionid] = avatar_session
+        self.chat_history.start_session(sessionid, avatar_session=avatar_session, params=params)
         return sessionid
         
     def add_session(self, sessionid: int, avatar_session: BaseAvatar):
         """同步添加静态或外部管理的会话（供非服务端入口调用）"""
         self.sessions[sessionid] = avatar_session
+        self.chat_history.start_session(sessionid, avatar_session=avatar_session)
+
+    def append_chat_message(self, sessionid: int, role: str, text: str, datainfo: dict | None = None):
+        self.chat_history.add_message(sessionid=sessionid, role=role, text=text, datainfo=datainfo)
         
-    def remove_session(self, sessionid: int):
+    def remove_session(self, sessionid: int, reason: str = ""):
         """销毁会话资源"""
         if sessionid in self.sessions:
             logger.info(f"Removing session {sessionid}")
             # todo: 还可以主动调 avatar_session 释放
             self.sessions.pop(sessionid, None)
+        self.chat_history.finalize_session(sessionid=sessionid, reason=reason)
+
+    def flush_all_sessions(self, reason: str = "shutdown"):
+        for sessionid in list(self.sessions.keys()):
+            self.remove_session(sessionid=sessionid, reason=reason)
 
 # 单例抛出
 session_manager = SessionManager()

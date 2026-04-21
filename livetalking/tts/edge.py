@@ -14,7 +14,7 @@ from registry import register
 class EdgeTTS(BaseTTS):
     def txt_to_audio(self,msg:tuple[str, dict]):
         text,textevent = msg
-        voicename = textevent.get('tts', {}).get('ref_file',self.opt.REF_FILE) #self.opt.REF_FILE #"zh-CN-YunxiaNeural"
+        voicename = textevent.get('tts', {}).get('ref_file',self.opt.REF_FILE) # EdgeTTS voice, e.g. "vi-VN-HoaiMyNeural"
         t = time.time()
         asyncio.new_event_loop().run_until_complete(self.__main(voicename,text))
         logger.info(f'-------edge tts time:{time.time()-t:.4f}s')

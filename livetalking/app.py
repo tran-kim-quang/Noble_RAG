@@ -24,6 +24,7 @@ import json
 #from gevent import pywsgi
 #from geventwebsocket.handler import WebSocketHandler
 import re
+import os
 import numpy as np
 from threading import Thread,Event
 import sys
@@ -106,6 +107,9 @@ def build_avatar_session(sessionid:int, params:dict)->BaseAvatar:
 async def offer(request):
     return await rtc_manager.handle_offer(request)
 
+async def ice_config(request):
+    return await rtc_manager.handle_ice_config(request)
+
 async def on_shutdown(app):
     await rtc_manager.shutdown()
 
@@ -135,7 +139,13 @@ def main():
         global_avatars[opt.avatar_id] = load_avatar(opt.avatar_id) 
         warm_up(opt.batch_size,model)      
     elif opt.model == 'wav2lip':
-        model = load_model("./models/wav2lip.pth")
+        model_file = (opt.modelfile or "").strip() or "./models/wav2lip.pth"
+        if not os.path.isfile(model_file):
+            raise FileNotFoundError(
+                f"Wav2Lip checkpoint not found: {model_file}. "
+                "Pass --modelfile /path/to/wav2lip.pth or place file at ./models/wav2lip.pth"
+            )
+        model = load_model(model_file)
         global_avatars[opt.avatar_id] = load_avatar(opt.avatar_id)
         warm_up(opt.batch_size,model,256)
     elif opt.model == 'ultralight':
@@ -161,6 +171,7 @@ def main():
     appasync["llm_response"] = llm_response
 
     appasync.on_shutdown.append(on_shutdown)
+    appasync.router.add_get("/ice-config", ice_config)
     appasync.router.add_post("/offer", offer)
     
     # 注册 server/routes.py 中的通用 API 路由

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from avatars.base_avatar import BaseAvatar
 
+from server.session_manager import session_manager
 from utils.logger import logger
 
 
@@ -192,11 +193,32 @@ def _coalesce_enabled() -> bool:
     return _truthy_env("NOBLE_RAG_STREAM_COALESCE_ENABLED", "true")
 
 
-def _emit_segment(text: str, avatar_session: "BaseAvatar", datainfo: dict) -> None:
+def _emit_segment(
+    text: str,
+    avatar_session: "BaseAvatar",
+    datainfo: dict,
+    history_segments: list[str] | None = None,
+) -> None:
     if not text:
         return
     logger.info(text)
     avatar_session.put_msg_txt(text, datainfo)
+    if history_segments is not None:
+        cleaned = text.strip()
+        if cleaned:
+            history_segments.append(cleaned)
+
+
+def _join_history_segments(segments: list[str]) -> str:
+    parts = [segment.strip() for segment in segments if str(segment).strip()]
+    return "\n\n".join(parts)
+
+
+def _record_assistant_message(avatar_session: "BaseAvatar", datainfo: dict, text: str) -> None:
+    sessionid = getattr(avatar_session, "sessionid", None)
+    if sessionid is None:
+        return
+    session_manager.append_chat_message(int(sessionid), "assistant", text, datainfo)
 
 
 def _stream_rag_to_audio(
@@ -204,7 +226,7 @@ def _stream_rag_to_audio(
     avatar_session: "BaseAvatar",
     datainfo: dict,
     timeout_sec: float,
-) -> bool:
+) -> tuple[bool, str]:
     attempted = []
     last_error = None
 
@@ -223,6 +245,7 @@ def _stream_rag_to_audio(
             first_chunk_logged = False
             emitted_any = False
             pending = ""
+            history_segments: list[str] = []
             coalesce_enabled = _coalesce_enabled()
             coalesce_window = _coalesce_window_sec()
 
@@ -260,7 +283,7 @@ def _stream_rag_to_audio(
                             if done:
                                 final_text = pending.strip()
                                 if final_text:
-                                    _emit_segment(final_text, avatar_session, datainfo)
+                                    _emit_segment(final_text, avatar_session, datainfo, history_segments=history_segments)
                                     pending = ""
                                     emitted_any = True
                                 continue
@@ -272,11 +295,11 @@ def _stream_rag_to_audio(
                             segments, pending = _split_ready_sentences(pending)
                             for seg in segments:
                                 if len(seg) >= 4:
-                                    _emit_segment(seg, avatar_session, datainfo)
+                                    _emit_segment(seg, avatar_session, datainfo, history_segments=history_segments)
                                     emitted_any = True
                             # Emit partial chunk to reduce perceived silence for mic mode.
                             if len(pending.strip()) >= _stream_partial_chars():
-                                _emit_segment(pending.strip(), avatar_session, datainfo)
+                                _emit_segment(pending.strip(), avatar_session, datainfo, history_segments=history_segments)
                                 pending = ""
                                 emitted_any = True
 
@@ -292,17 +315,27 @@ def _stream_rag_to_audio(
                         break
 
             if pending.strip():
-                _emit_segment(pending.strip(), avatar_session, datainfo)
+                _emit_segment(pending.strip(), avatar_session, datainfo, history_segments=history_segments)
                 emitted_any = True
 
+            history_text = _join_history_segments(history_segments)
+            if history_text:
+                return True, history_text
             if emitted_any:
-                return True
+                return True, ""
 
             last_error = RuntimeError("Stream endpoint returned no speakable chunks")
 
         except HTTPError as e:
             last_error = e
             if e.code == 404:
+                continue
+            if e.code == 405:
+                logger.warning(
+                    "llm RAG stream endpoint does not support POST: url=%s code=%s. Falling back to non-stream /sales/query.",
+                    rag_url,
+                    e.code,
+                )
                 continue
             if e.code >= 500:
                 continue
@@ -315,7 +348,7 @@ def _stream_rag_to_audio(
             continue
 
     logger.warning("llm RAG stream unavailable. Tried=%s last_error=%s", attempted, last_error)
-    return False
+    return False, ""
 
 
 def _chat_rag_once(payload: dict, timeout_sec: float) -> str:
@@ -373,18 +406,22 @@ def llm_response(message, avatar_session: "BaseAvatar", datainfo: dict = {}):
         if datainfo.get("raw_transcript"):
             payload["raw_transcript"] = datainfo["raw_transcript"]
 
-        streamed = _stream_rag_to_audio(payload, avatar_session, datainfo, timeout_sec)
+        streamed, streamed_text = _stream_rag_to_audio(payload, avatar_session, datainfo, timeout_sec)
         if not streamed:
             if stream_only:
                 logger.warning("llm stream-only mode enabled; skip non-stream fallback /sales/query")
                 if stream_error_reply:
                     _emit_segment(stream_error_reply, avatar_session, datainfo)
+                    _record_assistant_message(avatar_session, datainfo, stream_error_reply)
                 return
             text = _chat_rag_once(payload, timeout_sec)
             if not text:
                 logger.warning("llm RAG returned empty text in non-stream mode")
                 return
             _emit_segment(text, avatar_session, datainfo)
+            _record_assistant_message(avatar_session, datainfo, text)
+        elif streamed_text:
+            _record_assistant_message(avatar_session, datainfo, streamed_text)
 
         logger.info("llm total time: %.3fs", time.perf_counter() - start)
 

@@ -230,6 +230,7 @@ async def human(request):
             datainfo['session_id'] = params.get('session_id')
 
         if params['type'] == 'echo':
+            session_manager.append_chat_message(sessionid, "assistant", params['text'], datainfo)
             avatar_session.put_msg_txt(params['text'], datainfo)
         elif params['type'] == 'chat':
             logger.info(
@@ -239,6 +240,7 @@ async def human(request):
                 len(str(params.get('text', '') or '')),
                 len(str(datainfo.get('raw_transcript', '') or '')),
             )
+            session_manager.append_chat_message(sessionid, "user", params['text'], datainfo)
             llm_response = request.app.get("llm_response")
             if llm_response:
                 asyncio.get_event_loop().run_in_executor(
