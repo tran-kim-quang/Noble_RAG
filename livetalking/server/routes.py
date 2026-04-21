@@ -55,8 +55,19 @@ def _append_chat_candidates(urls: list[str], value: str) -> None:
     base = (value or "").strip().rstrip("/")
     if not base:
         return
-    if base.endswith("/sales/chat") or base.endswith("/api/v1/sales/chat"):
+    if (
+        base.endswith("/sales/query")
+        or base.endswith("/api/v1/sales/query")
+        or base.endswith("/sales/chat")
+        or base.endswith("/api/v1/sales/chat")
+    ):
         urls.append(base)
+        return
+    if base.endswith("/sales/query/stream"):
+        urls.append(base[: -len("/stream")])
+        return
+    if base.endswith("/api/v1/sales/query/stream"):
+        urls.append(base[: -len("/stream")])
         return
     if base.endswith("/sales/chat/stream"):
         urls.append(base[: -len("/stream")])
@@ -64,6 +75,8 @@ def _append_chat_candidates(urls: list[str], value: str) -> None:
     if base.endswith("/api/v1/sales/chat/stream"):
         urls.append(base[: -len("/stream")])
         return
+    urls.append(f"{base}/sales/query")
+    urls.append(f"{base}/api/v1/sales/query")
     urls.append(f"{base}/sales/chat")
     urls.append(f"{base}/api/v1/sales/chat")
 
@@ -85,6 +98,7 @@ def _candidate_rag_chat_urls() -> list[str]:
 
     bases.extend(
         [
+            "http://127.0.0.1:8021",
             "http://127.0.0.1:8010",
             "http://127.0.0.1:18081",
             "http://127.0.0.1:8000",
@@ -123,7 +137,12 @@ def _candidate_rag_stream_urls() -> list[str]:
         stream_urls.append(direct_chat.rstrip("/") + "/stream")
 
     for url in _candidate_rag_chat_urls():
-        if url.endswith("/sales/chat") or url.endswith("/api/v1/sales/chat"):
+        if (
+            url.endswith("/sales/query")
+            or url.endswith("/api/v1/sales/query")
+            or url.endswith("/sales/chat")
+            or url.endswith("/api/v1/sales/chat")
+        ):
             stream_urls.append(url + "/stream")
 
     out = []

@@ -21,8 +21,19 @@ def _append_chat_candidates(urls: list[str], value: str) -> None:
     base = (value or "").strip().rstrip("/")
     if not base:
         return
-    if base.endswith("/sales/chat") or base.endswith("/api/v1/sales/chat"):
+    if (
+        base.endswith("/sales/query")
+        or base.endswith("/api/v1/sales/query")
+        or base.endswith("/sales/chat")
+        or base.endswith("/api/v1/sales/chat")
+    ):
         urls.append(base)
+        return
+    if base.endswith("/sales/query/stream"):
+        urls.append(base[: -len("/stream")])
+        return
+    if base.endswith("/api/v1/sales/query/stream"):
+        urls.append(base[: -len("/stream")])
         return
     if base.endswith("/sales/chat/stream"):
         urls.append(base[: -len("/stream")])
@@ -30,6 +41,8 @@ def _append_chat_candidates(urls: list[str], value: str) -> None:
     if base.endswith("/api/v1/sales/chat/stream"):
         urls.append(base[: -len("/stream")])
         return
+    urls.append(f"{base}/sales/query")
+    urls.append(f"{base}/api/v1/sales/query")
     urls.append(f"{base}/sales/chat")
     urls.append(f"{base}/api/v1/sales/chat")
 
@@ -51,6 +64,7 @@ def _candidate_rag_chat_urls() -> list[str]:
 
     bases.extend(
         [
+            "http://127.0.0.1:8021",
             "http://127.0.0.1:8010",
             "http://127.0.0.1:18081",
             "http://127.0.0.1:8000",
@@ -84,6 +98,8 @@ def _candidate_rag_stream_urls() -> list[str]:
         ds = direct_stream.rstrip("/")
         if ds.endswith("/stream"):
             stream_urls.append(ds)
+        elif ds.endswith("/sales/query") or ds.endswith("/api/v1/sales/query"):
+            stream_urls.append(ds + "/stream")
         elif ds.endswith("/sales/chat") or ds.endswith("/api/v1/sales/chat"):
             stream_urls.append(ds + "/stream")
         else:
@@ -91,7 +107,11 @@ def _candidate_rag_stream_urls() -> list[str]:
 
     direct_chat = (os.getenv("NOBLE_RAG_CHAT_URL") or "").strip()
     if direct_chat:
-        if direct_chat.endswith("/sales/chat"):
+        if direct_chat.endswith("/sales/query"):
+            stream_urls.append(direct_chat + "/stream")
+        elif direct_chat.endswith("/api/v1/sales/query"):
+            stream_urls.append(direct_chat + "/stream")
+        elif direct_chat.endswith("/sales/chat"):
             stream_urls.append(direct_chat + "/stream")
         elif direct_chat.endswith("/api/v1/sales/chat"):
             stream_urls.append(direct_chat + "/stream")
@@ -99,7 +119,11 @@ def _candidate_rag_stream_urls() -> list[str]:
             stream_urls.append(direct_chat.rstrip("/") + "/stream")
 
     for url in _candidate_rag_chat_urls():
-        if url.endswith("/sales/chat"):
+        if url.endswith("/sales/query"):
+            stream_urls.append(url + "/stream")
+        elif url.endswith("/api/v1/sales/query"):
+            stream_urls.append(url + "/stream")
+        elif url.endswith("/sales/chat"):
             stream_urls.append(url + "/stream")
         elif url.endswith("/api/v1/sales/chat"):
             stream_urls.append(url + "/stream")
@@ -127,7 +151,7 @@ def _resolve_rag_session_id(avatar_session: "BaseAvatar", datainfo: dict) -> str
 def _extract_rag_text(payload: dict) -> str:
     if not isinstance(payload, dict):
         return ""
-    for key in ("response", "final_response", "answer", "content", "message"):
+    for key in ("assistant_reply", "response", "final_response", "answer", "content", "message"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
@@ -336,7 +360,7 @@ def llm_response(message, avatar_session: "BaseAvatar", datainfo: dict = {}):
         start = time.perf_counter()
         session_id = _resolve_rag_session_id(avatar_session, datainfo)
         timeout_sec = float((os.getenv("NOBLE_RAG_TIMEOUT_SEC") or "35").strip())
-        stream_only = _truthy_env("NOBLE_RAG_STREAM_ONLY", "true")
+        stream_only = _truthy_env("NOBLE_RAG_STREAM_ONLY", "false")
         stream_error_reply = (
             os.getenv("NOBLE_RAG_STREAM_ERROR_REPLY")
             or "Sunny xin lỗi, kết nối luồng phản hồi đang bận. Bạn thử lại ngay giúp Sunny nhé."
@@ -352,7 +376,7 @@ def llm_response(message, avatar_session: "BaseAvatar", datainfo: dict = {}):
         streamed = _stream_rag_to_audio(payload, avatar_session, datainfo, timeout_sec)
         if not streamed:
             if stream_only:
-                logger.warning("llm stream-only mode enabled; skip non-stream fallback /sales/chat")
+                logger.warning("llm stream-only mode enabled; skip non-stream fallback /sales/query")
                 if stream_error_reply:
                     _emit_segment(stream_error_reply, avatar_session, datainfo)
                 return
