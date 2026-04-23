@@ -13,6 +13,7 @@
 - `deploy/docker-compose.yml`
 - `deploy/.env.retrieval`
 - `deploy/.env.orchestrator`
+- `docs/huong_dan_ket_noi_host_model_cho_retrieval_service.md`
 - `deploy/volumes/qdrant/`
 - `deploy/scripts/start.sh`
 - `deploy/scripts/stop.sh`
@@ -35,6 +36,16 @@ fi
 # optional: tune config
 vi deploy/.env.retrieval
 vi deploy/.env.orchestrator
+
+# if using local Ollama on host machine
+# set in deploy/.env.retrieval:
+#   EMBEDDING_BACKEND=remote
+#   EMBEDDING_API_URL=http://host.docker.internal:11434/api/embeddings
+#   EMBEDDING_API_FORMAT=ollama
+#   EMBEDDING_MODEL=qwen3-embedding:8b
+#   EMBEDDING_DIM=4096
+#   LLM_WARM_API_URL=http://host.docker.internal:11434/api/generate
+#   LLM_WARM_MODEL=gemma4:latest
 
 # build images
 $COMPOSE -f deploy/docker-compose.yml build
@@ -71,22 +82,13 @@ $COMPOSE -f deploy/docker-compose.yml down
 ```
 
 ## 5) Post-deploy checks
-### 5.1 Ingest sample docs
+### 5.1 Ingest markdown project docs (Haystack -> Qdrant)
 ```bash
 $COMPOSE -f deploy/docker-compose.yml exec -T retrieval-service sh -lc \
-  "python - <<'PY'
-import json, urllib.request
-docs = json.load(open('/app/data/sample_docs.json', 'r', encoding='utf-8'))
-body = json.dumps({'documents': docs}).encode('utf-8')
-req = urllib.request.Request(
-    'http://retrieval-service:8011/ingest',
-    data=body,
-    headers={'Content-Type': 'application/json'},
-    method='POST',
-)
-with urllib.request.urlopen(req, timeout=30) as resp:
-    print(resp.read().decode())
-PY"
+  "python /app/scripts/ingest_markdown_to_retrieval.py \
+    --base-url http://retrieval-service:8011 \
+    --data-dir /app/data \
+    --files 02_12_2025_CSBH_574_NOBLE_PALACE_TAY_THANG_LONG_HDBM.md CONCEPT_THIET_KE_08_02_2025_only_hang_muc_noi_dung.md"
 ```
 
 ### 5.2 Test orchestrator
