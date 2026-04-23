@@ -8,3 +8,8 @@ deploy/volumes/
 *.env
 .env*
 .env
+
+# Large model/artifact files (prevent GitHub size-limit push failures)
+livetalking/.downloads/
+livetalking/**/*.pth
+livetalking/**/*.tar.gz
