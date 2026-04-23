@@ -67,7 +67,7 @@ def eval_case(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Minimal retrieval benchmark script")
-    parser.add_argument("--base-url", default="http://127.0.0.1:8011", help="Retrieval service base URL")
+    parser.add_argument("--base-url", default="http://localhost:8000", help="Retrieval service base URL")
     parser.add_argument("--cases", required=True, help="Path to benchmark cases JSON")
     parser.add_argument("--top-k", type=int, default=None, help="Override top_k for all cases")
     args = parser.parse_args()

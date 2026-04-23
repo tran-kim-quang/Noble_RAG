@@ -75,11 +75,27 @@ if ! echo "${HEALTH_JSON}" | python3 -c 'import json,sys; d=json.load(sys.stdin)
 fi
 pass "orchestrator health"
 
-step "ingest markdown docs"
-if ! ${COMPOSE_BIN} -f "${COMPOSE_FILE}" exec -T retrieval-service sh -lc "python /app/scripts/ingest_markdown_to_retrieval.py --base-url http://retrieval-service:8011 --data-dir /app/data --files 02_12_2025_CSBH_574_NOBLE_PALACE_TAY_THANG_LONG_HDBM.md CONCEPT_THIET_KE_08_02_2025_only_hang_muc_noi_dung.md"; then
-  fail "ingest markdown docs failed"
+step "ingest sample docs"
+if ! ${COMPOSE_BIN} -f "${COMPOSE_FILE}" exec -T retrieval-service sh -lc "python - <<'PY'
+import json, urllib.request
+with open('/app/data/sample_docs.json', 'r', encoding='utf-8') as f:
+    docs = json.load(f)
+body = json.dumps({'documents': docs}).encode('utf-8')
+req = urllib.request.Request(
+    'http://retrieval-service:8011/ingest',
+    data=body,
+    headers={'Content-Type': 'application/json'},
+    method='POST',
+)
+with urllib.request.urlopen(req, timeout=30) as resp:
+    raw = resp.read().decode('utf-8')
+print(raw)
+out = json.loads(raw)
+assert int(out.get('ingested', 0)) > 0
+PY"; then
+  fail "ingest sample docs failed"
 fi
-pass "ingest markdown docs"
+pass "ingest sample docs"
 
 step "query orchestrator (3 cases)"
 Q1="$(curl -fsS -X POST "${ORCH_BASE_URL}/sales/query" -H 'Content-Type: application/json' -d '{"message":"Giá căn 2 phòng ngủ là bao nhiêu?","need_retrieval":true}' 2>/dev/null || true)"

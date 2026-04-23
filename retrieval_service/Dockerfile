@@ -3,23 +3,13 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-ARG EMBEDDING_PROFILE=remote
-
 WORKDIR /app
 
-COPY retrieval_service/requirements.remote.txt /app/requirements.remote.txt
-COPY retrieval_service/requirements.local.txt /app/requirements.local.txt
-RUN set -eux; \
-    case "${EMBEDDING_PROFILE}" in \
-      remote) REQUIREMENTS_FILE="/app/requirements.remote.txt" ;; \
-      local) REQUIREMENTS_FILE="/app/requirements.local.txt" ;; \
-      *) echo "Unsupported EMBEDDING_PROFILE='${EMBEDDING_PROFILE}' (use: remote|local)" && exit 1 ;; \
-    esac; \
-    pip install --no-cache-dir -r "${REQUIREMENTS_FILE}"
+COPY retrieval_service/requirements.txt /app/retrieval_requirements.txt
+RUN pip install --no-cache-dir -r /app/retrieval_requirements.txt
 
 COPY retrieval_service /app/retrieval_service
 COPY data /app/data
-COPY scripts /app/scripts
 
 EXPOSE 8011
 

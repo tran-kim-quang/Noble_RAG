@@ -1,36 +1,6 @@
 version: "3.8"
 
 services:
-  ollama:
-    image: ollama/ollama:latest
-    container_name: noble_ollama
-    runtime: nvidia
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - OLLAMA_CONTEXT_LENGTH=8192
-      - OLLAMA_MAX_LOADED_MODELS=1
-      - OLLAMA_NUM_PARALLEL=1
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    volumes:
-      - ./volumes/ollama:/root/.ollama
-    expose:
-      - "11434"
-    networks:
-      - internal_net
-    restart: unless-stopped
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
-
   qdrant:
     image: qdrant/qdrant:latest
     container_name: noble_qdrant
@@ -49,14 +19,10 @@ services:
     build:
       context: ..
       dockerfile: retrieval_service/Dockerfile
-      args:
-        EMBEDDING_PROFILE: local
     container_name: noble_retrieval_service
-    hostname: desktop
     env_file:
       - ./.env.retrieval
     depends_on:
-      - ollama
       - qdrant
     expose:
       - "8011"
@@ -83,7 +49,6 @@ services:
     env_file:
       - ./.env.orchestrator
     depends_on:
-      - ollama
       - retrieval-service
     ports:
       - "${ORCH_BIND_IP:-127.0.0.1}:8021:8021"

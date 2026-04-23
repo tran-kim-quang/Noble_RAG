@@ -12,84 +12,19 @@ class RetrievalClient:
         self.base_url = base_url.rstrip("/")
         self.timeout_sec = timeout_sec
 
-    def retrieve(
-        self,
-        query: str,
-        top_k: int,
-        trace_id: str | None = None,
-        session_id: str | None = None,
-        user_id: str | None = None,
-    ) -> dict[str, Any]:
+    def retrieve(self, query: str, top_k: int) -> dict[str, Any]:
         payload = {"query": query, "top_k": top_k}
-        parsed = self._post_json(
-            "/retrieve",
-            payload,
-            trace_id=trace_id,
-            session_id=session_id,
-            user_id=user_id,
-        )
-        return {
-            "results": parsed.get("results", []) or [],
-            "confidence": parsed.get("confidence", 0.0),
-            "low_confidence": bool(parsed.get("low_confidence", False)),
-        }
-
-    def retrieve_project_grounded(
-        self,
-        query: str,
-        retrieval_intent: Any,
-        top_k: int,
-        trace_id: str | None = None,
-        session_id: str | None = None,
-        user_id: str | None = None,
-    ) -> dict[str, Any]:
-        payload = {
-            "query": query,
-            "retrieval_intent": retrieval_intent,
-            "top_k": top_k,
-        }
-        parsed = self._post_json(
-            "/retrieve/project-grounded",
-            payload,
-            trace_id=trace_id,
-            session_id=session_id,
-            user_id=user_id,
-        )
-        return {
-            "project_cards": parsed.get("project_cards", []) or [],
-            "trait_tags": parsed.get("trait_tags", []) or [],
-            "proximity_facts": parsed.get("proximity_facts", []) or [],
-            "evidence_chunks": parsed.get("evidence_chunks", []) or [],
-            "confidence": parsed.get("confidence", 0.0),
-            "low_confidence": bool(parsed.get("low_confidence", False)),
-        }
-
-    def _post_json(
-        self,
-        path: str,
-        payload: dict[str, Any],
-        trace_id: str | None = None,
-        session_id: str | None = None,
-        user_id: str | None = None,
-    ) -> dict[str, Any]:
         body = json.dumps(payload).encode("utf-8")
-        headers: dict[str, str] = {"Content-Type": "application/json"}
-        if trace_id:
-            headers["X-Langfuse-Trace-Id"] = str(trace_id)
-        if session_id:
-            headers["X-Langfuse-Session-Id"] = str(session_id)
-        if user_id:
-            headers["X-Langfuse-User-Id"] = str(user_id)
         req = urllib.request.Request(
-            f"{self.base_url}{path}",
+            f"{self.base_url}/retrieve",
             data=body,
-            headers=headers,
+            headers={"Content-Type": "application/json"},
             method="POST",
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_sec) as resp:
                 raw = resp.read().decode("utf-8")
-            return json.loads(raw)
+            parsed = json.loads(raw)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="ignore")
             raise RuntimeError(
@@ -103,3 +38,8 @@ class RetrievalClient:
             raise RuntimeError(
                 f"retrieval timeout after {self.timeout_sec}s"
             ) from exc
+        return {
+            "results": parsed.get("results", []) or [],
+            "confidence": parsed.get("confidence", 0.0),
+            "low_confidence": bool(parsed.get("low_confidence", False)),
+        }

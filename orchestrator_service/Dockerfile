@@ -13,4 +13,3 @@ COPY orchestrator_service /app/orchestrator_service
 EXPOSE 8021
 
 CMD ["uvicorn", "orchestrator_service.app:app", "--host", "0.0.0.0", "--port", "8021"]
-    

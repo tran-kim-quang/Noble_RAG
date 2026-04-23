@@ -3,6 +3,5 @@ uvicorn[standard]>=0.30,<1
 pydantic>=2.7,<3
 qdrant-haystack>=6.0.0
 qdrant-client>=1.9.0
-langfuse>=3.2.1,<4
 sentence-transformers>=5.0.0
 pytest>=8.0,<10
