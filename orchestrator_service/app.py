@@ -759,7 +759,7 @@ def _build_quick_intent_response(message: str, ask_policy: str) -> str | None:
     if normalized_ask_policy == "avoid_question":
         return (
             "Chào anh/chị, em sẵn sàng tư vấn bất động sản theo nhu cầu thực tế của mình. "
-            "Hiện em có thể hỗ trợ nhanh về dự án Noble Palace Tây Thăng Long và đề xuất hướng phù hợp cho anh/chị."
+            "Hiện em có thể hỗ trợ nhanh theo toàn bộ dữ liệu dự án đang có và đề xuất hướng phù hợp cho anh/chị."
         )
     return (
         "Chào anh/chị, em sẵn sàng tư vấn bất động sản theo nhu cầu thực tế của mình. "
@@ -1100,7 +1100,7 @@ def _build_reply_focus(
         cards = grounded_result.get("project_cards", []) or []
         if cards:
             first = cards[0]
-            project_name = _friendly_project_name(str(first.get("project_id", "Noble Palace Tây Thăng Long")))
+            project_name = _friendly_project_name(str(first.get("project_id", ""))) or "Dự án đang được nhắc tới"
             strengths = [str(item).strip() for item in (first.get("strengths") or []) if str(item).strip()]
             if strengths:
                 return _compact_text(f"{project_name}: {', '.join(strengths[:2])}", max_words=18)
@@ -1369,7 +1369,7 @@ def _build_reply_synthesis_prompt(
     return (
         "Bạn là chuyên viên tư vấn bất động sản.\n"
         "Nhiệm vụ duy nhất: trò chuyện tư vấn và giới thiệu dự án cho khách hàng bằng ngôn ngữ đời thường.\n"
-        "Collection hiện tại chỉ có 1 dự án chính: Noble Palace Tây Thăng Long.\n"
+        "Collection hiện tại có thể có nhiều dự án trong Qdrant.\n"
         "Hãy trả về DUY NHẤT 1 JSON object theo schema:\n"
         '{ "assistant_reply": "string" }\n'
         "Quy tắc bắt buộc:\n"
@@ -1384,7 +1384,7 @@ def _build_reply_synthesis_prompt(
         "- Không trả lời theo mẫu form/checklist; không hỏi dồn nhiều câu.\n"
         "- Không bịa thông tin ngoài dữ liệu cung cấp.\n"
         "- Nếu dữ liệu hiện tại chưa đủ chi tiết để kết luận sâu, nói ngắn gọn và đề xuất hẹn gặp trực tiếp.\n"
-        "- Nếu grounded_context.single_project_mode=true: chỉ nói về Noble Palace Tây Thăng Long, không nói 'nhiều lựa chọn' hay 'nhiều dự án'.\n"
+        "- Nếu grounded_context.single_project_mode=true: chỉ nói về dự án hiện diện trong grounded_context, không nói 'nhiều lựa chọn' hay 'nhiều dự án'.\n"
         "- Nếu grounded_context.single_project_mode=true: không hỏi khu vực/quận.\n"
         "- Không dùng câu hỏi nhị phân theo mẫu 'ở hay đầu tư'.\n"
         "Ràng buộc do orchestrator cung cấp:\n"
@@ -1859,7 +1859,7 @@ def _build_decider_prompt(
         "Ban la bo phan decider route cho tro ly tu van bat dong san.\n"
         "Nhiem vu duy nhat: phan loai query va quyet dinh co can route sang retrieval du an hay khong.\n"
         "Khong tra loi tu van. Khong cap nhat CRM state. Khong viet consult_reply.\n"
-        "Data scope hien tai: collection dang co 1 du an chinh la Noble Palace Tay Thang Long.\n"
+        "Data scope hien tai: collection co the co nhieu du an trong Qdrant, khong mac dinh 1 du an co dinh.\n"
         "4 query_type bat buoc: advisory_strategy, project_matching, project_specific, clarification.\n"
         "Quy tac route bat buoc:\n"
         "- advisory_strategy: hoi cach chon, chien luoc, so sanh tong quan -> start_route=consult_discovery, should_route_project=false.\n"
@@ -2112,7 +2112,7 @@ def _build_basic_consult_greeting_fastpath_analysis(
     evidence = [message.strip()] if message.strip() else []
     consult_reply = (
         "Chào anh/chị, em sẵn sàng tư vấn bất động sản cho mình. "
-        "Hiện bên em tập trung dự án Noble Palace Tây Thăng Long và em có thể tư vấn theo nhu cầu ở thực hoặc đầu tư của anh/chị."
+        "Em có thể tư vấn theo toàn bộ dữ liệu dự án hiện có và bám sát nhu cầu ở thực hoặc đầu tư của anh/chị."
     )
     return TurnAnalysis(
         route="consult_discovery",
@@ -2701,7 +2701,30 @@ def create_app(
                                     reply_plan.ask_policy,
                                     reason,
                                 )
-                                raise HTTPException(status_code=502, detail=f"reply synthesis error: {exc}") from exc
+                                # Graceful degradation: keep the API responsive when model
+                                # synthesis is slow/unavailable by returning fallback consult text.
+                                if consult_result is None:
+                                    consult_result = run_consult_discovery(
+                                        message=message,
+                                        lead_state=lead_state,
+                                        analysis=analysis,
+                                    )
+                                fallback_reply = (
+                                    str(consult_result.get("assistant_reply", "")).strip()
+                                    if consult_result
+                                    else ""
+                                ) or analysis.consult_reply
+                                assistant_reply = _compact_text(
+                                    fallback_reply
+                                    or (
+                                        "Em xin lỗi, hệ thống trả lời đang bận. "
+                                        "Anh/chị cho em 1 tiêu chí ưu tiên để em tư vấn nhanh hơn ạ."
+                                    ),
+                                    max_words=max(24, settings.quick_intent_response_max_words),
+                                )
+                                reply_source = "reply_synthesis_fallback_consult"
+                                fastpath_gate_reason = "synthesis_error_fallback"
+                                used_fastpath_consult_reply = True
                             reply_obs.update(
                                 output={
                                     "assistant_reply_chars": len(assistant_reply),

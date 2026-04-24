@@ -778,18 +778,105 @@ class RetrievalService:
 
     def _infer_project_id(self, source: str, text: str, metadata: dict[str, Any] | None = None) -> str:
         metadata = metadata or {}
-        if metadata.get("project_id"):
-            return str(metadata["project_id"])
+
+        def _normalize_project_slug(raw: Any) -> str:
+            value = str(raw or "").strip().lower()
+            value = re.sub(r"\.(md|markdown|txt|pdf|docx?)$", "", value)
+            value = re.sub(r"[^a-z0-9]+", "_", value).strip("_")
+            return value
 
         source_lower = source.lower()
         text_lower = text.lower()
-        match = re.search(r"project[_\s-]?id[:=]\s*([a-z0-9_-]+)", text_lower)
+        file_name_lower = str(metadata.get("file_name", metadata.get("origin_file", ""))).lower()
+        source_from_meta = str(metadata.get("source", "")).lower()
+        source_hint = " ".join(
+            part
+            for part in (
+                source_lower,
+                file_name_lower,
+                source_from_meta,
+            )
+            if part
+        )
+        text_hint = text_lower[:2000]
+
+        def _map_project_alias(raw: str) -> str | None:
+            slug = _normalize_project_slug(raw)
+            if not slug:
+                return None
+            if any(token in slug for token in ("sunshine_legend_city", "fact_sheet_sunshine", "ss_legend", "sunshine")):
+                return "sunshine_legend_city"
+            if any(token in slug for token in ("noble_palace_tay_ho", "tay_ho", "ciputra")):
+                return "noble_palace_tay_ho"
+            if any(token in slug for token in ("noble_palace_tay_thang_long", "tay_thang_long")):
+                return "noble_palace_tay_thang_long"
+            if slug in {"unknown", "unknown_project", "none", "null"}:
+                return None
+            return slug
+
+        def _infer_from_hints(hints: str) -> str | None:
+            normalized = str(hints or "").strip().lower()
+            if not normalized:
+                return None
+            if any(
+                token in normalized
+                for token in (
+                    "sunshine legend city",
+                    "sunshine legend",
+                    "fact_sheet_sunshine",
+                    "ai_factsheet_ss",
+                    "ss legend city",
+                )
+            ):
+                return "sunshine_legend_city"
+            if any(
+                token in normalized
+                for token in (
+                    "noble palace tay ho",
+                    "noble palace tây hồ",
+                    "tay_ho",
+                    "tay ho",
+                    "tây hồ",
+                    "ciputra",
+                )
+            ):
+                return "noble_palace_tay_ho"
+            if any(
+                token in normalized
+                for token in (
+                    "noble palace tay thang long",
+                    "noble palace tây thăng long",
+                    "tay_thang_long",
+                    "tay thang long",
+                    "tây thăng long",
+                )
+            ):
+                return "noble_palace_tay_thang_long"
+            return None
+
+        combined = " ".join(item for item in (source_hint, text_hint) if item)
+        match = re.search(r"project[_\s-]?id[:=]\s*([a-z0-9_-]+)", combined)
         if match:
-            return match.group(1)
-        if "noble palace" in text_lower or "tay thang long" in text_lower:
-            return "noble_palace_tay_thang_long"
-        if source_lower:
-            return "noble_palace_tay_thang_long"
+            explicit = _map_project_alias(match.group(1))
+            if explicit:
+                return explicit
+
+        # Prefer source/file based clues first so stale metadata.project_id cannot force a wrong project.
+        source_project_id = _infer_from_hints(source_hint)
+        if source_project_id:
+            return source_project_id
+
+        text_project_id = _infer_from_hints(text_hint)
+        if text_project_id:
+            return text_project_id
+
+        meta_project_id = _map_project_alias(str(metadata.get("project_id", "")))
+        if meta_project_id:
+            return meta_project_id
+
+        source_slug = _normalize_project_slug(source_lower.split("#", 1)[0])
+        if source_slug:
+            return source_slug
         return "unknown_project"
 
     def _build_project_summary(

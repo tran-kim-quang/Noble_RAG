@@ -35,6 +35,64 @@ POI_TO_TOPIC = {
 }
 
 
+def normalize_project_slug(raw: str) -> str:
+    value = str(raw or "").strip().lower()
+    value = re.sub(r"\.(md|markdown|txt|pdf|docx?)$", "", value)
+    value = re.sub(r"[^a-z0-9]+", "_", value).strip("_")
+    return value
+
+
+def infer_project_id_from_hints(hints: str) -> str | None:
+    normalized = str(hints or "").strip().lower()
+    if not normalized:
+        return None
+    if any(
+        token in normalized
+        for token in (
+            "sunshine legend city",
+            "sunshine legend",
+            "fact_sheet_sunshine",
+            "ai_factsheet_ss",
+            "ss legend city",
+        )
+    ):
+        return "sunshine_legend_city"
+    if any(
+        token in normalized
+        for token in (
+            "noble palace tay ho",
+            "noble palace tây hồ",
+            "tay_ho",
+            "tay ho",
+            "tây hồ",
+            "ciputra",
+        )
+    ):
+        return "noble_palace_tay_ho"
+    if any(
+        token in normalized
+        for token in (
+            "noble palace tay thang long",
+            "noble palace tây thăng long",
+            "tay_thang_long",
+            "tay thang long",
+            "tây thăng long",
+        )
+    ):
+        return "noble_palace_tay_thang_long"
+    return None
+
+
+def infer_project_id_for_file(file_name: str, content: str) -> str:
+    source_hint = str(file_name or "").strip().lower()
+    text_hint = str(content or "").strip().lower()[:4000]
+    inferred = infer_project_id_from_hints(f"{source_hint}\n{text_hint}")
+    if inferred:
+        return inferred
+    stem_slug = normalize_project_slug(Path(file_name).stem)
+    return stem_slug or "unknown_project"
+
+
 def split_sections(markdown_text: str) -> list[str]:
     cleaned = markdown_text.strip()
     if not cleaned:
@@ -148,7 +206,7 @@ def build_documents(
     markdown_files: list[str],
     chunk_size: int,
     chunk_overlap: int,
-    project_id: str,
+    project_id_override: str,
 ) -> list[dict]:
     documents: list[dict] = []
     for file_name in markdown_files:
@@ -157,6 +215,12 @@ def build_documents(
             raise FileNotFoundError(f"Missing file: {file_path}")
 
         content = file_path.read_text(encoding="utf-8")
+        file_project_id = (
+            normalize_project_slug(project_id_override)
+            if str(project_id_override or "").strip()
+            else infer_project_id_for_file(file_name=file_path.name, content=content)
+        )
+        print(f"project_map file={file_path.name} -> project_id={file_project_id}")
         sections = split_sections(content)
         for section_idx, section in enumerate(sections, start=1):
             pieces = chunk_text(section, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
@@ -169,7 +233,7 @@ def build_documents(
                         "source": source,
                         "text": piece,
                         "metadata": {
-                            "project_id": project_id,
+                            "project_id": file_project_id,
                             "origin_file": file_path.name,
                             "section_index": section_idx,
                             "chunk_index": piece_idx,
@@ -183,7 +247,7 @@ def build_documents(
                         file_name=file_path.name,
                         section_idx=section_idx,
                         piece_idx=piece_idx,
-                        project_id=project_id,
+                        project_id=file_project_id,
                     )
                 )
     return documents
@@ -207,7 +271,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Ingest markdown project data into retrieval-service/Qdrant.")
     parser.add_argument("--base-url", default="http://127.0.0.1:8011", help="Retrieval service base URL.")
     parser.add_argument("--data-dir", default="data", help="Directory containing markdown files.")
-    parser.add_argument("--project-id", default="noble_palace_tay_thang_long", help="Project id in metadata.")
+    parser.add_argument(
+        "--project-id",
+        default="",
+        help="Optional project_id override for all files. Leave empty to auto-map per file.",
+    )
     parser.add_argument("--chunk-size", type=int, default=1400, help="Chunk size in characters.")
     parser.add_argument("--chunk-overlap", type=int, default=200, help="Chunk overlap in characters.")
     parser.add_argument("--batch-size", type=int, default=32, help="Number of docs per ingest request.")
@@ -234,7 +302,7 @@ def main() -> int:
         markdown_files=args.files,
         chunk_size=args.chunk_size,
         chunk_overlap=args.chunk_overlap,
-        project_id=args.project_id,
+        project_id_override=args.project_id,
     )
     if not docs:
         raise RuntimeError("No documents were generated from markdown inputs.")
