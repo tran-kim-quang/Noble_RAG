@@ -91,6 +91,10 @@ def _synthesis_model() -> str:
 class Settings:
     retrieval_service_url: str = os.getenv("RETRIEVAL_SERVICE_URL", "http://127.0.0.1:8011")
     retrieval_timeout_sec: float = float(os.getenv("RETRIEVAL_TIMEOUT_SEC", "15"))
+    vision_enabled: bool = _env_bool("VISION_ENABLED", "true")
+    vision_service_url: str = os.getenv("VISION_SERVICE_URL", "http://127.0.0.1:8031").strip()
+    vision_timeout_sec: float = float(os.getenv("VISION_TIMEOUT_SEC", "12"))
+    vision_greeting_enabled: bool = _env_bool("VISION_GREETING_ENABLED", "true")
     default_top_k: int = int(os.getenv("ORCHESTRATOR_DEFAULT_TOP_K", "5"))
     decider_enabled: bool = _env_bool("ORCHESTRATOR_DECIDER_ENABLED", "true" if _use_llm_decider_alias() else "false")
     decider_api_format: str = _decider_api_format()

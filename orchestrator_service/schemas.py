@@ -32,11 +32,36 @@ class NeedPainpointState(BaseModel):
     last_updated_at: str | None = None
 
 
+class VisionContext(BaseModel):
+    recognized: bool = False
+    name: str | None = None
+    age: int | None = Field(default=None, ge=0, le=120)
+    gender: Literal["male", "female"] | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    source: Literal["face_db", "local_face_analysis", "vlm", "none", "error"] = "none"
+    face_count: int = Field(default=0, ge=0)
+    bbox: list[int] | None = None
+    reason: str | None = None
+
+
+class CustomerProfileState(BaseModel):
+    recognized: bool = False
+    name: str | None = None
+    age: int | None = Field(default=None, ge=0, le=120)
+    gender: Literal["male", "female"] | None = None
+    source: Literal["face_db", "local_face_analysis", "vlm", "none", "error"] | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    last_seen_at: str | None = None
+    greeted_by_name: bool = False
+    greeted_generic: bool = False
+
+
 class LeadState(BaseModel):
     name: str | None = None
     phone_contact: str | None = None
     need: NeedPainpointState = Field(default_factory=NeedPainpointState)
     painpoint: NeedPainpointState = Field(default_factory=NeedPainpointState)
+    customer_profile: CustomerProfileState = Field(default_factory=CustomerProfileState)
     engagement_state: Literal["cold", "warm", "interested", "ready"] = "cold"
     engagement_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     sales_state: Literal[
@@ -219,6 +244,7 @@ class HistoryTurn(BaseModel):
 class QueryRequest(BaseModel):
     message: str = Field(min_length=1)
     lead_state: LeadState | None = None
+    vision_context: VisionContext | None = None
     recent_history: list[HistoryTurn] = Field(default_factory=list)
     top_k: int | None = Field(default=None, ge=1, le=20)
     session_id: str | None = Field(default=None, min_length=1, max_length=128)
@@ -244,3 +270,17 @@ class QueryResponse(BaseModel):
     project_grounded_payload: ProjectGroundedPayload | None = None
     decision_trace: DecisionTrace | None = None
     timestamp: str = Field(default_factory=_now_iso)
+
+
+class VisionQueryRequest(QueryRequest):
+    image_base64: str = Field(min_length=1)
+    image_filename: str | None = None
+    image_content_type: str | None = None
+
+    @field_validator("image_base64")
+    @classmethod
+    def validate_image_base64_not_blank(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("image_base64 must not be blank")
+        return cleaned

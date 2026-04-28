@@ -3,6 +3,7 @@
 Tai lieu nay huong dan start nhanh he thong Noble RAG trong repo nay, gom:
 - `orchestrator-service` (API chinh): `:8021`
 - `retrieval-service` (noi bo): `:8011`
+- `vision-service` (noi bo): `:8031`
 - `qdrant` (vector DB, noi bo)
 - `ollama` (embedding backend, noi bo)
 
@@ -34,6 +35,7 @@ Neu chua co file env runtime, copy tu file mau:
 ```bash
 cp -n deploy/retrieval.example.env deploy/.env.retrieval
 cp -n deploy/orchestrator.example.env deploy/.env.orchestrator
+cp -n deploy/vision.example.env deploy/.env.vision
 ```
 
 ### Buoc 3: cap nhat cau hinh bat buoc
@@ -49,6 +51,14 @@ Kiem tra file `deploy/.env.retrieval`:
 - `EMBEDDING_API_URL=http://ollama:11434/api/embeddings`
 - `EMBEDDING_MODEL=qwen3-embedding:8b`
 - `EMBEDDING_DIM=4096`
+
+Neu dung vision service:
+
+- Dat anh khach hang theo cau truc `face_db/<ten_khach>/image1.jpg`
+- Kiem tra `deploy/.env.vision`
+- Kiem tra `deploy/.env.orchestrator` co:
+  - `VISION_ENABLED=true`
+  - `VISION_SERVICE_URL=http://vision-service:8031`
 
 ### Buoc 4: start stack
 
@@ -88,6 +98,10 @@ curl -s http://127.0.0.1:8021/health | python3 -m json.tool
 curl -s -X POST http://127.0.0.1:8021/sales/query \
   -H "Content-Type: application/json" \
   -d '{"message":"Gia can 2 phong ngu la bao nhieu?"}' | python3 -m json.tool
+
+curl -s -X POST http://127.0.0.1:8021/sales/query-with-vision \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Tu van tong quan cho toi","image_base64":"<base64-or-data-url>"}' | python3 -m json.tool
 ```
 
 ## 3) Van hanh hang ngay
@@ -99,6 +113,7 @@ curl -s -X POST http://127.0.0.1:8021/sales/query \
 # xem logs
 ./deploy/scripts/logs.sh orchestrator-service 200
 ./deploy/scripts/logs.sh retrieval-service 200
+./deploy/scripts/logs.sh vision-service 200
 ./deploy/scripts/logs.sh qdrant 200
 
 # restart
@@ -127,6 +142,7 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install -r retrieval_service/requirements.local.txt
 pip install -r orchestrator_service/requirements.txt
+pip install -r vision_service/requirements.txt
 ```
 
 ### Buoc 2: chay Qdrant local
@@ -175,6 +191,16 @@ python scripts/ingest_markdown_to_retrieval.py \
 RETRIEVAL_SERVICE_URL=http://127.0.0.1:8011 \
 ORCHESTRATOR_DEFAULT_TOP_K=5 \
 uvicorn orchestrator_service.app:app --host 127.0.0.1 --port 8021
+```
+
+### Buoc 6: chay vision service (terminal 3)
+
+```bash
+source .venv/bin/activate
+
+VISION_FACE_DB=face_db \
+VISION_MATCH_THRESHOLD=0.45 \
+uvicorn vision_service.app:app --host 127.0.0.1 --port 8031
 ```
 
 ## 5) Loi thuong gap

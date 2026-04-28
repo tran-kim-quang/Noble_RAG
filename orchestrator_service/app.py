@@ -27,6 +27,7 @@ from orchestrator_service.prompt_optimization import (
     PromptCompressor,
 )
 from orchestrator_service.retrieval_client import RetrievalClient
+from orchestrator_service.vision_client import VisionClient
 from orchestrator_service.schemas import (
     DecisionTrace,
     HistoryTurn,
@@ -37,6 +38,8 @@ from orchestrator_service.schemas import (
     QueryResponse,
     RoutingSignal,
     TopicWeight,
+    VisionContext,
+    VisionQueryRequest,
 )
 
 log = logging.getLogger("sales-orchestrator")
@@ -433,6 +436,7 @@ def merge_lead_state(
         phone_contact=extracted_phone or lead_state.phone_contact,
         need=_merge_block(lead_state.need, need_update),
         painpoint=_merge_block(lead_state.painpoint, painpoint_update),
+        customer_profile=lead_state.customer_profile,
         engagement_state=lead_state.engagement_state,
         engagement_confidence=lead_state.engagement_confidence,
         sales_state=lead_state.sales_state,
@@ -441,6 +445,39 @@ def merge_lead_state(
         next_best_action=lead_state.next_best_action,
         contact_capture_status=lead_state.contact_capture_status,
     )
+
+
+def _merge_customer_profile(lead_state: LeadState, vision_context: VisionContext | None) -> LeadState:
+    if vision_context is None:
+        return lead_state
+
+    current = lead_state.customer_profile
+    resolved_name = current.name
+    if vision_context.recognized and vision_context.name:
+        resolved_name = vision_context.name
+    resolved_gender = vision_context.gender if vision_context.gender is not None else current.gender
+    resolved_age = vision_context.age if vision_context.age is not None else current.age
+    resolved_source = current.source
+    if vision_context.source and (vision_context.source != "none" or not current.source):
+        resolved_source = vision_context.source
+    resolved_confidence = current.confidence
+    if vision_context.confidence is not None:
+        resolved_confidence = vision_context.confidence
+
+    updated_profile = current.model_copy(
+        update={
+            "recognized": bool(current.recognized or vision_context.recognized),
+            "name": resolved_name,
+            "age": resolved_age,
+            "gender": resolved_gender,
+            "source": resolved_source,
+            "confidence": resolved_confidence,
+            "last_seen_at": _now_iso(),
+            "greeted_by_name": current.greeted_by_name if resolved_name == current.name else False,
+            "greeted_generic": current.greeted_generic if resolved_gender == current.gender else False,
+        }
+    )
+    return lead_state.model_copy(update={"customer_profile": updated_profile})
 
 
 def _derive_observability_session_id(payload: QueryRequest, lead_state: LeadState) -> str | None:
@@ -454,6 +491,11 @@ def _derive_observability_session_id(payload: QueryRequest, lead_state: LeadStat
         normalized = re.sub(r"[^a-z0-9_\-]", "", normalized)
         if normalized:
             return f"name:{normalized}"[:128]
+    if lead_state.customer_profile.name:
+        normalized = re.sub(r"\s+", "-", lead_state.customer_profile.name.strip().lower())
+        normalized = re.sub(r"[^a-z0-9_\-]", "", normalized)
+        if normalized:
+            return f"vision:{normalized}"[:128]
     return None
 
 
@@ -464,6 +506,9 @@ def _derive_observability_user_id(lead_state: LeadState) -> str | None:
     name = str(lead_state.name or "").strip()
     if name:
         return name[:128]
+    profile_name = str(lead_state.customer_profile.name or "").strip()
+    if profile_name:
+        return profile_name[:128]
     return None
 
 
@@ -712,9 +757,67 @@ def _has_grounded_fit(grounded_result: dict[str, Any] | None) -> bool:
 
 
 def _missing_contact_fields(lead_state: LeadState) -> tuple[bool, bool]:
-    missing_name = not bool((lead_state.name or "").strip())
+    missing_name = not bool((lead_state.name or lead_state.customer_profile.name or "").strip())
     missing_phone = not bool((lead_state.phone_contact or "").strip())
     return missing_name, missing_phone
+
+
+def _derive_customer_honorific(lead_state: LeadState) -> str | None:
+    gender = lead_state.customer_profile.gender
+    if gender == "female":
+        return "chị"
+    if gender == "male":
+        return "anh"
+    return None
+
+
+def _build_customer_greeting_prefix(
+    lead_state: LeadState,
+    recent_history: list[HistoryTurn],
+    settings: Settings,
+) -> str | None:
+    if not settings.vision_greeting_enabled:
+        return None
+    if any(str(turn.role).strip().lower() == "assistant" for turn in recent_history):
+        return None
+
+    profile = lead_state.customer_profile
+    honorific = _derive_customer_honorific(lead_state)
+    if profile.recognized and profile.name and not profile.greeted_by_name:
+        if honorific:
+            return f"Em chào {honorific} {profile.name} ạ."
+        return f"Em chào {profile.name} ạ."
+    if (not profile.recognized) and profile.gender and not profile.greeted_generic:
+        if honorific:
+            return f"Em chào {honorific} ạ."
+    return None
+
+
+def _reply_has_greeting_prefix(reply: str) -> bool:
+    lowered = str(reply or "").strip().lower()
+    return lowered.startswith("em chào") or lowered.startswith("xin chào")
+
+
+def _prepend_customer_greeting(reply: str, prefix: str | None) -> str:
+    cleaned_reply = str(reply or "").strip()
+    if not prefix:
+        return cleaned_reply
+    if not cleaned_reply:
+        return prefix
+    if _reply_has_greeting_prefix(cleaned_reply):
+        return cleaned_reply
+    return f"{prefix} {cleaned_reply}".strip()
+
+
+def _mark_customer_greeting_applied(lead_state: LeadState) -> LeadState:
+    profile = lead_state.customer_profile
+    if profile.recognized and profile.name:
+        updated_profile = profile.model_copy(update={"greeted_by_name": True})
+        return lead_state.model_copy(update={"customer_profile": updated_profile})
+    if profile.gender:
+        updated_profile = profile.model_copy(update={"greeted_generic": True})
+        return lead_state.model_copy(update={"customer_profile": updated_profile})
+    return lead_state
 
 
 def _message_requests_followup(message: str) -> bool:
@@ -1342,6 +1445,16 @@ def _build_reply_synthesis_prompt(
         "last_conversation_goal": lead_state.last_conversation_goal,
         "next_best_action": lead_state.next_best_action,
         "contact_capture_status": lead_state.contact_capture_status,
+        "customer_profile": {
+            "recognized": lead_state.customer_profile.recognized,
+            "name": lead_state.customer_profile.name,
+            "age": lead_state.customer_profile.age,
+            "gender": lead_state.customer_profile.gender,
+            "source": lead_state.customer_profile.source,
+            "confidence": lead_state.customer_profile.confidence,
+            "greeted_by_name": lead_state.customer_profile.greeted_by_name,
+            "greeted_generic": lead_state.customer_profile.greeted_generic,
+        },
     }
     grounded_snapshot = _build_grounded_snapshot(grounded_result=grounded_result, settings=settings)
     
@@ -1411,6 +1524,8 @@ def _build_reply_synthesis_prompt(
         "- ask_policy=allow_question: có thể không hỏi, hoặc hỏi tối đa 1 câu mở.\n"
         "- ask_policy=must_clarify: hỏi đúng 1 câu ngắn về question_focus sau khi đã có nhận định.\n"
         "- Nếu có câu hỏi: chỉ 1 câu, không hỏi form, không lặp mẫu câu hỏi gần đây.\n\n"
+        "- Neu customer_profile.recognized=true va customer_profile.name co gia tri, co the xung ho theo ten khach mot cach tu nhien khi mo dau neu phu hop.\n"
+        "- Neu customer_profile.recognized=false nhung customer_profile.gender la male hoac female, co the xung ho anh/chi phu hop trong cau chao.\n"
         f"user_message={json.dumps(message, ensure_ascii=False)}\n"
         f"final_route={json.dumps(final_route, ensure_ascii=False)}\n"
         f"query_type={json.dumps(query_type, ensure_ascii=False)}\n"
@@ -2248,6 +2363,7 @@ def run_project_grounded(
 def create_app(
     project_grounded_fetcher=None,
     turn_analyzer: Callable[[str, LeadState, list[HistoryTurn]], TurnAnalysis] | None = None,
+    vision_identify: Callable[..., dict[str, Any]] | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Sales Orchestrator 2 Routes", version="1.0.0")
     settings = get_settings()
@@ -2303,8 +2419,14 @@ def create_app(
         base_url=settings.retrieval_service_url,
         timeout_sec=settings.retrieval_timeout_sec,
     )
+    vision_client = VisionClient(
+        base_url=settings.vision_service_url,
+        timeout_sec=settings.vision_timeout_sec,
+    )
     if project_grounded_fetcher is None:
         project_grounded_fetcher = client.retrieve_project_grounded
+    if vision_identify is None:
+        vision_identify = vision_client.identify
 
     if turn_analyzer is None:
 
@@ -2326,6 +2448,7 @@ def create_app(
     def query(payload: QueryRequest) -> QueryResponse:
         message = payload.message.strip()
         lead_state = payload.lead_state or LeadState()
+        lead_state = _merge_customer_profile(lead_state, payload.vision_context)
         top_k = payload.top_k or settings.default_top_k
         langfuse_enabled = bool(settings.langfuse_enabled)
         session_id = _derive_observability_session_id(payload=payload, lead_state=lead_state)
@@ -2333,6 +2456,7 @@ def create_app(
         trace_metadata = {
             "service": "sales-orchestrator",
             "endpoint": "/sales/query",
+            "has_vision_context": bool(payload.vision_context),
         }
         try:
             with start_observation(
@@ -2344,6 +2468,7 @@ def create_app(
                     "top_k": top_k,
                     "force_route": payload.force_route,
                     "history_turns": len(payload.recent_history),
+                    "has_vision_context": bool(payload.vision_context),
                 },
                 metadata=trace_metadata,
             ) as request_obs:
@@ -2574,6 +2699,7 @@ def create_app(
                                 lead_state=final_state,
                             )
                         )
+                        missing_name_after, missing_phone_after = _missing_contact_fields(final_state)
                         final_state = final_state.model_copy(
                             update={
                                 "engagement_state": engagement_state_after,
@@ -2584,9 +2710,9 @@ def create_app(
                                 "next_best_action": next_best_action,
                                 "contact_capture_status": (
                                     "complete"
-                                    if final_state.name and final_state.phone_contact
+                                    if (not missing_name_after and not missing_phone_after)
                                     else "partial"
-                                    if final_state.name or final_state.phone_contact
+                                    if ((not missing_name_after) or (not missing_phone_after))
                                     else "requested"
                                     if conversation_goal == "capture_contact"
                                     else final_state.contact_capture_status
@@ -2734,6 +2860,16 @@ def create_app(
                                 }
                             )
 
+                    greeting_prefix = _build_customer_greeting_prefix(
+                        lead_state=final_state,
+                        recent_history=payload.recent_history,
+                        settings=settings,
+                    )
+                    if greeting_prefix:
+                        assistant_reply = _prepend_customer_greeting(assistant_reply, greeting_prefix)
+                        if _reply_has_greeting_prefix(assistant_reply):
+                            final_state = _mark_customer_greeting_applied(final_state)
+
                     if final_route == "project_grounded" and grounded_result is not None:
                         response = QueryResponse(
                             route="project_grounded",
@@ -2793,6 +2929,9 @@ def create_app(
                                 if extracted_phone_fallback
                                 else "none"
                             ),
+                            "vision_recognized": final_state.customer_profile.recognized,
+                            "vision_source": final_state.customer_profile.source,
+                            "vision_confidence": final_state.customer_profile.confidence,
                             "low_confidence": bool(grounded_result.get("low_confidence", False))
                             if grounded_result
                             else None,
@@ -2829,6 +2968,32 @@ def create_app(
         finally:
             if settings.langfuse_flush_at_request_end:
                 flush_observability(langfuse_enabled)
+
+    @app.post("/sales/query-with-vision", response_model=QueryResponse)
+    def query_with_vision(payload: VisionQueryRequest) -> QueryResponse:
+        resolved_vision_context = payload.vision_context
+        if settings.vision_enabled:
+            try:
+                raw_profile = vision_identify(
+                    image_base64=payload.image_base64,
+                    image_filename=payload.image_filename,
+                    image_content_type=payload.image_content_type,
+                    session_id=payload.session_id,
+                )
+                resolved_vision_context = VisionContext.model_validate(raw_profile)
+            except Exception as exc:
+                log.warning("vision identify failed for /sales/query-with-vision: %s", exc)
+
+        query_payload = QueryRequest(
+            message=payload.message,
+            lead_state=payload.lead_state,
+            vision_context=resolved_vision_context,
+            recent_history=payload.recent_history,
+            top_k=payload.top_k,
+            session_id=payload.session_id,
+            force_route=payload.force_route,
+        )
+        return query(query_payload)
 
     return app
 

@@ -75,6 +75,32 @@ services:
         max-size: "20m"
         max-file: "5"
 
+  vision-service:
+    build:
+      context: ..
+      dockerfile: vision_service/Dockerfile
+    container_name: noble_vision_service
+    env_file:
+      - ./.env.vision
+    volumes:
+      - ../face_db:/app/face_db
+    expose:
+      - "8031"
+    networks:
+      - internal_net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8031/health', timeout=5)"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
   orchestrator-service:
     build:
       context: ..
@@ -85,6 +111,7 @@ services:
     depends_on:
       - ollama
       - retrieval-service
+      - vision-service
     ports:
       - "${ORCH_BIND_IP:-127.0.0.1}:8021:8021"
     networks:
