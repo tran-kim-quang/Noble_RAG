@@ -32,6 +32,7 @@ class FakeVisionService:
             source="face_db",
             face_count=1,
             bbox=[10, 20, 90, 100],
+            face_id="known-linh",
         )
 
 
@@ -71,6 +72,7 @@ def test_vision_identify():
     assert payload["name"] == "Linh"
     assert payload["gender"] == "female"
     assert payload["source"] == "face_db"
+    assert payload["face_id"] == "known-linh"
 
 
 @pytest.mark.skipif(PY313, reason="Known TestClient/anyio instability on Python 3.13 in this environment.")

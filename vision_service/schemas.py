@@ -31,6 +31,7 @@ class VisionProfile(BaseModel):
     face_count: int = Field(default=0, ge=0)
     bbox: list[int] | None = None
     reason: str | None = None
+    face_id: str | None = None
 
 
 class HealthResponse(BaseModel):

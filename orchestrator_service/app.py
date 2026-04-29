@@ -11,9 +11,11 @@ import time
 from typing import Any, Callable
 import urllib.error
 import urllib.request
+from uuid import uuid4
 
 from fastapi import FastAPI
 from fastapi import HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
 from orchestrator_service.config import Settings
 from orchestrator_service.config import get_settings
@@ -27,11 +29,18 @@ from orchestrator_service.prompt_optimization import (
     PromptCompressor,
 )
 from orchestrator_service.retrieval_client import RetrievalClient
-from orchestrator_service.vision_client import VisionClient
+from orchestrator_service.session_store import SessionStore
 from orchestrator_service.schemas import (
     DecisionTrace,
     HistoryTurn,
     LeadState,
+    LiveTalkingQueryRequest,
+    LiveTalkingQueryResponse,
+    LiveTalkingSessionStartRequest,
+    LiveTalkingSessionStartResponse,
+    LiveTalkingSessionState,
+    LiveTalkingStopRequest,
+    LiveTalkingStopResponse,
     NeedPainpointDelta,
     NeedPainpointState,
     QueryRequest,
@@ -41,6 +50,7 @@ from orchestrator_service.schemas import (
     VisionContext,
     VisionQueryRequest,
 )
+from orchestrator_service.vision_client import VisionClient
 
 log = logging.getLogger("sales-orchestrator")
 _MODEL_HTTP_USER_AGENT = "Noble-RAG-Orchestrator/1.0"
@@ -463,6 +473,7 @@ def _merge_customer_profile(lead_state: LeadState, vision_context: VisionContext
     resolved_confidence = current.confidence
     if vision_context.confidence is not None:
         resolved_confidence = vision_context.confidence
+    resolved_face_id = vision_context.face_id or current.face_id
 
     updated_profile = current.model_copy(
         update={
@@ -475,6 +486,7 @@ def _merge_customer_profile(lead_state: LeadState, vision_context: VisionContext
             "last_seen_at": _now_iso(),
             "greeted_by_name": current.greeted_by_name if resolved_name == current.name else False,
             "greeted_generic": current.greeted_generic if resolved_gender == current.gender else False,
+            "face_id": resolved_face_id,
         }
     )
     return lead_state.model_copy(update={"customer_profile": updated_profile})
@@ -762,6 +774,12 @@ def _missing_contact_fields(lead_state: LeadState) -> tuple[bool, bool]:
     return missing_name, missing_phone
 
 
+def _slugify_identifier(value: str, fallback: str = "guest") -> str:
+    normalized = re.sub(r"\s+", "-", str(value or "").strip().lower())
+    normalized = re.sub(r"[^a-z0-9_\-]", "", normalized)
+    return normalized or fallback
+
+
 def _derive_customer_honorific(lead_state: LeadState) -> str | None:
     gender = lead_state.customer_profile.gender
     if gender == "female":
@@ -793,6 +811,18 @@ def _build_customer_greeting_prefix(
     return None
 
 
+def _build_livetalking_greeting(lead_state: LeadState) -> str:
+    profile = lead_state.customer_profile
+    honorific = _derive_customer_honorific(lead_state)
+    if profile.recognized and profile.name:
+        if honorific:
+            return f"Em chào {honorific} {profile.name} ạ."
+        return f"Em chào {profile.name} ạ."
+    if honorific:
+        return f"Em chào {honorific} ạ."
+    return "Em chào anh/chị ạ."
+
+
 def _reply_has_greeting_prefix(reply: str) -> bool:
     lowered = str(reply or "").strip().lower()
     return lowered.startswith("em chào") or lowered.startswith("xin chào")
@@ -818,6 +848,56 @@ def _mark_customer_greeting_applied(lead_state: LeadState) -> LeadState:
         updated_profile = profile.model_copy(update={"greeted_generic": True})
         return lead_state.model_copy(update={"customer_profile": updated_profile})
     return lead_state
+
+
+def _build_face_session_binding(
+    vision_context: VisionContext | None,
+    *,
+    fallback_session_id: str | None = None,
+) -> tuple[str, str]:
+    if vision_context and vision_context.recognized and vision_context.name:
+        return "known", _slugify_identifier(vision_context.name, fallback="known-customer")
+    if vision_context and vision_context.face_id:
+        return "guest", _slugify_identifier(vision_context.face_id, fallback="guest-face")
+    if fallback_session_id:
+        return "anonymous", _slugify_identifier(fallback_session_id, fallback="anonymous")
+    return "anonymous", f"anonymous-{uuid4().hex[:12]}"
+
+
+def _build_face_session_key(customer_kind: str, face_id: str) -> str:
+    return f"{customer_kind}:{face_id}"
+
+
+def _build_session_ttl_sec(customer_kind: str, settings: Settings) -> int:
+    if customer_kind == "known":
+        return max(1, settings.session_known_ttl_sec)
+    return max(1, settings.session_guest_ttl_sec)
+
+
+def _serialize_history(history: list[HistoryTurn]) -> list[dict[str, str]]:
+    return [{"role": turn.role, "message": turn.message} for turn in history]
+
+
+def _deserialize_history(raw: list[dict[str, Any]] | None) -> list[HistoryTurn]:
+    out: list[HistoryTurn] = []
+    for item in raw or []:
+        try:
+            out.append(HistoryTurn.model_validate(item))
+        except Exception:
+            continue
+    return out
+
+
+def _load_livetalking_session_record(
+    record: dict[str, Any] | None,
+) -> tuple[LeadState, list[HistoryTurn], VisionContext | None]:
+    if not isinstance(record, dict):
+        return LeadState(), [], None
+    lead_state = LeadState.model_validate(record.get("lead_state") or {})
+    recent_history = _deserialize_history(record.get("recent_history") or [])
+    raw_vision = record.get("vision_context")
+    vision_context = VisionContext.model_validate(raw_vision) if isinstance(raw_vision, dict) else None
+    return lead_state, recent_history, vision_context
 
 
 def _message_requests_followup(message: str) -> bool:
@@ -1454,6 +1534,7 @@ def _build_reply_synthesis_prompt(
             "confidence": lead_state.customer_profile.confidence,
             "greeted_by_name": lead_state.customer_profile.greeted_by_name,
             "greeted_generic": lead_state.customer_profile.greeted_generic,
+            "face_id": lead_state.customer_profile.face_id,
         },
     }
     grounded_snapshot = _build_grounded_snapshot(grounded_result=grounded_result, settings=settings)
@@ -1523,9 +1604,9 @@ def _build_reply_synthesis_prompt(
         "- ask_policy=avoid_question: kết thúc KHÔNG có dấu hỏi.\n"
         "- ask_policy=allow_question: có thể không hỏi, hoặc hỏi tối đa 1 câu mở.\n"
         "- ask_policy=must_clarify: hỏi đúng 1 câu ngắn về question_focus sau khi đã có nhận định.\n"
-        "- Nếu có câu hỏi: chỉ 1 câu, không hỏi form, không lặp mẫu câu hỏi gần đây.\n\n"
-        "- Neu customer_profile.recognized=true va customer_profile.name co gia tri, co the xung ho theo ten khach mot cach tu nhien khi mo dau neu phu hop.\n"
-        "- Neu customer_profile.recognized=false nhung customer_profile.gender la male hoac female, co the xung ho anh/chi phu hop trong cau chao.\n"
+        "- Nếu có câu hỏi: chỉ 1 câu, không hỏi form, không lặp mẫu câu hỏi gần đây.\n"
+        "- Nếu customer_profile.recognized=true và có customer_profile.name, có thể xưng hô tự nhiên với tên khách hàng khi chào hỏi.\n"
+        "- Nếu customer_profile.recognized=false nhưng customer_profile.gender đã biết, có thể dùng anh/chị cho lời chào mở đầu.\n\n"
         f"user_message={json.dumps(message, ensure_ascii=False)}\n"
         f"final_route={json.dumps(final_route, ensure_ascii=False)}\n"
         f"query_type={json.dumps(query_type, ensure_ascii=False)}\n"
@@ -2363,10 +2444,20 @@ def run_project_grounded(
 def create_app(
     project_grounded_fetcher=None,
     turn_analyzer: Callable[[str, LeadState, list[HistoryTurn]], TurnAnalysis] | None = None,
-    vision_identify: Callable[..., dict[str, Any]] | None = None,
+    vision_identify=None,
+    session_store: SessionStore | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Sales Orchestrator 2 Routes", version="1.0.0")
     settings = get_settings()
+
+    if settings.cors_allow_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(settings.cors_allow_origins),
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
 
     if not logging.getLogger().handlers:
         logging.basicConfig(
@@ -2426,7 +2517,10 @@ def create_app(
     if project_grounded_fetcher is None:
         project_grounded_fetcher = client.retrieve_project_grounded
     if vision_identify is None:
-        vision_identify = vision_client.identify
+        if settings.vision_enabled:
+            vision_identify = vision_client.identify
+    if session_store is None:
+        session_store = SessionStore(settings.redis_url, settings.redis_namespace)
 
     if turn_analyzer is None:
 
@@ -2444,11 +2538,117 @@ def create_app(
     def health() -> dict[str, str]:
         return {"status": "ok", "service": "sales-orchestrator-2-routes"}
 
+    def _identify_vision_context(
+        *,
+        image_base64: str,
+        image_filename: str | None,
+        image_content_type: str | None,
+        trace_id: str | None = None,
+        session_id: str | None = None,
+        user_id: str | None = None,
+    ) -> VisionContext | None:
+        if not settings.vision_enabled or vision_identify is None:
+            return None
+        if not str(image_base64 or "").strip():
+            return None
+        try:
+            payload = vision_identify(
+                image_base64=image_base64,
+                image_filename=image_filename,
+                image_content_type=image_content_type,
+                trace_id=trace_id,
+                session_id=session_id,
+                user_id=user_id,
+            )
+            return VisionContext.model_validate(payload)
+        except Exception as exc:
+            log.warning("vision identify failed: %s", exc)
+            return VisionContext(
+                recognized=False,
+                confidence=0.0,
+                source="error",
+                face_count=0,
+                reason=str(exc)[:200],
+            )
+
+    def _build_session_record(
+        *,
+        session_id: str,
+        face_session_key: str,
+        customer_kind: str,
+        ttl_sec: int,
+        lead_state: LeadState,
+        recent_history: list[HistoryTurn],
+        vision_context: VisionContext | None,
+    ) -> dict[str, Any]:
+        return {
+            "session_id": session_id,
+            "face_session_key": face_session_key,
+            "customer_kind": customer_kind,
+            "ttl_sec": ttl_sec,
+            "lead_state": lead_state.model_dump(mode="json"),
+            "recent_history": _serialize_history(recent_history),
+            "vision_context": vision_context.model_dump(mode="json") if vision_context is not None else None,
+            "updated_at": _now_iso(),
+        }
+
+    def _resolve_livetalking_session(
+        *,
+        image_base64: str,
+        image_filename: str | None,
+        image_content_type: str | None,
+        requested_session_id: str | None,
+        trace_id: str | None = None,
+        user_id: str | None = None,
+    ) -> tuple[LiveTalkingSessionState, LeadState, list[HistoryTurn], VisionContext | None]:
+        vision_context = _identify_vision_context(
+            image_base64=image_base64,
+            image_filename=image_filename,
+            image_content_type=image_content_type,
+            trace_id=trace_id,
+            session_id=requested_session_id,
+            user_id=user_id,
+        )
+        customer_kind, face_identifier = _build_face_session_binding(
+            vision_context,
+            fallback_session_id=requested_session_id,
+        )
+        face_session_key = _build_face_session_key(customer_kind, face_identifier)
+        ttl_sec = _build_session_ttl_sec(customer_kind, settings)
+        record = session_store.load_by_face_key(face_session_key)
+        if record is None and customer_kind == "anonymous" and requested_session_id:
+            record = session_store.load_by_session_id(requested_session_id)
+        if record is not None:
+            lead_state, recent_history, stored_vision_context = _load_livetalking_session_record(record)
+            effective_vision_context = vision_context or stored_vision_context
+            lead_state = _merge_customer_profile(lead_state, effective_vision_context)
+            session = LiveTalkingSessionState(
+                session_id=str(record.get("session_id", requested_session_id or "")) or requested_session_id or uuid4().hex,
+                face_session_key=str(record.get("face_session_key", face_session_key)) or face_session_key,
+                customer_kind=str(record.get("customer_kind", customer_kind)) or customer_kind,
+                ttl_sec=max(1, int(record.get("ttl_sec", ttl_sec) or ttl_sec)),
+                resumed=True,
+                should_greet=False,
+                greeting=None,
+            )
+            return session, lead_state, recent_history, effective_vision_context
+
+        base_state = _merge_customer_profile(LeadState(), vision_context)
+        session = LiveTalkingSessionState(
+            session_id=str(requested_session_id or uuid4().hex),
+            face_session_key=face_session_key,
+            customer_kind=customer_kind,
+            ttl_sec=ttl_sec,
+            resumed=False,
+            should_greet=settings.vision_greeting_enabled,
+            greeting=_build_livetalking_greeting(base_state) if settings.vision_greeting_enabled else None,
+        )
+        return session, base_state, [], vision_context
+
     @app.post("/sales/query", response_model=QueryResponse)
     def query(payload: QueryRequest) -> QueryResponse:
         message = payload.message.strip()
-        lead_state = payload.lead_state or LeadState()
-        lead_state = _merge_customer_profile(lead_state, payload.vision_context)
+        lead_state = _merge_customer_profile(payload.lead_state or LeadState(), payload.vision_context)
         top_k = payload.top_k or settings.default_top_k
         langfuse_enabled = bool(settings.langfuse_enabled)
         session_id = _derive_observability_session_id(payload=payload, lead_state=lead_state)
@@ -2456,7 +2656,6 @@ def create_app(
         trace_metadata = {
             "service": "sales-orchestrator",
             "endpoint": "/sales/query",
-            "has_vision_context": bool(payload.vision_context),
         }
         try:
             with start_observation(
@@ -2468,7 +2667,6 @@ def create_app(
                     "top_k": top_k,
                     "force_route": payload.force_route,
                     "history_turns": len(payload.recent_history),
-                    "has_vision_context": bool(payload.vision_context),
                 },
                 metadata=trace_metadata,
             ) as request_obs:
@@ -2699,7 +2897,6 @@ def create_app(
                                 lead_state=final_state,
                             )
                         )
-                        missing_name_after, missing_phone_after = _missing_contact_fields(final_state)
                         final_state = final_state.model_copy(
                             update={
                                 "engagement_state": engagement_state_after,
@@ -2710,9 +2907,11 @@ def create_app(
                                 "next_best_action": next_best_action,
                                 "contact_capture_status": (
                                     "complete"
-                                    if (not missing_name_after and not missing_phone_after)
+                                    if bool((final_state.name or final_state.customer_profile.name or "").strip())
+                                    and final_state.phone_contact
                                     else "partial"
-                                    if ((not missing_name_after) or (not missing_phone_after))
+                                    if bool((final_state.name or final_state.customer_profile.name or "").strip())
+                                    or final_state.phone_contact
                                     else "requested"
                                     if conversation_goal == "capture_contact"
                                     else final_state.contact_capture_status
@@ -2861,14 +3060,13 @@ def create_app(
                             )
 
                     greeting_prefix = _build_customer_greeting_prefix(
-                        lead_state=final_state,
-                        recent_history=payload.recent_history,
-                        settings=settings,
+                        final_state,
+                        payload.recent_history,
+                        settings,
                     )
-                    if greeting_prefix:
-                        assistant_reply = _prepend_customer_greeting(assistant_reply, greeting_prefix)
-                        if _reply_has_greeting_prefix(assistant_reply):
-                            final_state = _mark_customer_greeting_applied(final_state)
+                    assistant_reply = _prepend_customer_greeting(assistant_reply, greeting_prefix)
+                    if greeting_prefix and _reply_has_greeting_prefix(assistant_reply):
+                        final_state = _mark_customer_greeting_applied(final_state)
 
                     if final_route == "project_grounded" and grounded_result is not None:
                         response = QueryResponse(
@@ -2929,9 +3127,6 @@ def create_app(
                                 if extracted_phone_fallback
                                 else "none"
                             ),
-                            "vision_recognized": final_state.customer_profile.recognized,
-                            "vision_source": final_state.customer_profile.source,
-                            "vision_confidence": final_state.customer_profile.confidence,
                             "low_confidence": bool(grounded_result.get("low_confidence", False))
                             if grounded_result
                             else None,
@@ -2971,29 +3166,119 @@ def create_app(
 
     @app.post("/sales/query-with-vision", response_model=QueryResponse)
     def query_with_vision(payload: VisionQueryRequest) -> QueryResponse:
-        resolved_vision_context = payload.vision_context
-        if settings.vision_enabled:
-            try:
-                raw_profile = vision_identify(
-                    image_base64=payload.image_base64,
-                    image_filename=payload.image_filename,
-                    image_content_type=payload.image_content_type,
-                    session_id=payload.session_id,
-                )
-                resolved_vision_context = VisionContext.model_validate(raw_profile)
-            except Exception as exc:
-                log.warning("vision identify failed for /sales/query-with-vision: %s", exc)
-
+        vision_context = _identify_vision_context(
+            image_base64=payload.image_base64,
+            image_filename=payload.image_filename,
+            image_content_type=payload.image_content_type,
+            session_id=payload.session_id,
+        )
         query_payload = QueryRequest(
             message=payload.message,
             lead_state=payload.lead_state,
-            vision_context=resolved_vision_context,
+            vision_context=vision_context,
             recent_history=payload.recent_history,
             top_k=payload.top_k,
             session_id=payload.session_id,
             force_route=payload.force_route,
         )
         return query(query_payload)
+
+    @app.post("/integrations/livetalking/start", response_model=LiveTalkingSessionStartResponse)
+    def livetalking_start(payload: LiveTalkingSessionStartRequest) -> LiveTalkingSessionStartResponse:
+        session, stored_state, recent_history, vision_context = _resolve_livetalking_session(
+            image_base64=payload.image_base64,
+            image_filename=payload.image_filename,
+            image_content_type=payload.image_content_type,
+            requested_session_id=payload.session_id,
+            user_id=_derive_observability_user_id(payload.lead_state or LeadState()),
+        )
+        lead_state = payload.lead_state or stored_state
+        if recent_history:
+            lead_state = stored_state
+        lead_state = _merge_customer_profile(lead_state, vision_context)
+
+        history_to_store = list(recent_history)
+        if session.should_greet and session.greeting:
+            history_to_store.append(HistoryTurn(role="assistant", message=session.greeting))
+            lead_state = _mark_customer_greeting_applied(lead_state)
+
+        session_store.save(
+            _build_session_record(
+                session_id=session.session_id,
+                face_session_key=session.face_session_key,
+                customer_kind=session.customer_kind,
+                ttl_sec=session.ttl_sec,
+                lead_state=lead_state,
+                recent_history=history_to_store,
+                vision_context=vision_context,
+            ),
+            session.ttl_sec,
+        )
+        return LiveTalkingSessionStartResponse(
+            session=session,
+            lead_state=lead_state,
+            vision_context=vision_context,
+        )
+
+    @app.post("/integrations/livetalking/query", response_model=LiveTalkingQueryResponse)
+    def livetalking_query(payload: LiveTalkingQueryRequest) -> LiveTalkingQueryResponse:
+        session, stored_state, recent_history, vision_context = _resolve_livetalking_session(
+            image_base64=payload.image_base64,
+            image_filename=payload.image_filename,
+            image_content_type=payload.image_content_type,
+            requested_session_id=payload.session_id,
+            user_id=_derive_observability_user_id(payload.lead_state or LeadState()),
+        )
+        lead_state = payload.lead_state or stored_state
+        if recent_history:
+            lead_state = stored_state
+        lead_state = _merge_customer_profile(lead_state, vision_context)
+
+        query_payload = QueryRequest(
+            message=payload.message,
+            lead_state=lead_state,
+            vision_context=vision_context,
+            recent_history=recent_history,
+            top_k=payload.top_k,
+            session_id=session.session_id,
+            force_route=payload.force_route,
+        )
+        query_response = query(query_payload)
+
+        updated_history = [
+            *recent_history,
+            HistoryTurn(role="user", message=payload.message.strip()),
+            HistoryTurn(role="assistant", message=query_response.assistant_reply),
+        ]
+        session_store.save(
+            _build_session_record(
+                session_id=session.session_id,
+                face_session_key=session.face_session_key,
+                customer_kind=session.customer_kind,
+                ttl_sec=session.ttl_sec,
+                lead_state=query_response.lead_state,
+                recent_history=updated_history,
+                vision_context=vision_context,
+            ),
+            session.ttl_sec,
+        )
+        return LiveTalkingQueryResponse(
+            **query_response.model_dump(),
+            session=session,
+            vision_context=vision_context,
+        )
+
+    @app.post("/integrations/livetalking/stop", response_model=LiveTalkingStopResponse)
+    def livetalking_stop(payload: LiveTalkingStopRequest) -> LiveTalkingStopResponse:
+        deleted = session_store.delete(
+            session_id=payload.session_id,
+            face_session_key=payload.face_session_key,
+        )
+        return LiveTalkingStopResponse(
+            stopped=deleted is not None,
+            session_id=deleted.session_key if deleted is not None else payload.session_id,
+            face_session_key=deleted.face_key if deleted is not None else payload.face_session_key,
+        )
 
     return app
 

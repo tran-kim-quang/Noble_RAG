@@ -15,6 +15,11 @@ def _env_text(name: str) -> str:
     return os.getenv(name, "").strip()
 
 
+def _env_csv(name: str, default: str = "") -> tuple[str, ...]:
+    raw = _env_text(name) or default
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
 def _env_first(*names: str, default: str = "") -> str:
     for name in names:
         value = _env_text(name)
@@ -89,12 +94,20 @@ def _synthesis_model() -> str:
 
 @dataclass(frozen=True)
 class Settings:
-    retrieval_service_url: str = os.getenv("RETRIEVAL_SERVICE_URL", "http://127.0.0.1:8011")
+    retrieval_service_url: str = os.getenv("RETRIEVAL_SERVICE_URL", "http://127.0.0.1:8111")
     retrieval_timeout_sec: float = float(os.getenv("RETRIEVAL_TIMEOUT_SEC", "15"))
     vision_enabled: bool = _env_bool("VISION_ENABLED", "true")
     vision_service_url: str = os.getenv("VISION_SERVICE_URL", "http://127.0.0.1:8031").strip()
     vision_timeout_sec: float = float(os.getenv("VISION_TIMEOUT_SEC", "12"))
     vision_greeting_enabled: bool = _env_bool("VISION_GREETING_ENABLED", "true")
+    redis_url: str = os.getenv("REDIS_URL", "").strip()
+    redis_namespace: str = os.getenv("REDIS_NAMESPACE", "noble_rag").strip() or "noble_rag"
+    session_known_ttl_sec: int = int(os.getenv("SESSION_KNOWN_TTL_SEC", "3600"))
+    session_guest_ttl_sec: int = int(os.getenv("SESSION_GUEST_TTL_SEC", "300"))
+    cors_allow_origins: tuple[str, ...] = _env_csv(
+        "ORCHESTRATOR_CORS_ALLOW_ORIGINS",
+        default="http://127.0.0.1:8011,http://localhost:8011",
+    )
     default_top_k: int = int(os.getenv("ORCHESTRATOR_DEFAULT_TOP_K", "5"))
     decider_enabled: bool = _env_bool("ORCHESTRATOR_DECIDER_ENABLED", "true" if _use_llm_decider_alias() else "false")
     decider_api_format: str = _decider_api_format()

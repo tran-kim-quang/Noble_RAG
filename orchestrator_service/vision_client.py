@@ -62,14 +62,8 @@ class VisionClient:
             return json.loads(raw)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(
-                f"vision HTTP {exc.code}: {body[:200]}"
-            ) from exc
+            raise RuntimeError(f"vision HTTP {exc.code}: {body[:200]}") from exc
         except urllib.error.URLError as exc:
-            raise RuntimeError(
-                f"vision unreachable: {exc.reason}"
-            ) from exc
+            raise RuntimeError(f"vision unreachable: {exc.reason}") from exc
         except socket.timeout as exc:
-            raise RuntimeError(
-                f"vision timeout after {self.timeout_sec}s"
-            ) from exc
+            raise RuntimeError(f"vision timeout after {self.timeout_sec}s") from exc

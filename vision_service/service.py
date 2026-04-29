@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import logging
-import os
 import re
 import socket
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -42,6 +43,7 @@ class VisionService:
         self.app.prepare(ctx_id=ctx_id, det_size=(settings.det_size, settings.det_size))
         self.people: dict[str, Any] = {}
         self.image_count: dict[str, int] = {}
+        self.temp_faces: dict[str, dict[str, Any]] = {}
         self.load()
 
     def load(self) -> None:
@@ -53,9 +55,7 @@ class VisionService:
 
         for person_dir in sorted(p for p in self.face_db_dir.iterdir() if p.is_dir()):
             embeddings = []
-            image_paths = [
-                p for p in person_dir.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS
-            ]
+            image_paths = [p for p in person_dir.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
             for image_path in image_paths:
                 img = self.cv2.imread(str(image_path))
                 if img is None:
@@ -81,6 +81,7 @@ class VisionService:
         log.info("loaded people_count=%s face_db=%s", len(self.people), self.face_db_dir)
 
     def health(self) -> dict[str, Any]:
+        self._purge_expired_temp_faces()
         return {"status": "ok", "people_count": len(self.people)}
 
     def identify_base64(
@@ -106,7 +107,8 @@ class VisionService:
             )
 
         face = self._largest_face(faces)
-        match_name, score = self._match_embedding(face.normed_embedding)
+        embedding = face.normed_embedding
+        match_name, score = self._match_embedding(embedding)
         age = self._extract_age(face)
         gender = self._extract_gender(face)
         bbox = [int(x) for x in face.bbox]
@@ -121,7 +123,10 @@ class VisionService:
                 source="face_db",
                 face_count=len(faces),
                 bbox=bbox,
+                face_id=self._known_face_id(match_name),
             )
+
+        temp_face_id, temp_score = self._get_or_create_temp_face_id(embedding, age=age, gender=gender)
 
         if gender is not None:
             return VisionProfile(
@@ -129,25 +134,28 @@ class VisionService:
                 name=None,
                 age=age,
                 gender=gender,
-                confidence=max(0.0, score),
+                confidence=max(0.0, temp_score, score),
                 source="local_face_analysis",
                 face_count=len(faces),
                 bbox=bbox,
                 reason="unknown_face_local_gender_only",
+                face_id=temp_face_id,
             )
 
         vlm_gender = self._infer_gender_with_vlm(image_bytes)
         if vlm_gender is not None:
+            self._update_temp_face(temp_face_id, age=age, gender=vlm_gender)
             return VisionProfile(
                 recognized=False,
                 name=None,
                 age=age,
                 gender=vlm_gender,
-                confidence=max(0.0, score),
+                confidence=max(0.0, temp_score, score),
                 source="vlm",
                 face_count=len(faces),
                 bbox=bbox,
                 reason="unknown_face_vlm_gender",
+                face_id=temp_face_id,
             )
 
         return VisionProfile(
@@ -155,11 +163,12 @@ class VisionService:
             name=None,
             age=age,
             gender=None,
-            confidence=max(0.0, score),
+            confidence=max(0.0, temp_score, score),
             source="none",
             face_count=len(faces),
             bbox=bbox,
             reason="unknown_face_no_gender",
+            face_id=temp_face_id,
         )
 
     def _match_embedding(self, embedding: Any) -> tuple[str | None, float]:
@@ -174,6 +183,84 @@ class VisionService:
                 best_name = name
                 best_score = score
         return best_name, best_score
+
+    def _match_temp_embedding(self, embedding: Any) -> tuple[str | None, float]:
+        self._purge_expired_temp_faces()
+        best_id = None
+        best_score = -1.0
+        for temp_id, payload in self.temp_faces.items():
+            known_embedding = payload.get("embedding")
+            if known_embedding is None:
+                continue
+            score = float(self.np.dot(embedding, known_embedding))
+            if score > best_score:
+                best_id = temp_id
+                best_score = score
+        return best_id, best_score
+
+    def _get_or_create_temp_face_id(self, embedding: Any, age: int | None, gender: str | None) -> tuple[str, float]:
+        temp_face_id, score = self._match_temp_embedding(embedding)
+        if temp_face_id and score >= self.settings.temp_face_match_threshold:
+            self._touch_temp_face(temp_face_id, embedding=embedding, age=age, gender=gender)
+            return temp_face_id, score
+
+        digest = hashlib.sha1(self.np.asarray(embedding).astype(self.np.float32).tobytes()).hexdigest()[:16]
+        temp_face_id = f"guest-{digest}"
+        self.temp_faces[temp_face_id] = {
+            "embedding": self._normalize_embedding(embedding),
+            "age": age,
+            "gender": gender,
+            "expires_at": time.time() + max(1, self.settings.temp_face_ttl_sec),
+        }
+        return temp_face_id, max(0.0, score)
+
+    def _touch_temp_face(
+        self,
+        temp_face_id: str,
+        *,
+        embedding: Any,
+        age: int | None,
+        gender: str | None,
+    ) -> None:
+        payload = self.temp_faces.get(temp_face_id)
+        if payload is None:
+            payload = {}
+            self.temp_faces[temp_face_id] = payload
+        payload["embedding"] = self._normalize_embedding(embedding)
+        if age is not None:
+            payload["age"] = age
+        if gender is not None:
+            payload["gender"] = gender
+        payload["expires_at"] = time.time() + max(1, self.settings.temp_face_ttl_sec)
+
+    def _update_temp_face(self, temp_face_id: str, age: int | None, gender: str | None) -> None:
+        payload = self.temp_faces.get(temp_face_id)
+        if payload is None:
+            return
+        if age is not None:
+            payload["age"] = age
+        if gender is not None:
+            payload["gender"] = gender
+        payload["expires_at"] = time.time() + max(1, self.settings.temp_face_ttl_sec)
+
+    def _purge_expired_temp_faces(self) -> None:
+        now = time.time()
+        expired = [face_id for face_id, payload in self.temp_faces.items() if float(payload.get("expires_at", 0)) <= now]
+        for face_id in expired:
+            self.temp_faces.pop(face_id, None)
+
+    def _normalize_embedding(self, embedding: Any):
+        normalized = self.np.asarray(embedding).astype(self.np.float32)
+        denom = self.np.linalg.norm(normalized)
+        if denom == 0:
+            return normalized
+        return normalized / denom
+
+    @staticmethod
+    def _known_face_id(name: str) -> str:
+        normalized = re.sub(r"\s+", "-", str(name or "").strip().lower())
+        normalized = re.sub(r"[^a-z0-9_\-]", "", normalized)
+        return normalized or "known-customer"
 
     @staticmethod
     def _largest_face(faces):
@@ -301,7 +388,7 @@ class VisionService:
         except socket.timeout:
             log.warning("vlm timeout after %ss", self.settings.vlm_timeout_sec)
             return None
-        except Exception as exc:  # pragma: no cover - defensive
+        except Exception as exc:  # pragma: no cover
             log.warning("vlm request failed error=%s", exc)
             return None
 

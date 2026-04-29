@@ -13,6 +13,7 @@ from orchestrator_service.app import TurnAnalysis
 from orchestrator_service.app import create_app
 from orchestrator_service.schemas import NeedPainpointDelta
 from orchestrator_service.schemas import RoutingSignal
+from orchestrator_service.session_store import SessionStore
 
 
 def fake_turn_analyzer(message: str, lead_state, recent_history):
@@ -59,6 +60,7 @@ def test_query_with_vision_greets_recognized_customer(monkeypatch):
             "face_count": 1,
             "bbox": [10, 10, 100, 100],
             "reason": None,
+            "face_id": "known-linh",
         }
 
     client = TestClient(create_app(turn_analyzer=fake_turn_analyzer, vision_identify=fake_vision_identify))
@@ -96,6 +98,7 @@ def test_query_with_vision_generic_greeting_for_unknown_customer(monkeypatch):
             "face_count": 1,
             "bbox": [10, 10, 100, 100],
             "reason": "unknown_face_vlm_gender",
+            "face_id": "guest-abc",
         }
 
     client = TestClient(create_app(turn_analyzer=fake_turn_analyzer, vision_identify=fake_vision_identify))
@@ -140,3 +143,70 @@ def test_query_with_vision_falls_back_when_vision_errors(monkeypatch):
     assert payload["lead_state"]["customer_profile"]["recognized"] is False
     assert payload["lead_state"]["customer_profile"]["name"] is None
     assert payload["assistant_reply"] == "Em dang ho tro tu van."
+
+
+@pytest.mark.skipif(PY313, reason="Known TestClient/anyio instability on Python 3.13 in this environment.")
+def test_livetalking_session_start_resume_and_stop(monkeypatch):
+    monkeypatch.setenv("ORCHESTRATOR_MODEL_WARMUP_ENABLED", "false")
+    monkeypatch.setattr(app_module, "synthesize_assistant_reply", fake_synthesize_assistant_reply)
+
+    def fake_vision_identify(**kwargs):
+        _ = kwargs
+        return {
+            "recognized": True,
+            "name": "Linh",
+            "age": 31,
+            "gender": "female",
+            "confidence": 0.93,
+            "source": "face_db",
+            "face_count": 1,
+            "bbox": [10, 10, 100, 100],
+            "reason": None,
+            "face_id": "known-linh",
+        }
+
+    store = SessionStore("")
+    client = TestClient(
+        create_app(
+            turn_analyzer=fake_turn_analyzer,
+            vision_identify=fake_vision_identify,
+            session_store=store,
+        )
+    )
+
+    start_res = client.post("/integrations/livetalking/start", json={"image_base64": "ZmFrZQ=="})
+    assert start_res.status_code == 200
+    start_payload = start_res.json()
+    assert start_payload["session"]["resumed"] is False
+    assert start_payload["session"]["should_greet"] is True
+    assert "Linh" in start_payload["session"]["greeting"]
+
+    session_id = start_payload["session"]["session_id"]
+    restart_res = client.post(
+        "/integrations/livetalking/start",
+        json={"image_base64": "ZmFrZQ==", "session_id": session_id},
+    )
+    assert restart_res.status_code == 200
+    restart_payload = restart_res.json()
+    assert restart_payload["session"]["resumed"] is True
+    assert restart_payload["session"]["should_greet"] is False
+
+    query_res = client.post(
+        "/integrations/livetalking/query",
+        json={
+            "session_id": session_id,
+            "message": "Cho toi thong tin tong quan",
+            "image_base64": "ZmFrZQ==",
+            "force_route": "consult_discovery",
+        },
+    )
+    assert query_res.status_code == 200
+    query_payload = query_res.json()
+    assert query_payload["session"]["session_id"] == session_id
+    assert query_payload["assistant_reply"] == "Em dang ho tro tu van."
+
+    stop_res = client.post("/integrations/livetalking/stop", json={"session_id": session_id})
+    assert stop_res.status_code == 200
+    stop_payload = stop_res.json()
+    assert stop_payload["stopped"] is True
+    assert stop_payload["session_id"] == session_id

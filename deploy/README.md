@@ -4,12 +4,12 @@
 - `orchestrator-service`: public on host (`127.0.0.1:8021` by default).
 - `retrieval-service`: internal-only (Docker network, no host port publish).
 - `vision-service`: internal-only (Docker network, no host port publish).
+- `redis`: internal-only session store for known/guest face sessions.
 - `qdrant`: internal-only (Docker network, no host port publish).
 - Qdrant data persisted at `deploy/volumes/qdrant`.
 - Runtime config:
   - `deploy/.env.retrieval`
   - `deploy/.env.orchestrator`
-  - `deploy/.env.vision`
 
 ## 2) Files
 - `deploy/docker-compose.yml`
@@ -39,7 +39,6 @@ fi
 # optional: tune config
 vi deploy/.env.retrieval
 vi deploy/.env.orchestrator
-vi deploy/.env.vision
 
 # if using local Ollama on host machine
 # set in deploy/.env.retrieval:
@@ -69,12 +68,10 @@ $COMPOSE -f deploy/docker-compose.yml up -d
 # tail logs
 ./deploy/scripts/logs.sh orchestrator-service 200
 ./deploy/scripts/logs.sh retrieval-service 200
-./deploy/scripts/logs.sh vision-service 200
 ./deploy/scripts/logs.sh qdrant 200
 
 # restart one service
 $COMPOSE -f deploy/docker-compose.yml restart retrieval-service
-$COMPOSE -f deploy/docker-compose.yml restart vision-service
 $COMPOSE -f deploy/docker-compose.yml restart orchestrator-service
 
 # restart all
@@ -102,12 +99,6 @@ $COMPOSE -f deploy/docker-compose.yml exec -T retrieval-service sh -lc \
 curl -fsS -X POST http://127.0.0.1:8021/sales/query \
   -H "Content-Type: application/json" \
   -d '{"message":"Giá căn 2 phòng ngủ là bao nhiêu?", "need_retrieval": true}' | python3 -m json.tool
-```
-
-```bash
-curl -fsS -X POST http://127.0.0.1:8021/sales/query-with-vision \
-  -H "Content-Type: application/json" \
-  -d '{"message":"Tu van tong quan cho toi", "image_base64":"<base64-or-data-url>"}' | python3 -m json.tool
 ```
 
 ## 6) Security defaults
@@ -150,7 +141,4 @@ uvicorn retrieval_service.app:app --host 0.0.0.0 --port 8011
 
 # terminal 2
 uvicorn orchestrator_service.app:app --host 0.0.0.0 --port 8021
-
-# terminal 3
-uvicorn vision_service.app:app --host 0.0.0.0 --port 8031
 ```

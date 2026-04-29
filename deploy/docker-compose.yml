@@ -45,6 +45,21 @@ services:
         max-size: "20m"
         max-file: "5"
 
+  redis:
+    image: redis:7-alpine
+    container_name: noble_redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    expose:
+      - "6379"
+    networks:
+      - internal_net
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
   retrieval-service:
     build:
       context: ..
@@ -112,6 +127,7 @@ services:
       - ollama
       - retrieval-service
       - vision-service
+      - redis
     ports:
       - "${ORCH_BIND_IP:-127.0.0.1}:8021:8021"
     networks:

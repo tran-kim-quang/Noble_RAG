@@ -42,6 +42,7 @@ class VisionContext(BaseModel):
     face_count: int = Field(default=0, ge=0)
     bbox: list[int] | None = None
     reason: str | None = None
+    face_id: str | None = None
 
 
 class CustomerProfileState(BaseModel):
@@ -54,6 +55,7 @@ class CustomerProfileState(BaseModel):
     last_seen_at: str | None = None
     greeted_by_name: bool = False
     greeted_generic: bool = False
+    face_id: str | None = None
 
 
 class LeadState(BaseModel):
@@ -284,3 +286,55 @@ class VisionQueryRequest(QueryRequest):
         if not cleaned:
             raise ValueError("image_base64 must not be blank")
         return cleaned
+
+
+class LiveTalkingSessionStartRequest(BaseModel):
+    image_base64: str = Field(min_length=1)
+    image_filename: str | None = None
+    image_content_type: str | None = None
+    session_id: str | None = Field(default=None, min_length=1, max_length=128)
+    lead_state: LeadState | None = None
+
+    @field_validator("image_base64")
+    @classmethod
+    def validate_start_image_base64_not_blank(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("image_base64 must not be blank")
+        return cleaned
+
+
+class LiveTalkingQueryRequest(VisionQueryRequest):
+    pass
+
+
+class LiveTalkingStopRequest(BaseModel):
+    session_id: str | None = Field(default=None, min_length=1, max_length=128)
+    face_session_key: str | None = None
+
+
+class LiveTalkingSessionState(BaseModel):
+    session_id: str
+    face_session_key: str
+    customer_kind: Literal["known", "guest", "anonymous"]
+    ttl_sec: int = Field(ge=1)
+    resumed: bool = False
+    should_greet: bool = False
+    greeting: str | None = None
+
+
+class LiveTalkingSessionStartResponse(BaseModel):
+    session: LiveTalkingSessionState
+    lead_state: LeadState
+    vision_context: VisionContext | None = None
+
+
+class LiveTalkingQueryResponse(QueryResponse):
+    session: LiveTalkingSessionState
+    vision_context: VisionContext | None = None
+
+
+class LiveTalkingStopResponse(BaseModel):
+    stopped: bool
+    session_id: str | None = None
+    face_session_key: str | None = None
