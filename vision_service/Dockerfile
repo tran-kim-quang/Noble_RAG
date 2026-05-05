@@ -10,7 +10,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY vision_service/requirements.txt /app/vision_requirements.txt
-RUN pip install --no-cache-dir -r /app/vision_requirements.txt
+RUN pip install --no-cache-dir --default-timeout=600 --retries=10 -r /app/vision_requirements.txt
 
 COPY vision_service /app/vision_service
 

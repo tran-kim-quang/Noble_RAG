@@ -26,10 +26,10 @@ class Settings:
     model_name: str = os.getenv("VISION_MODEL_NAME", "buffalo_l").strip()
     match_threshold: float = float(os.getenv("VISION_MATCH_THRESHOLD", "0.45"))
     det_size: int = int(os.getenv("VISION_DET_SIZE", "640"))
-    use_gpu: bool = _env_bool("VISION_USE_GPU", "false")
+    use_gpu: bool = _env_bool("VISION_USE_GPU", "true")
 
     vlm_enabled: bool = _env_bool("VISION_VLM_ENABLED", "false")
-    vlm_api_format: str = os.getenv("VISION_VLM_API_FORMAT", "openai").strip().lower()
+    vlm_api_format: str = os.getenv("VISION_VLM_API_FORMAT", "ollama").strip().lower()
     vlm_api_url: str = os.getenv("VISION_VLM_API_URL", "").strip()
     vlm_api_key: str = os.getenv("VISION_VLM_API_KEY", "").strip()
     vlm_api_key_header: str = os.getenv("VISION_VLM_API_KEY_HEADER", "Authorization").strip()

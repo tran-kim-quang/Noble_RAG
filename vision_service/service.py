@@ -3,15 +3,14 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
-import json
 import logging
 import re
-import socket
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any
+
+from pydantic import BaseModel
+from pydantic import ValidationError
 
 from vision_service.config import Settings
 from vision_service.schemas import VisionProfile
@@ -19,6 +18,11 @@ from vision_service.schemas import VisionProfile
 log = logging.getLogger("vision-service")
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+class PersonalInference(BaseModel):
+    gender: str
+    age: str
 
 
 class VisionService:
@@ -44,6 +48,7 @@ class VisionService:
         self.people: dict[str, Any] = {}
         self.image_count: dict[str, int] = {}
         self.temp_faces: dict[str, dict[str, Any]] = {}
+        self._vlm_client = None
         self.load()
 
     def load(self) -> None:
@@ -128,7 +133,7 @@ class VisionService:
 
         temp_face_id, temp_score = self._get_or_create_temp_face_id(embedding, age=age, gender=gender)
 
-        if gender is not None:
+        if gender is not None and age is not None:
             return VisionProfile(
                 recognized=False,
                 name=None,
@@ -142,19 +147,21 @@ class VisionService:
                 face_id=temp_face_id,
             )
 
-        vlm_gender = self._infer_gender_with_vlm(image_bytes)
-        if vlm_gender is not None:
-            self._update_temp_face(temp_face_id, age=age, gender=vlm_gender)
+        vlm_age, vlm_gender = self._infer_personal_with_vlm(image_bytes)
+        merged_age = age or vlm_age
+        merged_gender = gender or vlm_gender
+        if merged_age is not None or merged_gender is not None:
+            self._update_temp_face(temp_face_id, age=merged_age, gender=merged_gender)
             return VisionProfile(
                 recognized=False,
                 name=None,
-                age=age,
-                gender=vlm_gender,
+                age=merged_age,
+                gender=merged_gender,
                 confidence=max(0.0, temp_score, score),
                 source="vlm",
                 face_count=len(faces),
                 bbox=bbox,
-                reason="unknown_face_vlm_gender",
+                reason="unknown_face_vlm_personal",
                 face_id=temp_face_id,
             )
 
@@ -198,7 +205,12 @@ class VisionService:
                 best_score = score
         return best_id, best_score
 
-    def _get_or_create_temp_face_id(self, embedding: Any, age: int | None, gender: str | None) -> tuple[str, float]:
+    def _get_or_create_temp_face_id(
+        self,
+        embedding: Any,
+        age: str | None,
+        gender: str | None,
+    ) -> tuple[str, float]:
         temp_face_id, score = self._match_temp_embedding(embedding)
         if temp_face_id and score >= self.settings.temp_face_match_threshold:
             self._touch_temp_face(temp_face_id, embedding=embedding, age=age, gender=gender)
@@ -219,7 +231,7 @@ class VisionService:
         temp_face_id: str,
         *,
         embedding: Any,
-        age: int | None,
+        age: str | None,
         gender: str | None,
     ) -> None:
         payload = self.temp_faces.get(temp_face_id)
@@ -233,7 +245,7 @@ class VisionService:
             payload["gender"] = gender
         payload["expires_at"] = time.time() + max(1, self.settings.temp_face_ttl_sec)
 
-    def _update_temp_face(self, temp_face_id: str, age: int | None, gender: str | None) -> None:
+    def _update_temp_face(self, temp_face_id: str, age: str | None, gender: str | None) -> None:
         payload = self.temp_faces.get(temp_face_id)
         if payload is None:
             return
@@ -290,17 +302,30 @@ class VisionService:
             raise ValueError("Invalid base64 image payload") from exc
 
     @staticmethod
-    def _extract_age(face) -> int | None:
-        raw = getattr(face, "age", None)
-        if raw is None:
+    def _extract_age(face) -> str | None:
+        for attr_name in ("age_group", "age"):
+            raw = getattr(face, attr_name, None)
+            if raw is None:
+                continue
+            normalized = VisionService._normalize_age_enum(raw)
+            if normalized is not None:
+                return normalized
+        return None
+
+    @staticmethod
+    def _normalize_age_enum(raw: Any) -> str | None:
+        if isinstance(raw, (int, float)):
+            # Backward compatibility: some face models still output numeric age.
+            return "trẻ" if int(raw) < 40 else "trung niên"
+
+        lowered = str(raw).strip().lower()
+        if not lowered:
             return None
-        try:
-            age = int(raw)
-        except (TypeError, ValueError):
-            return None
-        if age < 0 or age > 120:
-            return None
-        return age
+        if lowered in {"trẻ", "tre", "young"}:
+            return "trẻ"
+        if lowered in {"trung niên", "trung nien", "middle", "middle-aged", "middle_aged"}:
+            return "trung niên"
+        return None
 
     @staticmethod
     def _extract_gender(face) -> str | None:
@@ -326,42 +351,43 @@ class VisionService:
                 return "male"
         return None
 
-    def _infer_gender_with_vlm(self, image_bytes: bytes) -> str | None:
+    def _infer_personal_with_vlm(self, image_bytes: bytes) -> tuple[str | None, str | None]:
         if not self.settings.vlm_enabled:
-            return None
+            return None, None
         if not self.settings.vlm_api_url or not self.settings.vlm_model:
-            return None
-        if self.settings.vlm_api_format != "openai":
+            return None, None
+        if self.settings.vlm_api_format not in {"ollama", "openai"}:
             log.warning("unsupported vision vlm api format format=%s", self.settings.vlm_api_format)
-            return None
+            return None, None
 
-        image_b64 = base64.b64encode(image_bytes).decode("ascii")
-        payload = {
-            "model": self.settings.vlm_model,
-            "temperature": 0.0,
-            "max_tokens": 8,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You identify only apparent gender presentation for polite Vietnamese honorifics. "
-                        "Return exactly one token: male, female, or unknown."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Return male, female, or unknown."},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
-                        },
-                    ],
-                },
-            ],
-        }
-        body = json.dumps(payload).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
+        try:
+            client = self._get_ollama_client()
+            content = self._ollama_chat_personal(client, image_bytes=image_bytes)
+        except RuntimeError as exc:
+            log.warning("vlm unavailable error=%s", exc)
+            return None, None
+        except Exception as exc:  # pragma: no cover
+            log.warning("vlm request failed error=%s", exc)
+            return None, None
+
+        try:
+            payload = PersonalInference.model_validate_json(content)
+        except ValidationError:
+            return None, None
+
+        age = self._normalize_age_enum(payload.age)
+        gender = self._normalize_gender_text(payload.gender)
+        return age, gender
+
+    def _get_ollama_client(self):
+        if self._vlm_client is not None:
+            return self._vlm_client
+        try:
+            from ollama import Client
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError("ollama package is not installed") from exc
+
+        headers = {}
         if self.settings.vlm_api_key:
             value = self.settings.vlm_api_key
             header = self.settings.vlm_api_key_header or "Authorization"
@@ -369,64 +395,54 @@ class VisionService:
                 value = f"Bearer {value}"
             headers[header] = value
 
-        req = urllib.request.Request(
-            self.settings.vlm_api_url,
-            data=body,
-            headers=headers,
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=self.settings.vlm_timeout_sec) as resp:
-                raw = resp.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="ignore")
-            log.warning("vlm http error code=%s detail=%s", exc.code, detail[:200])
-            return None
-        except urllib.error.URLError as exc:
-            log.warning("vlm unreachable reason=%s", exc.reason)
-            return None
-        except socket.timeout:
-            log.warning("vlm timeout after %ss", self.settings.vlm_timeout_sec)
-            return None
-        except Exception as exc:  # pragma: no cover
-            log.warning("vlm request failed error=%s", exc)
-            return None
+        self._vlm_client = Client(host=self.settings.vlm_api_url, headers=headers or None)
+        return self._vlm_client
 
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            log.warning("vlm returned invalid json")
-            return None
-
-        content = self._extract_openai_message_text(parsed)
-        return self._normalize_gender_text(content)
-
-    @staticmethod
-    def _extract_openai_message_text(payload: dict[str, Any]) -> str:
-        choices = payload.get("choices")
-        if not isinstance(choices, list) or not choices:
-            return ""
-        message = choices[0].get("message", {})
-        content = message.get("content", "")
-        if isinstance(content, str):
-            return content.strip()
-        if isinstance(content, list):
-            parts: list[str] = []
-            for item in content:
-                if not isinstance(item, dict):
-                    continue
-                text = str(item.get("text", "")).strip()
-                if text:
-                    parts.append(text)
-            return " ".join(parts).strip()
-        return ""
+    def _ollama_chat_personal(self, client: Any, image_bytes: bytes) -> str:
+        image_b64 = base64.b64encode(image_bytes).decode("ascii")
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "Phạm vi các thuộc tính:\n"
+                    "<giới tính>: [nam, nữ]\n"
+                    "<độ tuổi>: [trẻ, trung niên]\n\n"
+                    "Phân tích bức ảnh và chỉ trả lời bằng JSON sau:\n"
+                    "{\n"
+                    '  "gender": "<giới tính>",\n'
+                    '  "age": "<độ tuổi>"\n'
+                    "}"
+                ),
+                "images": [image_b64],
+            },
+        ]
+        options = {"temperature": 0, "num_predict": 64}
+        chunks: list[str] = []
+        for part in client.chat(
+            self.settings.vlm_model,
+            messages=messages,
+            stream=True,
+            options=options,
+            format=PersonalInference.model_json_schema(),
+        ):
+            msg = part.get("message", {}) if isinstance(part, dict) else {}
+            text = str(msg.get("content", "")).strip()
+            if text:
+                chunks.append(text)
+        content = "".join(chunks).strip()
+        content = re.sub(r"^```json\s*|```$", "", content, flags=re.IGNORECASE | re.MULTILINE).strip()
+        return content
 
     @staticmethod
     def _normalize_gender_text(text: str) -> str | None:
-        lowered = re.sub(r"[^a-z]", " ", str(text or "").strip().lower())
+        lowered = re.sub(r"[^a-z\u00C0-\u1EF9]", " ", str(text or "").strip().lower())
         lowered = " ".join(lowered.split())
         if not lowered:
             return None
+        if lowered in {"nam"}:
+            return "male"
+        if lowered in {"nu", "nữ"}:
+            return "female"
         if "female" in lowered or "woman" in lowered:
             return "female"
         if "male" in lowered or re.search(r"\bman\b", lowered):
