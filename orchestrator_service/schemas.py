@@ -35,7 +35,7 @@ class NeedPainpointState(BaseModel):
 class VisionContext(BaseModel):
     recognized: bool = False
     name: str | None = None
-    age: int | None = Field(default=None, ge=0, le=120)
+    age: Literal["trẻ", "trung niên"] | None = None
     gender: Literal["male", "female"] | None = None
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     source: Literal["face_db", "local_face_analysis", "vlm", "none", "error"] = "none"
@@ -48,7 +48,7 @@ class VisionContext(BaseModel):
 class CustomerProfileState(BaseModel):
     recognized: bool = False
     name: str | None = None
-    age: int | None = Field(default=None, ge=0, le=120)
+    age: Literal["trẻ", "trung niên"] | None = None
     gender: Literal["male", "female"] | None = None
     source: Literal["face_db", "local_face_analysis", "vlm", "none", "error"] | None = None
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)

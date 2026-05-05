@@ -655,6 +655,36 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         pass
 
+    # Common case: markdown fenced JSON.
+    fenced_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    if fenced_match:
+        candidate = fenced_match.group(1).strip()
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # Robust fallback: try every balanced {...} candidate and return the first valid JSON object.
+    starts = [idx for idx, ch in enumerate(text) if ch == "{"]
+    for start in starts:
+        depth = 0
+        for idx in range(start, len(text)):
+            ch = text[idx]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : idx + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                        if isinstance(parsed, dict):
+                            return parsed
+                    except json.JSONDecodeError:
+                        break
+
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
@@ -1647,6 +1677,17 @@ def _call_model_generate(
 ) -> Any:
     api_format = str(api_format or "ollama").strip().lower()
     model_name = str(model or "").strip().lower()
+    api_url = str(api_url or "").strip()
+
+    # Ollama Cloud serves OpenAI-compatible endpoints on ollama.com.
+    # If env is configured as `ollama` format against ollama.com root,
+    # auto-upgrade to OpenAI format to avoid HTML/non-JSON responses.
+    if api_format == "ollama" and "ollama.com" in api_url:
+        api_format = "openai"
+        if "/v1/" not in api_url:
+            api_url = api_url.rstrip("/") + "/v1/chat/completions"
+        elif not api_url.rstrip("/").endswith("/chat/completions"):
+            api_url = api_url.rstrip("/") + "/chat/completions"
     headers: dict[str, str] = {
         "Content-Type": "application/json",
         "User-Agent": _MODEL_HTTP_USER_AGENT,
@@ -2078,6 +2119,10 @@ def _build_decider_prompt(
         '  "should_route_project": true|false,\n'
         '  "project_query_hint": "string|null"\n'
         "}\n\n"
+        "QUY DINH DINH DANG CUNG:\n"
+        "- Chi tra ve DUY NHAT JSON object.\n"
+        "- Khong markdown, khong ```json, khong giai thich, khong text truoc/sau JSON.\n"
+        "- project_query_hint: neu should_route_project=false thi bat buoc la null.\n\n"
         f"message={json.dumps(message, ensure_ascii=False)}\n"
         f"lead_state={json.dumps(compact_state, ensure_ascii=False)}\n"
         f"recent_history={json.dumps(compact_history, ensure_ascii=False)}\n"
