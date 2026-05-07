@@ -180,6 +180,8 @@ def test_livetalking_session_start_resume_and_stop(monkeypatch):
     assert start_payload["session"]["resumed"] is False
     assert start_payload["session"]["should_greet"] is True
     assert "Linh" in start_payload["session"]["greeting"]
+    assert "khách hàng cũ" in start_payload["session"]["greeting"]
+    assert "sản phẩm nào khác" in start_payload["session"]["greeting"]
 
     session_id = start_payload["session"]["session_id"]
     restart_res = client.post(
@@ -210,3 +212,58 @@ def test_livetalking_session_start_resume_and_stop(monkeypatch):
     stop_payload = stop_res.json()
     assert stop_payload["stopped"] is True
     assert stop_payload["session_id"] == session_id
+
+
+@pytest.mark.skipif(PY313, reason="Known TestClient/anyio instability on Python 3.13 in this environment.")
+def test_livetalking_session_start_unknown_face_includes_catalog_overview(monkeypatch):
+    monkeypatch.setenv("ORCHESTRATOR_MODEL_WARMUP_ENABLED", "false")
+    monkeypatch.setattr(app_module, "synthesize_assistant_reply", fake_synthesize_assistant_reply)
+
+    def fake_vision_identify(**kwargs):
+        _ = kwargs
+        return {
+            "recognized": False,
+            "name": None,
+            "age": 28,
+            "gender": "female",
+            "confidence": 0.31,
+            "source": "vlm",
+            "face_count": 1,
+            "bbox": [10, 10, 100, 100],
+            "reason": "unknown_face",
+            "face_id": "guest-xyz",
+        }
+
+    def fake_project_grounded_fetcher(*args, **kwargs):
+        _ = args
+        _ = kwargs
+        return {
+            "project_cards": [
+                {
+                    "project_id": "noble_palace_tay_thang_long",
+                    "product_types": ["apartment", "shophouse", "villa"],
+                }
+            ],
+            "trait_tags": [],
+            "proximity_facts": [],
+            "evidence_chunks": [],
+            "confidence": 0.9,
+            "low_confidence": False,
+        }
+
+    client = TestClient(
+        create_app(
+            turn_analyzer=fake_turn_analyzer,
+            vision_identify=fake_vision_identify,
+            project_grounded_fetcher=fake_project_grounded_fetcher,
+            session_store=SessionStore(""),
+        )
+    )
+
+    start_res = client.post("/integrations/livetalking/start", json={"image_base64": "ZmFrZQ=="})
+    assert start_res.status_code == 200
+    start_payload = start_res.json()
+    greeting = str(start_payload["session"]["greeting"] or "")
+    assert "Em chào anh/chị" in greeting
+    assert "căn hộ" in greeting
+    assert "shophouse" in greeting

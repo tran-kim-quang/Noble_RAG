@@ -100,14 +100,23 @@ _POI_KEYWORDS = {
 class RetrievalService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self._qdrant_local_path = self._extract_local_qdrant_path(settings.qdrant_url)
 
-        self.document_store = QdrantDocumentStore(
-            url=settings.qdrant_url,
-            index=settings.collection_name,
-            embedding_dim=settings.embedding_dim,
-            api_key=settings.qdrant_api_key or None,
-            recreate_index=False,
-        )
+        if self._qdrant_local_path:
+            self.document_store = QdrantDocumentStore(
+                path=self._qdrant_local_path,
+                index=settings.collection_name,
+                embedding_dim=settings.embedding_dim,
+                recreate_index=False,
+            )
+        else:
+            self.document_store = QdrantDocumentStore(
+                url=settings.qdrant_url,
+                index=settings.collection_name,
+                embedding_dim=settings.embedding_dim,
+                api_key=settings.qdrant_api_key or None,
+                recreate_index=False,
+            )
 
         self.indexing: Pipeline | None = None
         self.retrieval: Pipeline | None = None
@@ -166,7 +175,7 @@ class RetrievalService:
             settings.embedding_backend,
             settings.embedding_model,
             settings.embedding_dim,
-            settings.qdrant_url,
+            (f"local://{self._qdrant_local_path}" if self._qdrant_local_path else settings.qdrant_url),
         )
 
     def health(self) -> dict:
@@ -1042,13 +1051,20 @@ class RetrievalService:
             )
 
     def _validate_remote_embedding_dim(self) -> None:
-        embedding = self._embed_remote_text("dimension probe")
-        model_dim = len(embedding)
-        if model_dim != self.settings.embedding_dim:
-            raise ValueError(
-                "Remote embedding dimension mismatch: "
-                f"EMBEDDING_DIM={self.settings.embedding_dim} but endpoint '{self.settings.embedding_api_url}' "
-                f"returned dim={model_dim}. Please align endpoint model or EMBEDDING_DIM."
+        try:
+            embedding = self._embed_remote_text("dimension probe")
+            model_dim = len(embedding)
+            if model_dim != self.settings.embedding_dim:
+                raise ValueError(
+                    "Remote embedding dimension mismatch: "
+                    f"EMBEDDING_DIM={self.settings.embedding_dim} but endpoint '{self.settings.embedding_api_url}' "
+                    f"returned dim={model_dim}. Please align endpoint model or EMBEDDING_DIM."
+                )
+        except (TimeoutError, urllib.error.URLError, urllib.error.HTTPError) as exc:
+            log.warning(
+                "Remote embedding validation skipped (endpoint timeout/unreachable): %s. "
+                "Will validate on first use.",
+                exc
             )
 
     def _embed_remote_text(self, text: str) -> list[float]:
@@ -1140,13 +1156,21 @@ class RetrievalService:
             ) from exc
 
     def _validate_qdrant_collection_dim(self) -> None:
-        client = QdrantClient(
-            url=self.settings.qdrant_url,
-            api_key=self.settings.qdrant_api_key or None,
-            timeout=self.settings.qdrant_timeout_sec,
-        )
+        if self._qdrant_local_path:
+            client = QdrantClient(path=self._qdrant_local_path)
+        else:
+            client = QdrantClient(
+                url=self.settings.qdrant_url,
+                api_key=self.settings.qdrant_api_key or None,
+                timeout=self.settings.qdrant_timeout_sec,
+            )
         try:
             collection = client.get_collection(self.settings.collection_name)
+        except ValueError as exc:
+            # Qdrant local mode raises ValueError when collection is absent.
+            if "not found" in str(exc).lower():
+                return
+            raise
         except qdrant_exceptions.UnexpectedResponse as exc:
             if exc.status_code == 404:
                 return
@@ -1166,3 +1190,20 @@ class RetrievalService:
                 f"but EMBEDDING_DIM={self.settings.embedding_dim}. "
                 "Use a new collection name or align EMBEDDING_DIM/model."
             )
+
+    @staticmethod
+    def _extract_local_qdrant_path(qdrant_url: str) -> str | None:
+        raw = str(qdrant_url or "").strip()
+        if not raw:
+            return None
+        lowered = raw.lower()
+        if lowered.startswith("local://"):
+            path = raw[len("local://") :].strip()
+            return path or None
+        if lowered.startswith("file:///"):
+            path = raw[len("file:///") :].strip()
+            return path or None
+        if lowered.startswith("file://"):
+            path = raw[len("file://") :].strip()
+            return path or None
+        return None

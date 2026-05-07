@@ -275,6 +275,7 @@ class QueryResponse(BaseModel):
 
 
 class VisionQueryRequest(QueryRequest):
+    request_id: str | None = None
     image_base64: str = Field(min_length=1)
     image_filename: str | None = None
     image_content_type: str | None = None
@@ -289,6 +290,7 @@ class VisionQueryRequest(QueryRequest):
 
 
 class LiveTalkingSessionStartRequest(BaseModel):
+    request_id: str | None = None
     image_base64: str = Field(min_length=1)
     image_filename: str | None = None
     image_content_type: str | None = None

@@ -3,8 +3,10 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import inspect
 import logging
 import re
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -43,13 +45,59 @@ class VisionService:
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
             ctx_id = 0
 
-        self.app = FaceAnalysis(name=settings.model_name, providers=providers)
+        # insightface API differs by version:
+        # - newer: FaceAnalysis(name=..., providers=[...])
+        # - older: FaceAnalysis(name=..., root=...) and may crash on modern model packs.
+        init_signature = inspect.signature(FaceAnalysis.__init__)
+        if "providers" in init_signature.parameters:
+            self.app = FaceAnalysis(name=settings.model_name, providers=providers)
+        else:
+            log.warning("legacy insightface detected; using compatibility model filtering.")
+            self.app = self._build_legacy_face_app(FaceAnalysis, model_name=settings.model_name)
         self.app.prepare(ctx_id=ctx_id, det_size=(settings.det_size, settings.det_size))
         self.people: dict[str, Any] = {}
         self.image_count: dict[str, int] = {}
         self.temp_faces: dict[str, dict[str, Any]] = {}
         self._vlm_client = None
         self.load()
+
+    @staticmethod
+    def _build_legacy_face_app(FaceAnalysis, model_name: str):
+        import os
+        from insightface.model_zoo import model_zoo
+
+        src_root = Path(os.path.expanduser("~/.insightface/models"))
+        src_dir = src_root / model_name
+        workspace_root = Path(__file__).resolve().parents[1]
+        compat_root = workspace_root / ".vision_models"
+        compat_name = f"{model_name}_legacy"
+        compat_dir = compat_root / compat_name
+
+        if not src_dir.exists():
+            raise RuntimeError(f"insightface model folder is missing: {src_dir}")
+
+        compat_dir.mkdir(parents=True, exist_ok=True)
+        for existing in compat_dir.glob("*.onnx"):
+            existing.unlink(missing_ok=True)
+
+        kept_files = 0
+        for onnx_path in sorted(src_dir.glob("*.onnx")):
+            try:
+                model = model_zoo.get_model(str(onnx_path))
+            except Exception as exc:
+                log.warning("skip unsupported onnx model=%s error=%s", onnx_path.name, exc)
+                continue
+            task_name = getattr(model, "taskname", "")
+            if task_name not in {"detection", "recognition"}:
+                log.info("skip non-required onnx model=%s task=%s", onnx_path.name, task_name)
+                continue
+            shutil.copy2(onnx_path, compat_dir / onnx_path.name)
+            kept_files += 1
+
+        if kept_files == 0:
+            raise RuntimeError(f"no compatible ONNX models found in {src_dir}")
+
+        return FaceAnalysis(name=compat_name, root=str(compat_root))
 
     def load(self) -> None:
         if not self.face_db_dir.exists():

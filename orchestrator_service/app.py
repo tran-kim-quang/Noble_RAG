@@ -1,7 +1,10 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import base64
+import binascii
+import hashlib
 import json
 import logging
 import re
@@ -193,14 +196,22 @@ def _normalize_retrieval_readiness(raw: Any) -> str:
 
 
 def _extract_name(message: str) -> str | None:
+    if not isinstance(message, str) or not message.strip():
+        return None
+
+    # Unicode letter without digits/underscore. This avoids fragile hard-coded
+    # ranges that can break after mojibake/encoding drift.
+    name_word = r"[^\W\d_]+(?:[-'][^\W\d_]+)*"
+    name_group = rf"({name_word}(?:\s+{name_word}){{0,5}})"
     patterns = [
-        r"(?:mình|toi|tôi|em|anh|chi|chị)\s+(?:là|la)\s+([a-zA-ZÀ-ỹ][a-zA-ZÀ-ỹ\s]{1,30})",
-        r"(?:tên|ten)\s+(?:mình|toi|tôi|em|anh|chi|chị)\s+(?:là|la)\s+([a-zA-ZÀ-ỹ][a-zA-ZÀ-ỹ\s]{1,30})",
+        rf"(?:mình|minh|toi|tôi|em|anh|chi|chị)\s+(?:là|la)\s+{name_group}",
+        rf"(?:tên|ten)\s+(?:mình|minh|toi|tôi|em|anh|chi|chị)\s+(?:là|la)\s+{name_group}",
     ]
     for pattern in patterns:
-        match = re.search(pattern, message, re.IGNORECASE)
-        if match:
-            return " ".join(match.group(1).strip().split())[:64]
+        match = re.search(pattern, message, re.IGNORECASE | re.UNICODE)
+        if not match:
+            continue
+        return " ".join(match.group(1).strip().split())[:64]
     return None
 
 
@@ -218,7 +229,7 @@ def _coerce_extracted_name(raw: Any) -> str | None:
         return None
     if cleaned.lower() in {"none", "null", "n/a"}:
         return None
-    if not re.search(r"[a-zA-ZÀ-ỹ]", cleaned):
+    if not re.search(r"[^\W\d_]", cleaned, re.UNICODE):
         return None
     return cleaned[:64]
 
@@ -524,6 +535,20 @@ def _derive_observability_user_id(lead_state: LeadState) -> str | None:
     return None
 
 
+def _vision_image_diagnostics(image_base64: str) -> tuple[int, int | None, str | None, str | None]:
+    cleaned = str(image_base64 or "").strip()
+    if cleaned.startswith("data:"):
+        _, _, cleaned = cleaned.partition(",")
+    b64_len = len(cleaned)
+    if not cleaned:
+        return b64_len, None, None, "empty"
+    try:
+        raw = base64.b64decode(cleaned, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        return b64_len, None, None, str(exc)
+    return b64_len, len(raw), hashlib.sha1(raw).hexdigest()[:16], None
+
+
 def _build_retrieval_intent(
     message: str,
     lead_state: LeadState,
@@ -714,6 +739,54 @@ def _friendly_project_name(project_id: str) -> str:
     return cleaned.title()
 
 
+def _friendly_product_type_name(product_type: str) -> str:
+    raw = str(product_type or "").strip().lower()
+    mapping = {
+        "apartment": "căn hộ",
+        "shophouse": "shophouse",
+        "villa": "biệt thự",
+        "townhouse": "nhà phố",
+        "penthouse": "penthouse",
+        "duplex": "duplex",
+        "unspecified": "sản phẩm đa dạng",
+    }
+    return mapping.get(raw, raw.replace("_", " ").strip() or "sản phẩm đa dạng")
+
+
+def _build_project_catalog_overview(project_cards: list[dict[str, Any]]) -> str:
+    if not project_cards:
+        return (
+            "Hiện em đang có dữ liệu từ nhiều dự án trong hệ thống, "
+            "có thể giới thiệu nhanh các dòng căn hộ, shophouse và biệt thự phù hợp nhu cầu."
+        )
+
+    project_names: list[str] = []
+    product_types: list[str] = []
+
+    for card in project_cards[:5]:
+        project_id = str(card.get("project_id", "")).strip()
+        if project_id:
+            name = _friendly_project_name(project_id)
+            if name and name not in project_names:
+                project_names.append(name)
+        for raw_type in card.get("product_types", []) or []:
+            type_name = _friendly_product_type_name(str(raw_type))
+            if type_name and type_name not in product_types:
+                product_types.append(type_name)
+
+    if not product_types:
+        product_types = ["căn hộ", "shophouse", "biệt thự"]
+
+    products_text = ", ".join(product_types[:4])
+    if project_names:
+        projects_text = ", ".join(project_names[:3])
+        return (
+            f"Hiện em đang có dữ liệu các dòng {products_text} "
+            f"tại nhiều dự án như {projects_text}."
+        )
+    return f"Hiện em đang có dữ liệu các dòng {products_text} tại nhiều dự án."
+
+
 def _is_single_project_mode(project_cards: list[dict], proximity_facts: list[dict]) -> bool:
     ids: set[str] = set()
     for card in project_cards:
@@ -841,17 +914,36 @@ def _build_customer_greeting_prefix(
     return None
 
 
-def _build_livetalking_greeting(lead_state: LeadState) -> str:
+def _build_livetalking_greeting(
+    lead_state: LeadState,
+    *,
+    product_catalog_overview: str | None = None,
+) -> str:
     profile = lead_state.customer_profile
     honorific = _derive_customer_honorific(lead_state)
     if profile.recognized and profile.name:
         if honorific:
-            return f"Em chào {honorific} {profile.name} ạ."
-        return f"Em chào {profile.name} ạ."
-    if honorific:
-        return f"Em chào {honorific} ạ."
-    return "Em chào anh/chị ạ."
+            return (
+                f"Em chào {honorific} {profile.name} ạ. "
+                "Vì mình là khách hàng cũ nên anh/chị muốn tìm hiểu thêm về sản phẩm nào khác không ạ?"
+            )
+        return (
+            f"Em chào {profile.name} ạ. "
+            "Vì mình là khách hàng cũ nên anh/chị muốn tìm hiểu thêm về sản phẩm nào khác không ạ?"
+        )
 
+    overview = str(product_catalog_overview or "").strip()
+    if overview:
+        return f"Em chào anh/chị ạ. {overview}"
+    if honorific:
+        return (
+            f"Em chào {honorific} ạ. "
+            "Hiện em có thể giới thiệu nhanh các dòng căn hộ, shophouse và biệt thự đang có trong hệ thống."
+        )
+    return (
+        "Em chào anh/chị ạ. "
+        "Hiện em có thể giới thiệu nhanh các dòng căn hộ, shophouse và biệt thự đang có trong hệ thống."
+    )
 
 def _reply_has_greeting_prefix(reply: str) -> bool:
     lowered = str(reply or "").strip().lower()
@@ -1948,6 +2040,84 @@ def _build_reply_repair_prompt(
     )
 
 
+def _build_no_decider_direct_reply_prompt(
+    *,
+    message: str,
+    recent_history: list[HistoryTurn],
+    lead_state: LeadState,
+    reply_plan: ReplyPlan,
+    settings: Settings,
+) -> str:
+    compact_history = [
+        {"role": turn.role, "message": turn.message}
+        for turn in recent_history[-settings.synthesis_history_turns :]
+    ]
+    state_payload = {
+        "need_summary": lead_state.need.summary,
+        "painpoint_summary": lead_state.painpoint.summary,
+        "sales_state": lead_state.sales_state,
+        "engagement_state": lead_state.engagement_state,
+        "conversation_goal": lead_state.last_conversation_goal,
+        "next_best_action": lead_state.next_best_action,
+    }
+    return (
+        "Ban la tro ly tu van bat dong san.\n"
+        "Boi canh: decider tam thoi khong san sang. Van phai tu van theo noi dung query cua khach.\n"
+        "Muc tieu: tra loi gon, tu nhien, bam sat query, khong noi ve loi he thong.\n"
+        "Bat buoc: tra ve DUY NHAT 1 JSON object theo schema {\"assistant_reply\":\"...\"}.\n"
+        "Khong markdown, khong giai thich them.\n"
+        f"ask_policy={json.dumps(reply_plan.ask_policy, ensure_ascii=False)}\n"
+        f"response_mode={json.dumps(reply_plan.response_mode, ensure_ascii=False)}\n"
+        f"focus={json.dumps(reply_plan.focus, ensure_ascii=False)}\n"
+        f"question_focus={json.dumps(reply_plan.question_focus, ensure_ascii=False)}\n"
+        f"user_message={json.dumps(message, ensure_ascii=False)}\n"
+        f"lead_state={json.dumps(state_payload, ensure_ascii=False)}\n"
+        f"recent_history={json.dumps(compact_history, ensure_ascii=False)}\n"
+    )
+
+
+def synthesize_assistant_reply_no_decider(
+    *,
+    message: str,
+    recent_history: list[HistoryTurn],
+    lead_state: LeadState,
+    reply_plan: ReplyPlan,
+    settings: Settings,
+) -> str:
+    prompt = _build_no_decider_direct_reply_prompt(
+        message=message,
+        recent_history=recent_history,
+        lead_state=lead_state,
+        reply_plan=reply_plan,
+        settings=settings,
+    )
+    response_payload = _call_model_generate(
+        api_format=settings.synthesis_api_format,
+        api_url=settings.synthesis_api_url,
+        api_key=settings.synthesis_api_key,
+        api_key_header=settings.synthesis_api_key_header,
+        model=settings.synthesis_model,
+        timeout_sec=settings.synthesis_timeout_sec,
+        keep_alive=settings.synthesis_keep_alive,
+        prompt=prompt,
+        temperature=max(0.0, min(1.0, settings.synthesis_temperature)),
+        response_format="json",
+        max_tokens=settings.synthesis_output_max_tokens,
+        enable_stream=False,
+    )
+    reply = _sanitize_reply_for_policy(
+        reply=_extract_assistant_reply(response_payload),
+        ask_policy=reply_plan.ask_policy,
+        single_project_mode=False,
+        question_focus=reply_plan.question_focus,
+    )
+    if not reply:
+        raise RuntimeError("no_decider direct synthesis returned empty reply")
+    if _reply_needs_retry(reply=reply, single_project_mode=False, ask_policy=reply_plan.ask_policy):
+        raise RuntimeError("no_decider direct synthesis failed policy/quality gate")
+    return _compact_text(reply, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
+
+
 def synthesize_assistant_reply(
     message: str,
     recent_history: list[HistoryTurn],
@@ -2601,6 +2771,7 @@ def create_app(
             return None
         if not str(image_base64 or "").strip():
             return None
+        b64_len, byte_size, image_sha1, decode_error = _vision_image_diagnostics(image_base64)
         try:
             payload = vision_identify(
                 image_base64=image_base64,
@@ -2612,7 +2783,22 @@ def create_app(
             )
             return VisionContext.model_validate(payload)
         except Exception as exc:
-            log.warning("vision identify failed: %s", exc)
+            log.warning(
+                (
+                    "vision identify failed: %s session_id=%s trace_id=%s "
+                    "image_b64_len=%s image_bytes=%s image_sha1=%s predecode_error=%s "
+                    "filename=%s content_type=%s"
+                ),
+                exc,
+                session_id,
+                trace_id,
+                b64_len,
+                byte_size,
+                image_sha1,
+                decode_error,
+                image_filename,
+                image_content_type,
+            )
             return VisionContext(
                 recognized=False,
                 confidence=0.0,
@@ -2641,6 +2827,34 @@ def create_app(
             "vision_context": vision_context.model_dump(mode="json") if vision_context is not None else None,
             "updated_at": _now_iso(),
         }
+
+    def _build_qdrant_overview_for_livetalking_start(
+        *,
+        trace_id: str | None = None,
+        session_id: str | None = None,
+        user_id: str | None = None,
+    ) -> str:
+        try:
+            intent = _build_retrieval_intent(
+                message="Giới thiệu tổng quan các sản phẩm hiện có",
+                lead_state=LeadState(),
+                query_type="project_matching",
+                retrieval_readiness="ready",
+            )
+            retrieval_raw = _call_project_grounded_fetcher(
+                project_grounded_fetcher,
+                "Giới thiệu tổng quan các sản phẩm hiện có",
+                intent,
+                max(3, min(settings.default_top_k, 8)),
+                trace_id=trace_id,
+                session_id=session_id,
+                user_id=user_id,
+            )
+            cards = retrieval_raw.get("project_cards", []) or []
+            return _build_project_catalog_overview(cards)
+        except Exception as exc:
+            log.warning("livetalking start qdrant overview failed: %s", exc)
+            return _build_project_catalog_overview([])
 
     def _resolve_livetalking_session(
         *,
@@ -2684,6 +2898,13 @@ def create_app(
             return session, lead_state, recent_history, effective_vision_context
 
         base_state = _merge_customer_profile(LeadState(), vision_context)
+        product_catalog_overview = None
+        if not (base_state.customer_profile.recognized and base_state.customer_profile.name):
+            product_catalog_overview = _build_qdrant_overview_for_livetalking_start(
+                trace_id=trace_id,
+                session_id=requested_session_id,
+                user_id=user_id,
+            )
         session = LiveTalkingSessionState(
             session_id=str(requested_session_id or uuid4().hex),
             face_session_key=face_session_key,
@@ -2691,9 +2912,52 @@ def create_app(
             ttl_sec=ttl_sec,
             resumed=False,
             should_greet=settings.vision_greeting_enabled,
-            greeting=_build_livetalking_greeting(base_state) if settings.vision_greeting_enabled else None,
+            greeting=(
+                _build_livetalking_greeting(
+                    base_state,
+                    product_catalog_overview=product_catalog_overview,
+                )
+                if settings.vision_greeting_enabled
+                else None
+            ),
         )
         return session, base_state, [], vision_context
+
+    def _resolve_livetalking_query_session(
+        *,
+        requested_session_id: str | None,
+    ) -> tuple[LiveTalkingSessionState, LeadState, list[HistoryTurn], VisionContext | None]:
+        session_id = str(requested_session_id or "").strip()
+        if not session_id:
+            raise HTTPException(
+                status_code=400,
+                detail="session_id is required for /integrations/livetalking/query. Call /integrations/livetalking/start first.",
+            )
+
+        record = session_store.load_by_session_id(session_id)
+        if record is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"livetalking session not found or expired: {session_id}",
+            )
+
+        lead_state, recent_history, vision_context = _load_livetalking_session_record(record)
+        resolved_face_key = str(record.get("face_session_key", "")).strip() or f"anonymous:{session_id}"
+        resolved_customer_kind = str(record.get("customer_kind", "anonymous")).strip() or "anonymous"
+        if resolved_customer_kind not in {"known", "guest", "anonymous"}:
+            resolved_customer_kind = "anonymous"
+        resolved_ttl_sec = max(1, int(record.get("ttl_sec", settings.session_guest_ttl_sec) or settings.session_guest_ttl_sec))
+
+        session = LiveTalkingSessionState(
+            session_id=str(record.get("session_id", session_id)) or session_id,
+            face_session_key=resolved_face_key,
+            customer_kind=resolved_customer_kind,
+            ttl_sec=resolved_ttl_sec,
+            resumed=True,
+            should_greet=False,
+            greeting=None,
+        )
+        return session, lead_state, recent_history, vision_context
 
     @app.post("/sales/query", response_model=QueryResponse)
     def query(payload: QueryRequest) -> QueryResponse:
@@ -3029,6 +3293,7 @@ def create_app(
                         settings.quick_intent_fast_response_enabled
                         and final_route == "consult_discovery"
                         and _normalize_query_type(analysis.query_type) == "clarification"
+                        and reason != "fallback_no_decider"
                     ):
                         quick_intent_reply = _build_quick_intent_response(
                             message=message,
@@ -3076,30 +3341,56 @@ def create_app(
                                     reply_plan.ask_policy,
                                     reason,
                                 )
-                                # Graceful degradation: keep the API responsive when model
-                                # synthesis is slow/unavailable by returning fallback consult text.
-                                if consult_result is None:
-                                    consult_result = run_consult_discovery(
-                                        message=message,
-                                        lead_state=lead_state,
-                                        analysis=analysis,
+                                # For no-decider fallback, force a second model-only attempt
+                                # instead of immediately returning deterministic template text.
+                                if reason == "fallback_no_decider":
+                                    try:
+                                        assistant_reply = synthesize_assistant_reply_no_decider(
+                                            message=message,
+                                            recent_history=payload.recent_history,
+                                            lead_state=final_state,
+                                            reply_plan=reply_plan,
+                                            settings=settings,
+                                        )
+                                        reply_source = "reply_synthesis_no_decider_direct"
+                                        fastpath_gate_reason = "no_decider_model_direct"
+                                        used_fastpath_consult_reply = False
+                                        log.info(
+                                            "reply synthesis recovered via no_decider direct mode final_route=%s",
+                                            final_route,
+                                        )
+                                    except Exception as direct_exc:
+                                        log.warning(
+                                            "no_decider direct synthesis failed final_route=%s error=%s",
+                                            final_route,
+                                            str(direct_exc)[:240],
+                                        )
+                                        assistant_reply = ""
+                                if not assistant_reply:
+                                    # Graceful degradation: keep the API responsive when model
+                                    # synthesis is slow/unavailable by returning fallback consult text.
+                                    if consult_result is None:
+                                        consult_result = run_consult_discovery(
+                                            message=message,
+                                            lead_state=lead_state,
+                                            analysis=analysis,
+                                        )
+                                    fallback_reply = (
+                                        str(consult_result.get("assistant_reply", "")).strip()
+                                        if consult_result
+                                        else ""
+                                    ) or analysis.consult_reply
+                                    assistant_reply = _compact_text(
+                                        fallback_reply
+                                        or (
+                                            "Em xin lỗi, hệ thống trả lời đang bận. "
+                                            "Anh/chị cho em 1 tiêu chí ưu tiên để em tư vấn nhanh hơn ạ."
+                                        ),
+                                        max_words=max(24, settings.quick_intent_response_max_words),
                                     )
-                                fallback_reply = (
-                                    str(consult_result.get("assistant_reply", "")).strip()
-                                    if consult_result
-                                    else ""
-                                ) or analysis.consult_reply
-                                assistant_reply = _compact_text(
-                                    fallback_reply
-                                    or (
-                                        "Em xin lỗi, hệ thống trả lời đang bận. "
-                                        "Anh/chị cho em 1 tiêu chí ưu tiên để em tư vấn nhanh hơn ạ."
-                                    ),
-                                    max_words=max(24, settings.quick_intent_response_max_words),
-                                )
-                                reply_source = "reply_synthesis_fallback_consult"
-                                fastpath_gate_reason = "synthesis_error_fallback"
-                                used_fastpath_consult_reply = True
+                                    reply_source = "reply_synthesis_fallback_consult"
+                                    fastpath_gate_reason = "synthesis_error_fallback"
+                                    used_fastpath_consult_reply = True
                             reply_obs.update(
                                 output={
                                     "assistant_reply_chars": len(assistant_reply),
@@ -3220,6 +3511,7 @@ def create_app(
             image_base64=payload.image_base64,
             image_filename=payload.image_filename,
             image_content_type=payload.image_content_type,
+            trace_id=payload.request_id,
             session_id=payload.session_id,
         )
         query_payload = QueryRequest(
@@ -3240,6 +3532,7 @@ def create_app(
             image_filename=payload.image_filename,
             image_content_type=payload.image_content_type,
             requested_session_id=payload.session_id,
+            trace_id=payload.request_id,
             user_id=_derive_observability_user_id(payload.lead_state or LeadState()),
         )
         lead_state = payload.lead_state or stored_state
@@ -3272,12 +3565,10 @@ def create_app(
 
     @app.post("/integrations/livetalking/query", response_model=LiveTalkingQueryResponse)
     def livetalking_query(payload: LiveTalkingQueryRequest) -> LiveTalkingQueryResponse:
-        session, stored_state, recent_history, vision_context = _resolve_livetalking_session(
-            image_base64=payload.image_base64,
-            image_filename=payload.image_filename,
-            image_content_type=payload.image_content_type,
+        # Query phase reuses the session resolved at /integrations/livetalking/start.
+        # We intentionally skip vision re-scan here to keep latency stable.
+        session, stored_state, recent_history, vision_context = _resolve_livetalking_query_session(
             requested_session_id=payload.session_id,
-            user_id=_derive_observability_user_id(payload.lead_state or LeadState()),
         )
         lead_state = payload.lead_state or stored_state
         if recent_history:
@@ -3334,3 +3625,4 @@ def create_app(
 
 
 app = create_app()
+

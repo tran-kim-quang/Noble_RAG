@@ -1,0 +1,6 @@
+input mean and std: 127.5 127.5
+find model: C:\Noble\Noble_RAG\.vision_models\buffalo_l_legacy\det_10g.onnx detection
+input mean and std: 127.5 127.5
+find model: C:\Noble\Noble_RAG\.vision_models\buffalo_l_legacy\w600k_r50.onnx recognition
+set det-size: (640, 640)
+INFO:     127.0.0.1:64892 - "GET /health HTTP/1.1" 200 OK

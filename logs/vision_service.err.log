@@ -1,0 +1,11 @@
+INFO:     Loading environment from 'C:\Noble\Noble_RAG\logs\vision-service.env.local'
+INFO:     Started server process [20372]
+INFO:     Waiting for application startup.
+2026-05-06 18:53:00,742 WARNING [vision-service] legacy insightface detected; using compatibility model filtering.
+2026-05-06 18:53:01,493 WARNING [vision-service] skip unsupported onnx model=1k3d68.onnx error=error on model routing
+2026-05-06 18:53:01,542 WARNING [vision-service] skip unsupported onnx model=2d106det.onnx error=error on model routing
+2026-05-06 18:53:01,620 WARNING [vision-service] skip unsupported onnx model=genderage.onnx error=error on model routing
+2026-05-06 18:53:03,068 INFO [vision-service] loaded people_count=2 face_db=C:\Noble\Noble_RAG\face_db
+2026-05-06 18:53:03,071 INFO [vision-service] startup host=0.0.0.0 port=8031 people_count=2
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8031 (Press CTRL+C to quit)

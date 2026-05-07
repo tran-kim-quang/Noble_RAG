@@ -1,6 +1,7 @@
 /.venv/
 /venv/
 /env/
+/.venv310/
 __pycache__/
 *.pyc
 deploy/volumes/ollama/id_ed25519
