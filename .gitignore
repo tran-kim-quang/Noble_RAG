@@ -18,3 +18,6 @@ deploy/volumes/
 livetalking/.downloads/
 livetalking/**/*.pth
 livetalking/**/*.tar.gz
+
+
+logs/
