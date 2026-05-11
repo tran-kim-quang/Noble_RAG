@@ -81,7 +81,7 @@ def _synthesis_api_format() -> str:
 
 
 def _synthesis_api_url() -> str:
-    return _env_first("ORCHESTRATOR_SYNTHESIS_API_URL", "ORCHESTRATOR_DECIDER_API_URL", default=_decider_api_url())
+    return _env_first("ORCHESTRATOR_SYNTHESIS_API_URL", "ORCHESTRATOR_DECIDER_API_URL", default="http://ollama:11434/api/chat")
 
 
 def _synthesis_api_key() -> str:

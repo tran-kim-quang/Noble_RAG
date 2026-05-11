@@ -363,6 +363,7 @@ def _warmup_decider_model(settings: Settings) -> None:
         prompt="Warmup ping. Reply briefly with OK.",
         temperature=0.0,
         response_format=None,
+        call_role="decider",
     )
 
 
@@ -382,6 +383,7 @@ def _warmup_synthesis_model(settings: Settings) -> None:
         response_format=None,
         max_tokens=16,
         enable_stream=False,
+        call_role="synthesis",
     )
 
 
@@ -1883,23 +1885,21 @@ def _call_model_generate(
     timeout_sec: float,
     keep_alive: str,
     prompt: str,
+    messages: list[dict[str, str]] | None = None,
     temperature: float,
     response_format: str | None = "json",
     max_tokens: int | None = None,
     enable_stream: bool = False,
+    call_role: str = "general",
 ) -> Any:
-    def _normalize_ollama_cloud_openai_url(raw_url: str) -> str:
+    def _normalize_ollama_cloud_native_url(raw_url: str) -> str:
         parsed = urllib.parse.urlsplit(raw_url)
         base = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
         path = (parsed.path or "").rstrip("/")
         if not path:
-            return base + "/v1/chat/completions"
-        if path.endswith("/v1/chat/completions"):
-            return base + path
-        # Accept common ollama-style path and upgrade to cloud chat-completions.
+            return base + "/api/generate"
         if path.endswith("/api/generate") or path.endswith("/api/chat"):
-            return base + "/v1/chat/completions"
-        # Keep explicit custom path if user provides one.
+            return base + path
         return base + path
 
     api_format = str(api_format or "ollama").strip().lower()
@@ -1907,12 +1907,22 @@ def _call_model_generate(
     api_url = str(api_url or "").strip()
     log.info("model_call config: format=%s url=%s model=%s stream=%s", api_format, api_url, model, bool(enable_stream))
 
-    # Ollama Cloud serves OpenAI-compatible endpoints on ollama.com.
-    # If env is configured as `ollama` format against ollama.com root,
-    # auto-upgrade to OpenAI format to avoid HTML/non-JSON responses.
-    if api_format == "ollama" and "ollama.com" in api_url:
-        api_format = "openai"
-        api_url = _normalize_ollama_cloud_openai_url(api_url)
+    # Ollama Cloud supports native `/api/...` directly on ollama.com.
+    # For orchestrator behavior consistency:
+    # - decider is forced to `/api/generate`
+    # - synthesis is forced to `/api/chat`
+    if api_format == "ollama":
+        if "ollama.com" in api_url:
+            api_url = _normalize_ollama_cloud_native_url(api_url)
+        parsed = urllib.parse.urlsplit(api_url)
+        base = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+        path = (parsed.path or "").rstrip("/")
+        if call_role == "decider":
+            api_url = base + "/api/generate"
+        elif call_role == "synthesis":
+            api_url = base + "/api/chat"
+        elif not path:
+            api_url = base + "/api/generate"
     headers: dict[str, str] = {
         "Content-Type": "application/json",
         "User-Agent": _MODEL_HTTP_USER_AGENT,
@@ -1925,9 +1935,10 @@ def _call_model_generate(
             headers[header_name] = api_key
 
     if api_format == "openai":
+        message_payload = messages if messages else [{"role": "user", "content": prompt}]
         payload: dict[str, Any] = {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": message_payload,
             "stream": bool(enable_stream),
         }
         # Kimi k2.5 supports thinking/non-thinking modes; disable thinking for faster routing/synthesis turns.
@@ -1941,12 +1952,17 @@ def _call_model_generate(
         if response_format == "json":
             payload["response_format"] = {"type": "json_object"}
     else:
+        parsed_url = urllib.parse.urlsplit(api_url)
+        is_ollama_chat_api = (parsed_url.path or "").rstrip("/").endswith("/api/chat")
         payload = {
             "model": model,
             "prompt": prompt,
             "stream": bool(enable_stream),
             "options": {"temperature": temperature},
         }
+        if is_ollama_chat_api:
+            payload.pop("prompt", None)
+            payload["messages"] = messages if messages else [{"role": "user", "content": prompt}]
         if response_format:
             payload["format"] = response_format
             # Some reasoning-capable Ollama models return only `thinking` with empty
@@ -1997,7 +2013,8 @@ def _call_model_generate(
                                     parts.append(text)
                 return "".join(parts)
 
-            # Ollama streaming: newline-delimited JSON objects with `response` chunks.
+            # Ollama streaming: newline-delimited JSON with `response` chunks
+            # (generate) or `message.content` chunks (chat).
             parts = []
             while True:
                 line_bytes = resp.readline()
@@ -2013,6 +2030,12 @@ def _call_model_generate(
                 chunk = event.get("response")
                 if isinstance(chunk, str) and chunk:
                     parts.append(chunk)
+                    continue
+                message = event.get("message")
+                if isinstance(message, dict):
+                    content = message.get("content")
+                    if isinstance(content, str) and content:
+                        parts.append(content)
             return "".join(parts)
 
     with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
@@ -2041,6 +2064,11 @@ def _call_model_generate(
     response_text = parsed.get("response", "")
     if isinstance(response_text, str) and response_text.strip():
         return response_text
+    message = parsed.get("message")
+    if isinstance(message, dict):
+        message_content = message.get("content")
+        if isinstance(message_content, str) and message_content.strip():
+            return message_content
     thinking_text = parsed.get("thinking", "")
     if isinstance(thinking_text, str):
         return thinking_text
@@ -2294,6 +2322,94 @@ def _build_no_decider_direct_reply_prompt(
     )
 
 
+def _history_to_chat_messages(recent_history: list[HistoryTurn], max_turns: int) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for turn in recent_history[-max_turns:]:
+        role = str(turn.role or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = str(turn.message or "").strip()
+        if not content:
+            continue
+        out.append({"role": role, "content": content})
+    return out
+
+
+def _build_no_decider_direct_reply_messages(
+    *,
+    message: str,
+    recent_history: list[HistoryTurn],
+    lead_state: LeadState,
+    reply_plan: ReplyPlan,
+    settings: Settings,
+) -> list[dict[str, str]]:
+    state_payload = {
+        "need_summary": lead_state.need.summary,
+        "painpoint_summary": lead_state.painpoint.summary,
+        "sales_state": lead_state.sales_state,
+        "engagement_state": lead_state.engagement_state,
+        "conversation_goal": lead_state.last_conversation_goal,
+        "next_best_action": lead_state.next_best_action,
+    }
+    system_prompt = (
+        "Ban la tro ly tu van bat dong san.\n"
+        "Boi canh: decider tam thoi khong san sang. Van phai tu van theo noi dung query cua khach.\n"
+        "Muc tieu: tra loi gon, tu nhien, bam sat query, khong noi ve loi he thong.\n"
+        "Bat buoc: tra ve DUY NHAT 1 JSON object theo schema {\"assistant_reply\":\"...\"}.\n"
+        "Khong markdown, khong giai thich them.\n"
+        f"ask_policy={json.dumps(reply_plan.ask_policy, ensure_ascii=False)}\n"
+        f"response_mode={json.dumps(reply_plan.response_mode, ensure_ascii=False)}\n"
+        f"focus={json.dumps(reply_plan.focus, ensure_ascii=False)}\n"
+        f"question_focus={json.dumps(reply_plan.question_focus, ensure_ascii=False)}\n"
+        f"lead_state={json.dumps(state_payload, ensure_ascii=False)}\n"
+    )
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(_history_to_chat_messages(recent_history, settings.synthesis_history_turns))
+    messages.append({"role": "user", "content": message})
+    return messages
+
+
+def _build_synthesis_chat_messages(
+    *,
+    message: str,
+    lead_state: LeadState,
+    recent_history: list[HistoryTurn],
+    final_route: str,
+    query_type: str,
+    decision_reason: str,
+    reply_plan: ReplyPlan,
+    grounded_result: dict[str, Any] | None,
+    settings: Settings,
+) -> list[dict[str, str]]:
+    compact_state = {
+        "need_summary": lead_state.need.summary,
+        "painpoint_summary": lead_state.painpoint.summary,
+        "sales_state": lead_state.sales_state,
+        "engagement_state": lead_state.engagement_state,
+        "conversation_goal": lead_state.last_conversation_goal,
+        "next_best_action": lead_state.next_best_action,
+    }
+    system_prompt = (
+        "Ban la tro ly tu van bat dong san.\n"
+        "Nhiem vu: tra loi phu hop theo route/chien luoc, ngan gon, tu nhien, khong noi ky thuat he thong.\n"
+        "Bat buoc tra ve DUY NHAT 1 JSON object theo schema {\"assistant_reply\":\"...\"}.\n"
+        "Khong markdown, khong giai thich them.\n"
+        f"final_route={json.dumps(_normalize_route(final_route), ensure_ascii=False)}\n"
+        f"query_type={json.dumps(_normalize_query_type(query_type), ensure_ascii=False)}\n"
+        f"decision_reason={json.dumps(decision_reason, ensure_ascii=False)}\n"
+        f"response_mode={json.dumps(_normalize_response_mode(reply_plan.response_mode), ensure_ascii=False)}\n"
+        f"ask_policy={json.dumps(_normalize_ask_policy(reply_plan.ask_policy), ensure_ascii=False)}\n"
+        f"focus={json.dumps(reply_plan.focus, ensure_ascii=False)}\n"
+        f"question_focus={json.dumps(reply_plan.question_focus, ensure_ascii=False)}\n"
+        f"lead_state={json.dumps(compact_state, ensure_ascii=False)}\n"
+        f"grounded_context={json.dumps(grounded_result or {}, ensure_ascii=False)}\n"
+    )
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(_history_to_chat_messages(recent_history, settings.synthesis_history_turns))
+    messages.append({"role": "user", "content": message})
+    return messages
+
+
 def synthesize_assistant_reply_no_decider(
     *,
     message: str,
@@ -2302,7 +2418,7 @@ def synthesize_assistant_reply_no_decider(
     reply_plan: ReplyPlan,
     settings: Settings,
 ) -> str:
-    prompt = _build_no_decider_direct_reply_prompt(
+    chat_messages = _build_no_decider_direct_reply_messages(
         message=message,
         recent_history=recent_history,
         lead_state=lead_state,
@@ -2317,11 +2433,13 @@ def synthesize_assistant_reply_no_decider(
         model=settings.synthesis_model,
         timeout_sec=settings.synthesis_timeout_sec,
         keep_alive=settings.synthesis_keep_alive,
-        prompt=prompt,
+        prompt=message,
+        messages=chat_messages,
         temperature=max(0.0, min(1.0, settings.synthesis_temperature)),
         response_format="json",
         max_tokens=settings.synthesis_output_max_tokens,
         enable_stream=False,
+        call_role="synthesis",
     )
     reply = _sanitize_reply_for_policy(
         reply=_extract_assistant_reply(response_payload),
@@ -2366,6 +2484,17 @@ def synthesize_assistant_reply(
         grounded_result=grounded_result,
         settings=settings,
     )
+    primary_messages = _build_synthesis_chat_messages(
+        message=message,
+        lead_state=lead_state,
+        recent_history=recent_history,
+        final_route=final_route,
+        query_type=analysis.query_type,
+        decision_reason=decision_reason,
+        reply_plan=reply_plan,
+        grounded_result=grounded_result,
+        settings=settings,
+    )
     single_project_mode = False
     if grounded_result:
         single_project_mode = _is_single_project_mode(
@@ -2391,6 +2520,7 @@ def synthesize_assistant_reply(
             return _compact_text(cached_response, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
     
     attempt_prompt = primary_prompt
+    attempt_messages = primary_messages
     last_failure_reason = "reply_synthesis_not_attempted"
     for attempt_index in range(2):
         try:
@@ -2407,10 +2537,12 @@ def synthesize_assistant_reply(
                 timeout_sec=settings.synthesis_timeout_sec,
                 keep_alive=settings.synthesis_keep_alive,
                 prompt=attempt_prompt,
+                messages=attempt_messages,
                 temperature=max(0.0, min(1.0, settings.synthesis_temperature)),
                 response_format="json",
                 max_tokens=settings.synthesis_output_max_tokens,
                 enable_stream=settings.synthesis_enable_streaming,
+                call_role="synthesis",
             )
             
             if timing_inst:
@@ -2466,11 +2598,13 @@ def synthesize_assistant_reply(
             raise RuntimeError(f"reply synthesis failed: {exc}") from exc
 
         if attempt_index == 0:
+            invalid_reply = locals().get("reply", "")
             attempt_prompt = _build_reply_repair_prompt(
                 original_prompt=primary_prompt,
-                invalid_reply=reply,
+                invalid_reply=invalid_reply,
                 invalid_reason=last_failure_reason,
             )
+            attempt_messages = list(primary_messages) + [{"role": "user", "content": attempt_prompt}]
 
     grounded_fallback = _build_grounded_specific_reply(grounded_result)
     if grounded_fallback:
@@ -2552,6 +2686,7 @@ def _analyze_turn_with_model(
         temperature=settings.decider_temperature,
         response_format="json",
         max_tokens=settings.decider_output_max_tokens,
+        call_role="decider",
     )
     if isinstance(response_payload, dict):
         result_obj = response_payload
@@ -4112,4 +4247,3 @@ def create_app(
 
 
 app = create_app()
-
