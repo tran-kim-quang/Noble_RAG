@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from typing import Literal
 
@@ -32,6 +32,21 @@ class VisionProfile(BaseModel):
     bbox: list[int] | None = None
     reason: str | None = None
     face_id: str | None = None
+
+    @field_validator("age", mode="before")
+    @classmethod
+    def normalize_age(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return "trẻ" if int(value) < 40 else "trung niên"
+        if isinstance(value, str):
+            cleaned = value.strip().lower()
+            if cleaned in {"trẻ", "tre", "young"}:
+                return "trẻ"
+            if cleaned in {"trung niên", "trung nien", "middle", "middle-aged", "middle_aged"}:
+                return "trung niên"
+        return None
 
 
 class HealthResponse(BaseModel):

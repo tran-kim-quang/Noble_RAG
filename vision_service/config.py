@@ -39,6 +39,10 @@ class Settings:
     max_image_bytes: int = int(os.getenv("VISION_MAX_IMAGE_BYTES", str(5 * 1024 * 1024)))
     temp_face_ttl_sec: int = int(os.getenv("VISION_TEMP_FACE_TTL_SEC", "300"))
     temp_face_match_threshold: float = float(os.getenv("VISION_TEMP_FACE_MATCH_THRESHOLD", "0.6"))
+    shared_identity_db_path: str = os.getenv(
+        "SHARED_IDENTITY_DB_PATH",
+        "data/shared_identity/identity.sqlite3",
+    ).strip()
 
 
 def get_settings() -> Settings:

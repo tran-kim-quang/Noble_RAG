@@ -1086,13 +1086,18 @@ class RetrievalService:
     def _embed_remote_ollama(self, text: str) -> list[float]:
         payload = {
             "model": self.settings.embedding_model,
-            "prompt": text,
+            "input": text,
         }
         parsed = self._post_embedding_json(payload)
         embedding = parsed.get("embedding")
-        if not isinstance(embedding, list) or not embedding:
-            raise RuntimeError("Remote embedding endpoint returned invalid 'embedding' payload for ollama format.")
-        return [float(item) for item in embedding]
+        if isinstance(embedding, list) and embedding:
+            return [float(item) for item in embedding]
+        embeddings = parsed.get("embeddings")
+        if isinstance(embeddings, list) and embeddings and isinstance(embeddings[0], list) and embeddings[0]:
+            return [float(item) for item in embeddings[0]]
+        raise RuntimeError(
+            "Remote embedding endpoint returned invalid payload for ollama format; expected 'embedding' or 'embeddings[0]'."
+        )
 
     def _embed_remote_openai(self, texts: list[str]) -> list[list[float]]:
         payload = {

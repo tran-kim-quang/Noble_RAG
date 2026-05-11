@@ -16,6 +16,7 @@ from pydantic import ValidationError
 
 from vision_service.config import Settings
 from vision_service.schemas import VisionProfile
+from shared.identity_store import SharedIdentityStore
 
 log = logging.getLogger("vision-service")
 
@@ -58,8 +59,10 @@ class VisionService:
         self.people: dict[str, Any] = {}
         self.image_count: dict[str, int] = {}
         self.temp_faces: dict[str, dict[str, Any]] = {}
+        self.identity_store = SharedIdentityStore(settings.shared_identity_db_path)
         self._vlm_client = None
         self.load()
+        self._hydrate_temp_faces_from_store()
 
     @staticmethod
     def _build_legacy_face_app(FaceAnalysis, model_name: str):
@@ -137,6 +140,22 @@ class VisionService:
         self._purge_expired_temp_faces()
         return {"status": "ok", "people_count": len(self.people)}
 
+    def _hydrate_temp_faces_from_store(self) -> None:
+        loaded = 0
+        for face_id, embedding, meta in self.identity_store.load_guest_embeddings():
+            if not embedding:
+                continue
+            self.temp_faces[face_id] = {
+                "embedding": self._normalize_embedding(self.np.asarray(embedding, dtype=self.np.float32)),
+                "age": meta.get("age"),
+                "gender": meta.get("gender"),
+                # Guest now persists long-term across services; keep in-memory cache hot.
+                "expires_at": time.time() + max(1, self.settings.temp_face_ttl_sec),
+            }
+            loaded += 1
+        if loaded:
+            log.info("hydrated guest faces from shared db count=%s", loaded)
+
     def identify_base64(
         self,
         image_base64: str,
@@ -167,7 +186,7 @@ class VisionService:
         bbox = [int(x) for x in face.bbox]
 
         if match_name and score >= self.settings.match_threshold:
-            return VisionProfile(
+            profile = VisionProfile(
                 recognized=True,
                 name=match_name,
                 age=age,
@@ -178,11 +197,13 @@ class VisionService:
                 bbox=bbox,
                 face_id=self._known_face_id(match_name),
             )
+            self._persist_profile(profile, embedding=embedding)
+            return profile
 
         temp_face_id, temp_score = self._get_or_create_temp_face_id(embedding, age=age, gender=gender)
 
         if gender is not None and age is not None:
-            return VisionProfile(
+            profile = VisionProfile(
                 recognized=False,
                 name=None,
                 age=age,
@@ -194,13 +215,15 @@ class VisionService:
                 reason="unknown_face_local_gender_only",
                 face_id=temp_face_id,
             )
+            self._persist_profile(profile, embedding=embedding)
+            return profile
 
         vlm_age, vlm_gender = self._infer_personal_with_vlm(image_bytes)
         merged_age = age or vlm_age
         merged_gender = gender or vlm_gender
         if merged_age is not None or merged_gender is not None:
             self._update_temp_face(temp_face_id, age=merged_age, gender=merged_gender)
-            return VisionProfile(
+            profile = VisionProfile(
                 recognized=False,
                 name=None,
                 age=merged_age,
@@ -212,8 +235,10 @@ class VisionService:
                 reason="unknown_face_vlm_personal",
                 face_id=temp_face_id,
             )
+            self._persist_profile(profile, embedding=embedding)
+            return profile
 
-        return VisionProfile(
+        profile = VisionProfile(
             recognized=False,
             name=None,
             age=age,
@@ -225,6 +250,8 @@ class VisionService:
             reason="unknown_face_no_gender",
             face_id=temp_face_id,
         )
+        self._persist_profile(profile, embedding=embedding)
+        return profile
 
     def _match_embedding(self, embedding: Any) -> tuple[str | None, float]:
         if not self.people:
@@ -272,6 +299,7 @@ class VisionService:
             "gender": gender,
             "expires_at": time.time() + max(1, self.settings.temp_face_ttl_sec),
         }
+        self._persist_temp_face(temp_face_id)
         return temp_face_id, max(0.0, score)
 
     def _touch_temp_face(
@@ -292,6 +320,7 @@ class VisionService:
         if gender is not None:
             payload["gender"] = gender
         payload["expires_at"] = time.time() + max(1, self.settings.temp_face_ttl_sec)
+        self._persist_temp_face(temp_face_id)
 
     def _update_temp_face(self, temp_face_id: str, age: str | None, gender: str | None) -> None:
         payload = self.temp_faces.get(temp_face_id)
@@ -302,6 +331,46 @@ class VisionService:
         if gender is not None:
             payload["gender"] = gender
         payload["expires_at"] = time.time() + max(1, self.settings.temp_face_ttl_sec)
+        self._persist_temp_face(temp_face_id)
+
+    def _persist_temp_face(self, temp_face_id: str) -> None:
+        payload = self.temp_faces.get(temp_face_id)
+        if payload is None:
+            return
+        embedding = payload.get("embedding")
+        if embedding is None:
+            return
+        embedding_list = self.np.asarray(embedding).astype(self.np.float32).tolist()
+        face_session_key = f"guest:{temp_face_id}"
+        self.identity_store.upsert_identity(
+            face_id=temp_face_id,
+            face_session_key=face_session_key,
+            customer_kind="guest",
+            age=payload.get("age"),
+            gender=payload.get("gender"),
+            source="local_face_analysis",
+            embedding=embedding_list,
+        )
+
+    def _persist_profile(self, profile: VisionProfile, embedding: Any) -> None:
+        face_id = str(profile.face_id or "").strip()
+        if not face_id:
+            return
+        customer_kind = "known" if profile.recognized and profile.name else "guest"
+        face_session_key = f"{customer_kind}:{face_id}"
+        embedding_list = self.np.asarray(embedding).astype(self.np.float32).tolist()
+        self.identity_store.upsert_identity(
+            face_id=face_id,
+            face_session_key=face_session_key,
+            customer_kind=customer_kind,
+            name=profile.name,
+            age=profile.age,
+            gender=profile.gender,
+            source=profile.source,
+            confidence=float(profile.confidence or 0.0),
+            embedding=embedding_list,
+            vision_context=profile.model_dump(mode="json"),
+        )
 
     def _purge_expired_temp_faces(self) -> None:
         now = time.time()

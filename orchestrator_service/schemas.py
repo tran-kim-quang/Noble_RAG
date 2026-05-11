@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
@@ -10,6 +10,22 @@ from pydantic import field_validator
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_age_bucket(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return "trẻ" if int(value) < 40 else "trung niên"
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        if not cleaned:
+            return None
+        if cleaned in {"trẻ", "tre", "young"}:
+            return "trẻ"
+        if cleaned in {"trung niên", "trung nien", "middle", "middle-aged", "middle_aged"}:
+            return "trung niên"
+    return None
 
 
 class TopicWeight(BaseModel):
@@ -44,6 +60,11 @@ class VisionContext(BaseModel):
     reason: str | None = None
     face_id: str | None = None
 
+    @field_validator("age", mode="before")
+    @classmethod
+    def normalize_age(cls, value: Any) -> str | None:
+        return _normalize_age_bucket(value)
+
 
 class CustomerProfileState(BaseModel):
     recognized: bool = False
@@ -56,6 +77,11 @@ class CustomerProfileState(BaseModel):
     greeted_by_name: bool = False
     greeted_generic: bool = False
     face_id: str | None = None
+
+    @field_validator("age", mode="before")
+    @classmethod
+    def normalize_age(cls, value: Any) -> str | None:
+        return _normalize_age_bucket(value)
 
 
 class LeadState(BaseModel):
@@ -306,8 +332,9 @@ class LiveTalkingSessionStartRequest(BaseModel):
         return cleaned
 
 
-class LiveTalkingQueryRequest(VisionQueryRequest):
-    pass
+class LiveTalkingQueryRequest(QueryRequest):
+    request_id: str | None = None
+    stream: bool = False
 
 
 class LiveTalkingStopRequest(BaseModel):
@@ -340,3 +367,4 @@ class LiveTalkingStopResponse(BaseModel):
     stopped: bool
     session_id: str | None = None
     face_session_key: str | None = None
+

@@ -37,10 +37,21 @@ function Convert-ToLocalUrl {
     if (-not $Url) {
         return $Url
     }
-    return ($Url -replace "retrieval-service", "127.0.0.1" `
-                  -replace "vision-service", "127.0.0.1" `
-                  -replace "qdrant", "127.0.0.1" `
-                  -replace "ollama", "127.0.0.1")
+    try {
+        $uri = [System.Uri]$Url
+    } catch {
+        return $Url
+    }
+
+    $urlHost = $uri.Host.ToLowerInvariant()
+    $mapHosts = @("retrieval-service", "vision-service", "qdrant", "ollama")
+    if ($mapHosts -notcontains $urlHost) {
+        return $Url
+    }
+
+    $builder = New-Object System.UriBuilder($uri)
+    $builder.Host = "127.0.0.1"
+    return $builder.Uri.AbsoluteUri
 }
 
 function Get-MapValueOrDefault {
@@ -139,14 +150,33 @@ function Start-UvicornService {
     }
     Set-Content -LiteralPath $envFile -Value $lines -Encoding UTF8
 
-    $proc = Start-Process `
-        -FilePath $PythonExe `
-        -ArgumentList @("-m", "uvicorn", $Module, "--host", "0.0.0.0", "--port", [string]$Port, "--env-file", $envFile) `
-        -WorkingDirectory $WorkingDir `
-        -WindowStyle Hidden `
-        -RedirectStandardOutput $StdOutLog `
-        -RedirectStandardError $StdErrLog `
-        -PassThru
+    # Force override process-level env for child uvicorn process.
+    # Uvicorn --env-file does not override already-exported env vars by default.
+    $previous = @{}
+    foreach ($k in $EnvVars.Keys) {
+        $previous[$k] = [System.Environment]::GetEnvironmentVariable($k, "Process")
+        [System.Environment]::SetEnvironmentVariable($k, [string]$EnvVars[$k], "Process")
+    }
+
+    try {
+        $proc = Start-Process `
+            -FilePath $PythonExe `
+            -ArgumentList @("-m", "uvicorn", $Module, "--host", "0.0.0.0", "--port", [string]$Port, "--env-file", $envFile) `
+            -WorkingDirectory $WorkingDir `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $StdOutLog `
+            -RedirectStandardError $StdErrLog `
+            -PassThru
+    } finally {
+        foreach ($k in $EnvVars.Keys) {
+            if ($null -eq $previous[$k]) {
+                [System.Environment]::SetEnvironmentVariable($k, $null, "Process")
+            } else {
+                [System.Environment]::SetEnvironmentVariable($k, [string]$previous[$k], "Process")
+            }
+        }
+    }
+
     Write-Host ("[UP]   {0} pid={1} port={2}" -f $Name, $proc.Id, $Port)
     return $proc
 }
@@ -184,12 +214,12 @@ $localRetrievalUrl = ("http://127.0.0.1:{0}" -f $retrievalPort)
 $localVisionUrl = ("http://127.0.0.1:{0}" -f $visionPort)
 $deciderApiUrlRaw = Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_DECIDER_API_URL" -DefaultValue "http://127.0.0.1:11434/api/generate"
 $deciderApiUrl = Convert-ToLocalUrl $deciderApiUrlRaw
-if (($deciderApiUrl -match "ollama\.com") -or (-not $deciderApiUrl)) {
+if (-not $deciderApiUrl) {
     $deciderApiUrl = "http://127.0.0.1:11434/api/generate"
 }
 $synthesisApiUrlRaw = Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_SYNTHESIS_API_URL" -DefaultValue "http://127.0.0.1:11434/api/generate"
 $synthesisApiUrl = Convert-ToLocalUrl $synthesisApiUrlRaw
-if (($synthesisApiUrl -match "ollama\.com") -or (-not $synthesisApiUrl)) {
+if (-not $synthesisApiUrl) {
     $synthesisApiUrl = "http://127.0.0.1:11434/api/generate"
 }
 
@@ -210,7 +240,7 @@ $retrievalEnv = @{
     "QDRANT_COLLECTION" = (Get-MapValueOrDefault -Map $envRetrieval -Key "QDRANT_COLLECTION" -DefaultValue "retrieval_bench_qwen3_8b_local")
     "QDRANT_TIMEOUT_SEC" = (Get-MapValueOrDefault -Map $envRetrieval -Key "QDRANT_TIMEOUT_SEC" -DefaultValue "10")
     "EMBEDDING_BACKEND" = (Get-MapValueOrDefault -Map $envRetrieval -Key "EMBEDDING_BACKEND" -DefaultValue "remote")
-    "EMBEDDING_API_URL" = $(if ($embeddingApiUrl) { $embeddingApiUrl } else { "http://127.0.0.1:11434/api/embeddings" })
+    "EMBEDDING_API_URL" = $(if ($embeddingApiUrl) { $embeddingApiUrl } else { "http://localhost:11434/api/embed" })
     "EMBEDDING_API_FORMAT" = (Get-MapValueOrDefault -Map $envRetrieval -Key "EMBEDDING_API_FORMAT" -DefaultValue "ollama")
     "EMBEDDING_API_TIMEOUT_SEC" = (Get-MapValueOrDefault -Map $envRetrieval -Key "EMBEDDING_API_TIMEOUT_SEC" -DefaultValue "240")
     "EMBEDDING_MODEL" = (Get-MapValueOrDefault -Map $envRetrieval -Key "EMBEDDING_MODEL" -DefaultValue "qwen3-embedding:8b")
@@ -228,13 +258,42 @@ $orchEnv = @{
     "VISION_SERVICE_URL" = $(if ($visionUrl) { $visionUrl } else { $localVisionUrl })
     "RETRIEVAL_TIMEOUT_SEC" = (Get-MapValueOrDefault -Map $envOrch -Key "RETRIEVAL_TIMEOUT_SEC" -DefaultValue "15")
     "VISION_TIMEOUT_SEC" = (Get-MapValueOrDefault -Map $envOrch -Key "VISION_TIMEOUT_SEC" -DefaultValue "12")
-    "ORCHESTRATOR_DECIDER_ENABLED" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_DECIDER_ENABLED" -DefaultValue "true")
+    "ORCHESTRATOR_DECIDER_ENABLED" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_DECIDER_ENABLED" -DefaultValue "false")
     "ORCHESTRATOR_DECIDER_API_FORMAT" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_DECIDER_API_FORMAT" -DefaultValue "ollama")
     "ORCHESTRATOR_DECIDER_API_URL" = $deciderApiUrl
     "ORCHESTRATOR_DECIDER_MODEL" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_DECIDER_MODEL" -DefaultValue "gemma4:latest")
+    "ORCHESTRATOR_DECIDER_TIMEOUT_SEC" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_DECIDER_TIMEOUT_SEC" -DefaultValue "35")
+    "ORCHESTRATOR_DECIDER_TEMPERATURE" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_DECIDER_TEMPERATURE" -DefaultValue "0.2")
+    "ORCHESTRATOR_DECIDER_KEEP_ALIVE" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_DECIDER_KEEP_ALIVE" -DefaultValue "30m")
+    "ORCHESTRATOR_DECIDER_OUTPUT_MAX_TOKENS" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_DECIDER_OUTPUT_MAX_TOKENS" -DefaultValue "140")
+    "ORCHESTRATOR_DECIDER_HISTORY_TURNS" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_DECIDER_HISTORY_TURNS" -DefaultValue "4")
     "ORCHESTRATOR_SYNTHESIS_API_FORMAT" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_SYNTHESIS_API_FORMAT" -DefaultValue "ollama")
     "ORCHESTRATOR_SYNTHESIS_API_URL" = $synthesisApiUrl
     "ORCHESTRATOR_SYNTHESIS_MODEL" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_SYNTHESIS_MODEL" -DefaultValue "gemma4:latest")
+    "ORCHESTRATOR_SYNTHESIS_TIMEOUT_SEC" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_SYNTHESIS_TIMEOUT_SEC" -DefaultValue "35")
+    "ORCHESTRATOR_SYNTHESIS_TEMPERATURE" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_SYNTHESIS_TEMPERATURE" -DefaultValue "0.38")
+    "ORCHESTRATOR_SYNTHESIS_KEEP_ALIVE" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_SYNTHESIS_KEEP_ALIVE" -DefaultValue "30m")
+    "ORCHESTRATOR_SYNTHESIS_HISTORY_TURNS" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_SYNTHESIS_HISTORY_TURNS" -DefaultValue "3")
+    "ORCHESTRATOR_SYNTHESIS_CACHE_ENABLED" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_SYNTHESIS_CACHE_ENABLED" -DefaultValue "true")
+    "ORCHESTRATOR_SYNTHESIS_CACHE_MAX_ENTRIES" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_SYNTHESIS_CACHE_MAX_ENTRIES" -DefaultValue "1000")
+    "ORCHESTRATOR_SYNTHESIS_CACHE_TTL_SECONDS" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_SYNTHESIS_CACHE_TTL_SECONDS" -DefaultValue "3600")
+    "ORCHESTRATOR_SYNTHESIS_OUTPUT_MAX_TOKENS" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_SYNTHESIS_OUTPUT_MAX_TOKENS" -DefaultValue "300")
+    "ORCHESTRATOR_SYNTHESIS_ENABLE_STREAMING" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_SYNTHESIS_ENABLE_STREAMING" -DefaultValue "false")
+    "ORCHESTRATOR_SYNTHESIS_COMPRESSION_MODE" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_SYNTHESIS_COMPRESSION_MODE" -DefaultValue "moderate")
+    "ORCHESTRATOR_SYNTHESIS_OPTIMIZED_HISTORY_TURNS" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_SYNTHESIS_OPTIMIZED_HISTORY_TURNS" -DefaultValue "2")
+    "ORCHESTRATOR_ENABLE_TIMING_INSTRUMENTATION" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_ENABLE_TIMING_INSTRUMENTATION" -DefaultValue "true")
+    "ORCHESTRATOR_QUICK_INTENT_FAST_RESPONSE_ENABLED" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_QUICK_INTENT_FAST_RESPONSE_ENABLED" -DefaultValue "true")
+    "ORCHESTRATOR_QUICK_INTENT_RESPONSE_MAX_WORDS" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_QUICK_INTENT_RESPONSE_MAX_WORDS" -DefaultValue "48")
+    "ORCHESTRATOR_MODEL_WARMUP_ENABLED" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_MODEL_WARMUP_ENABLED" -DefaultValue "true")
+    "ORCHESTRATOR_MODEL_WARMUP_INTERVAL_SEC" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_MODEL_WARMUP_INTERVAL_SEC" -DefaultValue "60")
+    "ORCHESTRATOR_MODEL_WARMUP_DECIDER_ENABLED" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_MODEL_WARMUP_DECIDER_ENABLED" -DefaultValue "true")
+    "ORCHESTRATOR_MODEL_WARMUP_SYNTHESIS_ENABLED" = (Get-MapValueOrDefault -Map $envOrch -Key "ORCHESTRATOR_MODEL_WARMUP_SYNTHESIS_ENABLED" -DefaultValue "false")
+    # Force-disable legacy alias vars so they cannot override ORCHESTRATOR_* at runtime.
+    "LLM_DECIDER_API_FORMAT" = ""
+    "LLM_DECIDER_API_URL" = ""
+    "LLM_DECIDER_KEY" = ""
+    "LLM_DECIDER_NAME" = ""
+    "LLM_DECIDER_API_KEY_HEADER" = ""
 }
 
 if ($envOrch.ContainsKey("ORCHESTRATOR_DECIDER_API_KEY")) {

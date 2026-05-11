@@ -12,6 +12,7 @@ from pathlib import Path
 DEFAULT_FILES = [
     "02_12_2025_CSBH_574_NOBLE_PALACE_TAY_THANG_LONG_HDBM.md",
     "CONCEPT_THIET_KE_08_02_2025_only_hang_muc_noi_dung.md",
+    "fact_sheet_sunshine.md",
 ]
 
 HEADING_RE = re.compile(r"(?m)^#{1,6}\s+")

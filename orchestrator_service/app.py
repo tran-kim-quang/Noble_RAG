@@ -7,18 +7,23 @@ import binascii
 import hashlib
 import json
 import logging
+import os
 import re
 import socket
+import tempfile
 import threading
 import time
+import unicodedata
 from typing import Any, Callable
 import urllib.error
+import urllib.parse
 import urllib.request
 from uuid import uuid4
 
 from fastapi import FastAPI
 from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 from orchestrator_service.config import Settings
 from orchestrator_service.config import get_settings
@@ -54,6 +59,7 @@ from orchestrator_service.schemas import (
     VisionQueryRequest,
 )
 from orchestrator_service.vision_client import VisionClient
+from shared.identity_store import SharedIdentityStore
 
 log = logging.getLogger("sales-orchestrator")
 _MODEL_HTTP_USER_AGENT = "Noble-RAG-Orchestrator/1.0"
@@ -126,6 +132,14 @@ _FASTPATH_CONSULT_RESPONSE_MODES = {
 }
 _SYNTHESIS_REPLY_MAX_WORDS = 180
 _DECIDER_CONSULT_REPLY_MAX_WORDS = 140
+_INVENTORY_CLAIM_PATTERNS = (
+    "hiện em đang có",
+    "hiện em có",
+    "đang có nhiều dự án",
+    "có nhiều dự án",
+    "dữ liệu từ nhiều dự án",
+    "nhiều dự án trong hệ thống",
+)
 
 
 @dataclass(frozen=True)
@@ -221,6 +235,107 @@ def _extract_phone_contact(message: str) -> str | None:
         return None
     phone = re.sub(r"\s+", "", match.group(0))
     return phone
+
+
+def _has_grounding_evidence(grounded_result: dict[str, Any] | None) -> bool:
+    if not isinstance(grounded_result, dict):
+        return False
+    cards = grounded_result.get("project_cards", []) or []
+    chunks = grounded_result.get("evidence_chunks", []) or []
+    return bool(cards and chunks)
+
+
+def _contains_inventory_claim(reply: str) -> bool:
+    lowered = str(reply or "").strip().lower()
+    if not lowered:
+        return False
+    return any(pattern in lowered for pattern in _INVENTORY_CLAIM_PATTERNS)
+
+
+def _build_no_grounding_reply(message: str) -> str:
+    query = str(message or "").strip()
+    if query:
+        return (
+            f"Hiện tại em chưa truy xuất được dữ liệu dự án cho yêu cầu: \"{query}\". "
+            "Anh/chị vui lòng thử lại sau ít phút để em phản hồi chính xác theo dữ liệu hệ thống."
+        )
+    return (
+        "Hiện tại em chưa truy xuất được dữ liệu dự án từ hệ thống. "
+        "Anh/chị vui lòng thử lại sau ít phút để em phản hồi chính xác."
+    )
+
+
+def _normalize_text_for_match(value: str) -> str:
+    text = unicodedata.normalize("NFD", str(value or ""))
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _extract_project_name_hint(message: str) -> str | None:
+    raw = str(message or "").strip()
+    if not raw:
+        return None
+
+    # First-pass on raw text to survive mojibake forms like "dá»± Ã¡n".
+    raw_patterns = [
+        r"(?:dự án|du an|project|dá»±\s*Ã¡n)\s+([^\n\r]{2,120})",
+    ]
+    for pattern in raw_patterns:
+        match = re.search(pattern, raw, re.IGNORECASE)
+        if not match:
+            continue
+        hint_raw = match.group(1).strip(" -")
+        hint_norm = _normalize_text_for_match(hint_raw)
+        hint_norm = re.sub(r"\b(la gi|the nao|ra sao|o dau|gia bao nhieu)$", "", hint_norm).strip()
+        if hint_norm and len(hint_norm) >= 3:
+            return hint_norm[:80]
+
+    normalized = _normalize_text_for_match(raw)
+    if not normalized:
+        return None
+    patterns = [
+        r"(?:du an|project)\s+([a-z0-9][a-z0-9\s\-]{1,80})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, normalized)
+        if not match:
+            continue
+        hint = re.sub(r"\s+", " ", match.group(1)).strip(" -")
+        # trim trailing filler words
+        hint = re.sub(r"\b(la gi|the nao|ra sao|o dau|gia bao nhieu)$", "", hint).strip()
+        if hint and len(hint) >= 3:
+            return hint[:80]
+    return None
+
+
+def _grounded_result_matches_project_hint(grounded_result: dict[str, Any] | None, project_hint: str | None) -> bool:
+    if not project_hint:
+        return True
+    if not isinstance(grounded_result, dict):
+        return False
+    target = _normalize_text_for_match(project_hint)
+    haystack_parts: list[str] = []
+    for project_id in grounded_result.get("used_projects", []) or []:
+        haystack_parts.append(str(project_id))
+    for card in grounded_result.get("project_cards", []) or []:
+        if isinstance(card, dict):
+            haystack_parts.append(str(card.get("project_id") or ""))
+            haystack_parts.append(str(card.get("summary") or ""))
+    for ev in (grounded_result.get("evidence_chunks", []) or [])[:8]:
+        if isinstance(ev, dict):
+            haystack_parts.append(str(ev.get("text") or ""))
+            haystack_parts.append(str(ev.get("source") or ""))
+    haystack = _normalize_text_for_match(" ".join(haystack_parts))
+    return bool(target and target in haystack)
+
+
+def _build_project_name_mismatch_reply(project_hint: str) -> str:
+    return (
+        f"Hiện tại em chưa tìm thấy dữ liệu phù hợp cho dự án \"{project_hint}\" trong kho tri thức. "
+        "Anh/chị vui lòng kiểm tra lại tên dự án hoặc cho em thêm thông tin để em tra cứu chính xác."
+    )
 
 
 def _coerce_extracted_name(raw: Any) -> str | None:
@@ -1694,6 +1809,12 @@ def _build_reply_synthesis_prompt(
         "- Không dùng cụm từ kỹ thuật như route/retrieval/metadata/payload/confidence/vector/schema.\n"
         "- Độ dài linh hoạt theo nhu cầu câu hỏi: mặc định ngắn gọn (thường 1-3 câu), chỉ dài hơn khi user cần chi tiết.\n"
         "- Nếu có dữ liệu phù hợp thì nêu nhận định cụ thể; nếu chưa đủ dữ liệu thì nói rõ còn thiếu gì.\n"
+        "- Khi có grounded_context với evidence_chunks: phải nêu TỐI THIỂU 2 chi tiết cụ thể từ dữ liệu (ví dụ vị trí, quy mô, loại hình sản phẩm, tiến độ bàn giao, khung giá nếu có).\n"
+        "- Nếu grounded_context có dữ liệu định lượng (con số, mốc thời gian, quy mô, tiến độ, giá): bắt buộc đưa ít nhất 1 dữ liệu định lượng vào câu trả lời.\n"
+        "- Không dùng câu chung chung kiểu 'có nhiều dự án', 'dữ liệu từ nhiều dự án', 'sản phẩm đa dạng' nếu không kèm chi tiết cụ thể.\n"
+        "- Không được chỉ trả lời bằng thông điệp marketing/CTA; phần tư vấn cụ thể phải xuất hiện trước CTA.\n"
+        "- Cấu trúc ưu tiên cho câu trả lời dự án: (1) trả lời trực tiếp câu hỏi, (2) nêu 2-3 chi tiết cụ thể, (3) mở một phần thông tin sâu hơn để mời hẹn.\n"
+        "- Phần mời hẹn chỉ xuất hiện ở cuối và phải nêu rõ giá trị buổi hẹn (ví dụ so sánh căn, bóc tách bảng giá, phương án tài chính), không được thay thế phần trả lời chính.\n"
         "- Không tự suy diễn ngân sách cá nhân cụ thể (ví dụ 'với 5 tỷ...') nếu người dùng chưa nêu ngân sách.\n"
         "- Khi nhắc con số tài chính, chỉ dùng số đã có trong grounded_context hoặc user_message/recent_history.\n"
         "- Nếu người dùng cần phân tích quá sâu (tài chính chi tiết, pháp lý sâu, phương án căn cụ thể), đề xuất 1 buổi hẹn trực tiếp.\n"
@@ -1714,7 +1835,7 @@ def _build_reply_synthesis_prompt(
         "- response_mode=value_teaser: nêu 1-2 điểm hợp nổi bật để tạo hứng thú tìm hiểu tiếp.\n"
         "- response_mode=discover_need: tư vấn trước, sau đó mới làm rõ nhẹ nếu cần.\n"
         "- response_mode=consultive_recommendation: tư vấn như consultant, nêu logic vì sao phù hợp.\n"
-        "- response_mode=grounded_recommendation: nêu điểm phù hợp dựa trên grounded_context, ngắn và chắc.\n"
+        "- response_mode=grounded_recommendation: trả lời trực diện theo query và grounded_context; bắt buộc có chi tiết cụ thể, rồi mới CTA mềm ở cuối nếu phù hợp.\n"
         "- response_mode=handle_concern: giải tỏa băn khoăn nhẹ, không tranh cãi.\n"
         "- response_mode=soft_next_step: mời bước tiếp theo mềm, không gây áp lực.\n"
         "- response_mode=nurture_followup: nuôi lead, không gây áp lực.\n"
@@ -1767,19 +1888,31 @@ def _call_model_generate(
     max_tokens: int | None = None,
     enable_stream: bool = False,
 ) -> Any:
+    def _normalize_ollama_cloud_openai_url(raw_url: str) -> str:
+        parsed = urllib.parse.urlsplit(raw_url)
+        base = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+        path = (parsed.path or "").rstrip("/")
+        if not path:
+            return base + "/v1/chat/completions"
+        if path.endswith("/v1/chat/completions"):
+            return base + path
+        # Accept common ollama-style path and upgrade to cloud chat-completions.
+        if path.endswith("/api/generate") or path.endswith("/api/chat"):
+            return base + "/v1/chat/completions"
+        # Keep explicit custom path if user provides one.
+        return base + path
+
     api_format = str(api_format or "ollama").strip().lower()
     model_name = str(model or "").strip().lower()
     api_url = str(api_url or "").strip()
+    log.info("model_call config: format=%s url=%s model=%s stream=%s", api_format, api_url, model, bool(enable_stream))
 
     # Ollama Cloud serves OpenAI-compatible endpoints on ollama.com.
     # If env is configured as `ollama` format against ollama.com root,
     # auto-upgrade to OpenAI format to avoid HTML/non-JSON responses.
     if api_format == "ollama" and "ollama.com" in api_url:
         api_format = "openai"
-        if "/v1/" not in api_url:
-            api_url = api_url.rstrip("/") + "/v1/chat/completions"
-        elif not api_url.rstrip("/").endswith("/chat/completions"):
-            api_url = api_url.rstrip("/") + "/chat/completions"
+        api_url = _normalize_ollama_cloud_openai_url(api_url)
     headers: dict[str, str] = {
         "Content-Type": "application/json",
         "User-Agent": _MODEL_HTTP_USER_AGENT,
@@ -1945,6 +2078,91 @@ def _reply_needs_retry(reply: str, single_project_mode: bool, ask_policy: str) -
         return True
 
     return False
+
+
+def _extract_grounding_keywords(grounded_result: dict[str, Any] | None) -> list[str]:
+    if not isinstance(grounded_result, dict):
+        return []
+    tokens: list[str] = []
+    for project_id in grounded_result.get("used_projects", []) or []:
+        tokens.extend(re.findall(r"[a-z0-9]+", _normalize_text_for_match(str(project_id))))
+    for card in (grounded_result.get("project_cards", []) or [])[:2]:
+        if isinstance(card, dict):
+            tokens.extend(re.findall(r"[a-z0-9]+", _normalize_text_for_match(str(card.get("project_id") or ""))))
+            tokens.extend(re.findall(r"[a-z0-9]+", _normalize_text_for_match(str(card.get("summary") or ""))))
+    unique: list[str] = []
+    for token in tokens:
+        if len(token) < 4:
+            continue
+        if token in {"du", "an", "project", "city", "legend"}:
+            continue
+        if token not in unique:
+            unique.append(token)
+    return unique[:16]
+
+
+def _grounded_reply_too_generic(
+    *,
+    reply: str,
+    grounded_result: dict[str, Any] | None,
+    response_mode: str,
+    final_route: str,
+) -> bool:
+    if _normalize_route(final_route) != "project_grounded":
+        return False
+    if not _has_grounding_evidence(grounded_result):
+        return False
+
+    cleaned = str(reply or "").strip()
+    if not cleaned:
+        return True
+
+    normalized_reply = _normalize_text_for_match(cleaned)
+    # Must include at least one quantitative detail when evidence exists.
+    has_number = bool(re.search(r"\d", normalized_reply))
+    # Must include at least one project-specific keyword from grounded payload.
+    keywords = _extract_grounding_keywords(grounded_result)
+    has_keyword = any(k in normalized_reply for k in keywords) if keywords else False
+
+    # For grounded project answers, reject generic marketing copy lacking
+    # both project-specific anchors and quantitative evidence.
+    return not (has_number and has_keyword)
+
+
+def _build_grounded_specific_reply(grounded_result: dict[str, Any] | None) -> str:
+    if not isinstance(grounded_result, dict):
+        return ""
+    project_cards = grounded_result.get("project_cards", []) or []
+    evidence_chunks = grounded_result.get("evidence_chunks", []) or []
+    if not project_cards or not evidence_chunks:
+        return ""
+
+    project_id = str((project_cards[0] or {}).get("project_id") or "").strip()
+    project_name = project_id.replace("_", " ").title() if project_id else "Dự án này"
+    evidence_text = " ".join(str((item or {}).get("text") or "") for item in evidence_chunks[:3])
+    normalized = re.sub(r"\s+", " ", evidence_text)
+
+    # Pull a few concrete quantitative details if present.
+    area_match = re.search(r"(\d+(?:[.,]\d+)?)\s*ha", normalized, re.IGNORECASE)
+    product_match = re.search(r"(\d[\d\.\,]{2,})\s*sản phẩm", normalized, re.IGNORECASE)
+    handover_match = re.search(r"quý\s*\d\/\d{4}", normalized, re.IGNORECASE)
+    location_match = re.search(r"vị trí:\s*([^.\n-]{4,80})", normalized, re.IGNORECASE)
+
+    details: list[str] = []
+    if location_match:
+        details.append(f"vị trí tại {location_match.group(1).strip()}")
+    if area_match:
+        details.append(f"quy mô khoảng {area_match.group(1)} ha")
+    if product_match:
+        details.append(f"tổng nguồn cung khoảng {product_match.group(1)} sản phẩm")
+    if handover_match:
+        details.append(f"dự kiến bàn giao {handover_match.group(0)}")
+
+    detail_text = ", ".join(details[:3]) if details else "đã công bố khá rõ thông tin tổng quan, loại hình và tiến độ"
+    return (
+        f"{project_name} hiện {detail_text}. "
+        "Nếu anh/chị muốn, em có thể đi sâu bảng giá theo từng dòng sản phẩm và chọn phương án căn phù hợp nhất trong buổi tư vấn trực tiếp."
+    )
 
 
 def _rewrite_reply_by_policy(reply: str, single_project_mode: bool, ask_policy: str, settings: Settings) -> str:
@@ -2156,7 +2374,7 @@ def synthesize_assistant_reply(
         )
     
     # Try to retrieve from cache (before retry loop)
-    synthesis_cache = get_synthesis_cache()
+    synthesis_cache = get_synthesis_cache() if settings.synthesis_cache_enabled else None
     timing_inst = get_timing_instrument()
     cached_response = None
     cache_key = _build_synthesis_cache_key(
@@ -2208,6 +2426,14 @@ def synthesize_assistant_reply(
             if _has_personal_budget_phrase(reply) and not user_has_budget_context:
                 log.info("reply synthesis rejected unsupported personal budget phrase")
                 last_failure_reason = "unsupported_personal_budget_phrase"
+            elif _grounded_reply_too_generic(
+                reply=reply,
+                grounded_result=grounded_result,
+                response_mode=reply_plan.response_mode,
+                final_route=final_route,
+            ):
+                log.info("reply synthesis rejected generic grounded reply")
+                last_failure_reason = "grounded_reply_missing_specific_details"
             elif _reply_needs_retry(
                 reply=reply,
                 single_project_mode=single_project_mode,
@@ -2246,6 +2472,10 @@ def synthesize_assistant_reply(
                 invalid_reason=last_failure_reason,
             )
 
+    grounded_fallback = _build_grounded_specific_reply(grounded_result)
+    if grounded_fallback:
+        log.info("reply synthesis fallback to grounded-specific local rewrite")
+        return _compact_text(grounded_fallback, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
     raise RuntimeError(f"reply synthesis returned unusable output after retries: {last_failure_reason}")
 
 
@@ -2419,7 +2649,33 @@ def _analyze_turn_fallback(message: str, lead_state: LeadState, recent_history: 
             "Nếu bạn cần phân tích sâu theo phương án cụ thể, mình đề xuất một buổi hẹn trực tiếp."
         )
     )
+    normalized = _normalize_text_for_match(message)
+    project_signal = bool(
+        re.search(r"\b(du an|project|sunshine|noble|can ho|bang gia|phap ly)\b", normalized)
+    )
     reason = "fallback_no_decider"
+    if project_signal:
+        reason = "fallback_no_decider_project_signal"
+        return TurnAnalysis(
+            route="project_grounded",
+            decision_reason=reason,
+            need_update=need_update,
+            painpoint_update=painpoint_update,
+            routing_signal=RoutingSignal(
+                should_route_project=True,
+                project_query_hint=message.strip() or None,
+                reason=reason,
+            ),
+            consult_reply=consult_reply,
+            query_type="project_specific",
+            retrieval_readiness="ready",
+            route_source="fallback",
+            engagement_state_after_hint=lead_state.engagement_state,
+            sales_state_after_hint=lead_state.sales_state,
+            conversation_goal_hint=lead_state.last_conversation_goal or "show_fit",
+            extracted_name=_extract_name(message),
+            extracted_phone=_extract_phone_contact(message),
+        )
     return TurnAnalysis(
         route="consult_discovery",
         decision_reason=reason,
@@ -2647,6 +2903,29 @@ def run_project_grounded(
     evidence_chunks = retrieval_raw.get("evidence_chunks", []) or []
     low_confidence = bool(retrieval_raw.get("low_confidence", False))
     used_projects = [str(card.get("project_id")) for card in project_cards if card.get("project_id")]
+
+    # Project-name consistency gate at retrieval layer:
+    # if user explicitly names a project but retrieved evidence points to another project,
+    # force empty grounded payload so upper layer returns truthful "not found" message.
+    project_hint = _extract_project_name_hint(message)
+    grounded_probe = {
+        "used_projects": used_projects,
+        "project_cards": project_cards,
+        "evidence_chunks": evidence_chunks,
+    }
+    if project_hint and not _grounded_result_matches_project_hint(grounded_probe, project_hint):
+        log.warning(
+            "project-name consistency mismatch in retrieval layer hint=%s used_projects=%s",
+            project_hint,
+            used_projects,
+        )
+        project_cards = []
+        trait_tags = []
+        proximity_facts = []
+        evidence_chunks = []
+        low_confidence = True
+        used_projects = []
+
     return {
         "used_projects": _dedupe_keep_order(used_projects, max_items=5),
         "project_cards": project_cards,
@@ -2666,6 +2945,7 @@ def create_app(
     turn_analyzer: Callable[[str, LeadState, list[HistoryTurn]], TurnAnalysis] | None = None,
     vision_identify=None,
     session_store: SessionStore | None = None,
+    identity_store: SharedIdentityStore | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Sales Orchestrator 2 Routes", version="1.0.0")
     settings = get_settings()
@@ -2741,6 +3021,15 @@ def create_app(
             vision_identify = vision_client.identify
     if session_store is None:
         session_store = SessionStore(settings.redis_url, settings.redis_namespace)
+    if identity_store is None:
+        identity_db_path = settings.shared_identity_db_path
+        # Keep pytest runs isolated from persisted runtime identity DB.
+        if os.getenv("PYTEST_CURRENT_TEST"):
+            identity_db_path = os.path.join(
+                tempfile.gettempdir(),
+                f"noble_identity_test_{uuid4().hex}.sqlite3",
+            )
+        identity_store = SharedIdentityStore(identity_db_path)
 
     if turn_analyzer is None:
 
@@ -2828,6 +3117,32 @@ def create_app(
             "updated_at": _now_iso(),
         }
 
+    def _sync_identity_snapshot(
+        *,
+        session: LiveTalkingSessionState,
+        lead_state: LeadState,
+        vision_context: VisionContext | None,
+    ) -> None:
+        face_key = str(session.face_session_key or "").strip()
+        if ":" not in face_key:
+            return
+        customer_kind, _, face_id = face_key.partition(":")
+        if not face_id.strip():
+            return
+        identity_store.upsert_identity(
+            face_id=face_id.strip(),
+            face_session_key=face_key,
+            customer_kind=(customer_kind.strip() or session.customer_kind or "guest"),
+            name=lead_state.name or lead_state.customer_profile.name,
+            age=lead_state.customer_profile.age,
+            gender=lead_state.customer_profile.gender,
+            source=lead_state.customer_profile.source,
+            confidence=lead_state.customer_profile.confidence,
+            vision_context=vision_context.model_dump(mode="json") if vision_context is not None else None,
+            lead_state=lead_state.model_dump(mode="json"),
+            session_id=session.session_id,
+        )
+
     def _build_qdrant_overview_for_livetalking_start(
         *,
         trace_id: str | None = None,
@@ -2895,7 +3210,41 @@ def create_app(
                 should_greet=False,
                 greeting=None,
             )
+            _sync_identity_snapshot(
+                session=session,
+                lead_state=lead_state,
+                vision_context=effective_vision_context,
+            )
             return session, lead_state, recent_history, effective_vision_context
+
+        snapshot = identity_store.load_by_face_session_key(face_session_key)
+        if snapshot is not None and snapshot.lead_state:
+            try:
+                base_state = LeadState.model_validate(snapshot.lead_state)
+            except Exception:
+                base_state = LeadState()
+            effective_vision_context = vision_context
+            if effective_vision_context is None and snapshot.vision_context:
+                try:
+                    effective_vision_context = VisionContext.model_validate(snapshot.vision_context)
+                except Exception:
+                    effective_vision_context = None
+            base_state = _merge_customer_profile(base_state, effective_vision_context)
+            session = LiveTalkingSessionState(
+                session_id=str(requested_session_id or snapshot.session_id or uuid4().hex),
+                face_session_key=face_session_key,
+                customer_kind=customer_kind,
+                ttl_sec=ttl_sec,
+                resumed=True,
+                should_greet=False,
+                greeting=None,
+            )
+            _sync_identity_snapshot(
+                session=session,
+                lead_state=base_state,
+                vision_context=effective_vision_context,
+            )
+            return session, base_state, [], effective_vision_context
 
         base_state = _merge_customer_profile(LeadState(), vision_context)
         product_catalog_overview = None
@@ -2920,6 +3269,11 @@ def create_app(
                 if settings.vision_greeting_enabled
                 else None
             ),
+        )
+        _sync_identity_snapshot(
+            session=session,
+            lead_state=base_state,
+            vision_context=vision_context,
         )
         return session, base_state, [], vision_context
 
@@ -2956,6 +3310,11 @@ def create_app(
             resumed=True,
             should_greet=False,
             greeting=None,
+        )
+        _sync_identity_snapshot(
+            session=session,
+            lead_state=lead_state,
+            vision_context=vision_context,
         )
         return session, lead_state, recent_history, vision_context
 
@@ -3320,6 +3679,7 @@ def create_app(
                                 "fastpath_gate_reason": fastpath_gate_reason,
                             },
                         ) as reply_obs:
+                            assistant_reply = ""
                             try:
                                 assistant_reply = synthesize_assistant_reply(
                                     message=message,
@@ -3409,6 +3769,34 @@ def create_app(
                     if greeting_prefix and _reply_has_greeting_prefix(assistant_reply):
                         final_state = _mark_customer_greeting_applied(final_state)
 
+                    # Hard guardrail: never claim project inventory without grounding evidence.
+                    # If retrieval has no cards/chunks, force a truthful reply.
+                    if final_route == "project_grounded":
+                        has_evidence = _has_grounding_evidence(grounded_result)
+                        if not has_evidence:
+                            if _contains_inventory_claim(assistant_reply):
+                                log.warning(
+                                    "ungrounded inventory claim blocked route=%s reason=%s",
+                                    final_route,
+                                    reason,
+                                )
+                            assistant_reply = _build_no_grounding_reply(message)
+                            reply_source = "grounding_guardrail_no_evidence"
+                            fastpath_gate_reason = "grounding_guardrail_blocked_no_evidence"
+                            reason = "retrieval_empty"
+                        else:
+                            project_hint = _extract_project_name_hint(message)
+                            if not _grounded_result_matches_project_hint(grounded_result, project_hint):
+                                assistant_reply = _build_project_name_mismatch_reply(project_hint or "yêu cầu hiện tại")
+                                reply_source = "grounding_guardrail_project_name_mismatch"
+                                fastpath_gate_reason = "grounding_guardrail_project_name_mismatch"
+                                reason = "project_name_mismatch"
+                                log.warning(
+                                    "project-name consistency blocked hint=%s used_projects=%s",
+                                    project_hint,
+                                    (grounded_result or {}).get("used_projects", []),
+                                )
+
                     if final_route == "project_grounded" and grounded_result is not None:
                         response = QueryResponse(
                             route="project_grounded",
@@ -3471,6 +3859,16 @@ def create_app(
                             "low_confidence": bool(grounded_result.get("low_confidence", False))
                             if grounded_result
                             else None,
+                            "grounding_status": (
+                                "ok"
+                                if _has_grounding_evidence(grounded_result)
+                                else "empty"
+                                if final_route == "project_grounded"
+                                else None
+                            ),
+                            "evidence_count": len((grounded_result or {}).get("evidence_chunks", []) or [])
+                            if grounded_result
+                            else 0,
                         }
                     )
 
@@ -3557,14 +3955,18 @@ def create_app(
             ),
             session.ttl_sec,
         )
+        _sync_identity_snapshot(
+            session=session,
+            lead_state=lead_state,
+            vision_context=vision_context,
+        )
         return LiveTalkingSessionStartResponse(
             session=session,
             lead_state=lead_state,
             vision_context=vision_context,
         )
 
-    @app.post("/integrations/livetalking/query", response_model=LiveTalkingQueryResponse)
-    def livetalking_query(payload: LiveTalkingQueryRequest) -> LiveTalkingQueryResponse:
+    def _build_livetalking_query_response(payload: LiveTalkingQueryRequest) -> LiveTalkingQueryResponse:
         # Query phase reuses the session resolved at /integrations/livetalking/start.
         # We intentionally skip vision re-scan here to keep latency stable.
         session, stored_state, recent_history, vision_context = _resolve_livetalking_query_session(
@@ -3603,10 +4005,95 @@ def create_app(
             ),
             session.ttl_sec,
         )
+        _sync_identity_snapshot(
+            session=session,
+            lead_state=query_response.lead_state,
+            vision_context=vision_context,
+        )
         return LiveTalkingQueryResponse(
             **query_response.model_dump(),
             session=session,
             vision_context=vision_context,
+        )
+
+    @app.post("/integrations/livetalking/query", response_model=LiveTalkingQueryResponse)
+    def livetalking_query(payload: LiveTalkingQueryRequest):
+        response_payload = _build_livetalking_query_response(payload)
+        if not bool(payload.stream):
+            return response_payload
+
+        def event_stream():
+            packed = response_payload.model_dump(mode="json")
+            yield "event: start\ndata: {}\n\n"
+            reply = str(packed.get("assistant_reply") or "")
+            if reply:
+                words = reply.split()
+                chunk_words = 8
+                for idx in range(0, len(words), chunk_words):
+                    chunk = " ".join(words[idx : idx + chunk_words]).strip()
+                    if chunk:
+                        yield f"event: delta\ndata: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
+            yield f"event: done\ndata: {json.dumps(packed, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.post("/integrations/livetalking/query-stream")
+    def livetalking_query_stream(payload: LiveTalkingQueryRequest):
+        def event_stream():
+            yield "event: start\ndata: {}\n\n"
+            result_holder: dict[str, Any] = {}
+            done_event = threading.Event()
+
+            def _worker() -> None:
+                try:
+                    result_holder["response"] = _build_livetalking_query_response(payload)
+                except Exception as exc:
+                    result_holder["error"] = str(exc)[:240]
+                finally:
+                    done_event.set()
+
+            threading.Thread(target=_worker, name="livetalking-query-stream-worker", daemon=True).start()
+
+            while not done_event.wait(timeout=1.0):
+                yield "event: ping\ndata: {}\n\n"
+
+            error_msg = str(result_holder.get("error") or "").strip()
+            if error_msg:
+                yield f"event: error\ndata: {json.dumps({'error': error_msg}, ensure_ascii=False)}\n\n"
+                return
+
+            response_payload = result_holder.get("response")
+            if response_payload is None:
+                yield f"event: error\ndata: {json.dumps({'error': 'query stream returned no payload'}, ensure_ascii=False)}\n\n"
+                return
+
+            packed = response_payload.model_dump(mode="json")
+            reply = str(packed.get("assistant_reply") or "")
+            if reply:
+                words = reply.split()
+                chunk_words = 8
+                for idx in range(0, len(words), chunk_words):
+                    chunk = " ".join(words[idx : idx + chunk_words]).strip()
+                    if chunk:
+                        yield f"event: delta\ndata: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
+            yield f"event: done\ndata: {json.dumps(packed, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
         )
 
     @app.post("/integrations/livetalking/stop", response_model=LiveTalkingStopResponse)

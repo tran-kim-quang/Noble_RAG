@@ -198,7 +198,6 @@ def test_livetalking_session_start_resume_and_stop(monkeypatch):
         json={
             "session_id": session_id,
             "message": "Cho toi thong tin tong quan",
-            "image_base64": "ZmFrZQ==",
             "force_route": "consult_discovery",
         },
     )
