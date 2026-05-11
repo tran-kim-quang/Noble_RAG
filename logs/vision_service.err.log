@@ -1,7 +1,0 @@
-INFO:     Loading environment from 'C:\Noble\Noble_RAG\logs\vision-service.env.local'
-INFO:     Started server process [3172]
-INFO:     Waiting for application startup.
-2026-05-11 13:52:35,107 WARNING [vision-service] legacy insightface detected; using compatibility model filtering.
-2026-05-11 13:52:35,496 WARNING [vision-service] skip unsupported onnx model=1k3d68.onnx error=error on model routing
-2026-05-11 13:52:35,527 WARNING [vision-service] skip unsupported onnx model=2d106det.onnx error=error on model routing
-2026-05-11 13:52:35,609 WARNING [vision-service] skip unsupported onnx model=genderage.onnx error=error on model routing

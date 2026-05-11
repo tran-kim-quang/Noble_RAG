@@ -1,2 +1,0 @@
-INFO:     127.0.0.1:10330 - "GET /health HTTP/1.1" 200 OK
-INFO:     127.0.0.1:10333 - "POST /sales/query HTTP/1.1" 200 OK
