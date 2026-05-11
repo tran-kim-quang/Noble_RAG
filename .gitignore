@@ -19,5 +19,6 @@ livetalking/.downloads/
 livetalking/**/*.pth
 livetalking/**/*.tar.gz
 
+.vision_models/
 
 logs/
