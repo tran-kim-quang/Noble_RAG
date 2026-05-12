@@ -18,6 +18,15 @@ else
   exit 1
 fi
 
+# Prefer GPU by default when NVIDIA runtime is available; fallback to CPU.
+if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"'; then
+  export OLLAMA_RUNTIME="nvidia"
+  echo "[start] NVIDIA runtime detected -> Ollama will run with GPU"
+else
+  export OLLAMA_RUNTIME="runc"
+  echo "[start] NVIDIA runtime not found -> Ollama will run with CPU (runc)"
+fi
+
 "${COMPOSE_CMD[@]}" -f "${COMPOSE_FILE}" up -d --build
 
 echo "started"

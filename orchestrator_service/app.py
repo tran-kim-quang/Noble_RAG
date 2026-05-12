@@ -282,6 +282,32 @@ def _extract_project_name_hint(message: str) -> str | None:
     raw_patterns = [
         r"(?:dự án|du an|project|dá»±\s*Ã¡n)\s+([^\n\r]{2,120})",
     ]
+    generic_hint_phrases = {
+        "ban",
+        "ban dang co",
+        "ban hien co",
+        "dang co",
+        "hien co",
+        "cac du an ban dang co",
+        "cac du an ban hien co",
+        "cac du an dang co",
+        "cac du an hien co",
+    }
+    generic_hint_tokens = {
+        "ban", "dang", "ang", "hien", "co", "cac", "du", "an",
+        "bat", "dong", "san", "hienco", "dangco", "tong", "quan",
+    }
+
+    def _is_generic_project_hint(hint: str) -> bool:
+        if not hint:
+            return True
+        if hint in generic_hint_phrases:
+            return True
+        tokens = [t for t in hint.split() if t]
+        if not tokens:
+            return True
+        return all(token in generic_hint_tokens for token in tokens)
+
     for pattern in raw_patterns:
         match = re.search(pattern, raw, re.IGNORECASE)
         if not match:
@@ -289,6 +315,8 @@ def _extract_project_name_hint(message: str) -> str | None:
         hint_raw = match.group(1).strip(" -")
         hint_norm = _normalize_text_for_match(hint_raw)
         hint_norm = re.sub(r"\b(la gi|the nao|ra sao|o dau|gia bao nhieu)$", "", hint_norm).strip()
+        if _is_generic_project_hint(hint_norm):
+            return None
         if hint_norm and len(hint_norm) >= 3:
             return hint_norm[:80]
 
@@ -305,6 +333,8 @@ def _extract_project_name_hint(message: str) -> str | None:
         hint = re.sub(r"\s+", " ", match.group(1)).strip(" -")
         # trim trailing filler words
         hint = re.sub(r"\b(la gi|the nao|ra sao|o dau|gia bao nhieu)$", "", hint).strip()
+        if _is_generic_project_hint(hint):
+            return None
         if hint and len(hint) >= 3:
             return hint[:80]
     return None
@@ -1941,14 +1971,12 @@ def _call_model_generate(
             "messages": message_payload,
             "stream": bool(enable_stream),
         }
-        # Kimi k2.5 supports thinking/non-thinking modes; disable thinking for faster routing/synthesis turns.
-        if model_name.startswith("kimi-k2.5"):
+        if call_role == "decider":
             payload["thinking"] = {"type": "disabled"}
-            # Add max_tokens constraint to optimize synthesis latency (Kimi responds faster with token limit)
-            if max_tokens:
-                payload["max_tokens"] = max_tokens
         else:
             payload["temperature"] = temperature
+            if max_tokens:
+                payload["max_tokens"] = max_tokens
         if response_format == "json":
             payload["response_format"] = {"type": "json_object"}
     else:
@@ -1963,6 +1991,8 @@ def _call_model_generate(
         if is_ollama_chat_api:
             payload.pop("prompt", None)
             payload["messages"] = messages if messages else [{"role": "user", "content": prompt}]
+        if call_role == "decider":
+            payload["think"] = False
         if response_format:
             payload["format"] = response_format
             # Some reasoning-capable Ollama models return only `thinking` with empty
@@ -2389,6 +2419,17 @@ def _build_synthesis_chat_messages(
         "conversation_goal": lead_state.last_conversation_goal,
         "next_best_action": lead_state.next_best_action,
     }
+    grounded_context = {
+        "used_projects": (grounded_result or {}).get("used_projects", []) if isinstance(grounded_result, dict) else [],
+        "project_cards": (grounded_result or {}).get("project_cards", []) if isinstance(grounded_result, dict) else [],
+        "trait_tags": (grounded_result or {}).get("trait_tags", []) if isinstance(grounded_result, dict) else [],
+        "proximity_facts": (grounded_result or {}).get("proximity_facts", []) if isinstance(grounded_result, dict) else [],
+        "evidence_chunks": (grounded_result or {}).get("evidence_chunks", []) if isinstance(grounded_result, dict) else [],
+        "retrieval_intent": (grounded_result or {}).get("retrieval_intent", {}) if isinstance(grounded_result, dict) else {},
+        "confidence": (grounded_result or {}).get("confidence", 0.0) if isinstance(grounded_result, dict) else 0.0,
+        "low_confidence": bool((grounded_result or {}).get("low_confidence", True)) if isinstance(grounded_result, dict) else True,
+    }
+
     system_prompt = (
         "Ban la tro ly tu van bat dong san.\n"
         "Nhiem vu: tra loi phu hop theo route/chien luoc, ngan gon, tu nhien, khong noi ky thuat he thong.\n"
@@ -2402,7 +2443,7 @@ def _build_synthesis_chat_messages(
         f"focus={json.dumps(reply_plan.focus, ensure_ascii=False)}\n"
         f"question_focus={json.dumps(reply_plan.question_focus, ensure_ascii=False)}\n"
         f"lead_state={json.dumps(compact_state, ensure_ascii=False)}\n"
-        f"grounded_context={json.dumps(grounded_result or {}, ensure_ascii=False)}\n"
+        f"grounded_context={json.dumps(grounded_context, ensure_ascii=False)}\n"
     )
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(_history_to_chat_messages(recent_history, settings.synthesis_history_turns))
@@ -3864,28 +3905,39 @@ def create_app(
                                 if not assistant_reply:
                                     # Graceful degradation: keep the API responsive when model
                                     # synthesis is slow/unavailable by returning fallback consult text.
-                                    if consult_result is None:
-                                        consult_result = run_consult_discovery(
-                                            message=message,
-                                            lead_state=lead_state,
-                                            analysis=analysis,
+                                    grounded_fallback_reply = ""
+                                    if final_route == "project_grounded" and _has_grounding_evidence(grounded_result):
+                                        grounded_fallback_reply = _build_grounded_specific_reply(grounded_result)
+                                        if not grounded_fallback_reply:
+                                            cards = (grounded_result or {}).get("project_cards", []) or []
+                                            grounded_fallback_reply = _build_project_catalog_overview(cards)
+                                    if grounded_fallback_reply:
+                                        assistant_reply = _compact_text(grounded_fallback_reply, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
+                                        reply_source = "reply_synthesis_fallback_grounded"
+                                        fastpath_gate_reason = "synthesis_error_grounded_fallback"
+                                    else:
+                                        if consult_result is None:
+                                            consult_result = run_consult_discovery(
+                                                message=message,
+                                                lead_state=lead_state,
+                                                analysis=analysis,
+                                            )
+                                        fallback_reply = (
+                                            str(consult_result.get("assistant_reply", "")).strip()
+                                            if consult_result
+                                            else ""
+                                        ) or analysis.consult_reply
+                                        assistant_reply = _compact_text(
+                                            fallback_reply
+                                            or (
+                                                "Em xin lỗi, hệ thống trả lời đang bận. "
+                                                "Anh/chị cho em 1 tiêu chí ưu tiên để em tư vấn nhanh hơn ạ."
+                                            ),
+                                            max_words=max(24, settings.quick_intent_response_max_words),
                                         )
-                                    fallback_reply = (
-                                        str(consult_result.get("assistant_reply", "")).strip()
-                                        if consult_result
-                                        else ""
-                                    ) or analysis.consult_reply
-                                    assistant_reply = _compact_text(
-                                        fallback_reply
-                                        or (
-                                            "Em xin lỗi, hệ thống trả lời đang bận. "
-                                            "Anh/chị cho em 1 tiêu chí ưu tiên để em tư vấn nhanh hơn ạ."
-                                        ),
-                                        max_words=max(24, settings.quick_intent_response_max_words),
-                                    )
-                                    reply_source = "reply_synthesis_fallback_consult"
-                                    fastpath_gate_reason = "synthesis_error_fallback"
-                                    used_fastpath_consult_reply = True
+                                        reply_source = "reply_synthesis_fallback_consult"
+                                        fastpath_gate_reason = "synthesis_error_fallback"
+                                        used_fastpath_consult_reply = True
                             reply_obs.update(
                                 output={
                                     "assistant_reply_chars": len(assistant_reply),
