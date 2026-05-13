@@ -265,107 +265,114 @@ def _build_no_grounding_reply(message: str) -> str:
     )
 
 
+def _has_lead_capture_cta(reply: str) -> bool:
+    cleaned = _normalize_text_for_match(reply)
+    if not cleaned:
+        return False
+    cta_patterns = [
+        r"\bso dien thoai\b",
+        r"\bsdt\b",
+        r"\bten\b",
+        r"\bxin phep goi\b",
+        r"\bgoi dien\b",
+        r"\bhen\b",
+        r"\btu van\b",
+    ]
+    return any(re.search(pattern, cleaned) for pattern in cta_patterns)
+
+
+def _build_lead_capture_cta(lead_state: LeadState) -> str:
+    missing_name, missing_phone = _missing_contact_fields(lead_state)
+    if missing_name and missing_phone:
+        return "Anh/chị cho em xin tên và số điện thoại để em gửi so sánh chi tiết và tư vấn đúng nhu cầu."
+    if missing_phone:
+        return "Anh/chị cho em xin số điện thoại để em gọi tư vấn nhanh 15-20 phút theo nhu cầu của mình."
+    if missing_name:
+        return "Anh/chị cho em xin tên để em cá nhân hóa phương án tư vấn phù hợp nhất."
+    return "Nếu anh/chị đồng ý, em xin phép hẹn lịch tư vấn nhanh 15-20 phút để chốt phương án phù hợp."
+
+
+def _apply_business_outcome_gate(
+    *,
+    reply: str,
+    final_route: str,
+    lead_state: LeadState,
+    response_mode: str,
+) -> str:
+    cleaned = (reply or "").strip()
+    if not cleaned:
+        return cleaned
+    # Prioritize lead capture when discussing projects or recommendation.
+    requires_cta = (
+        _normalize_route(final_route) == "project_grounded"
+        or response_mode in {"grounded_recommendation", "contact_capture"}
+    )
+    if not requires_cta:
+        return cleaned
+    if _has_lead_capture_cta(cleaned):
+        return cleaned
+    cta = _build_lead_capture_cta(lead_state)
+    if cleaned.endswith((".", "!", "?")):
+        return f"{cleaned} {cta}"
+    return f"{cleaned}. {cta}"
+
+
+def _apply_safety_gate(
+    *,
+    reply: str,
+    user_has_budget_context: bool,
+) -> str:
+    cleaned = (reply or "").strip()
+    if not cleaned:
+        return cleaned
+    if user_has_budget_context:
+        return cleaned
+    if not _has_personal_budget_phrase(cleaned):
+        return cleaned
+    # Remove unsupported personal budget statements when user has not provided budget.
+    normalized = re.sub(
+        r"[^.?!]*(ngan sach|tài chính|tai chinh|khả năng chi trả|kha nang chi tra)[^.?!]*[.?!]?",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if normalized:
+        return normalized
+    return "Em có thể tư vấn theo các mức ngân sách phổ biến nếu anh/chị chia sẻ khung tài chính mong muốn."
+
+
+def _apply_grounding_gate(
+    *,
+    reply: str,
+    message: str,
+    final_route: str,
+    grounded_result: dict[str, Any] | None,
+    response_mode: str,
+) -> str:
+    cleaned = (reply or "").strip()
+    if _normalize_route(final_route) != "project_grounded":
+        return cleaned
+    if not _has_grounding_evidence(grounded_result):
+        return _build_no_grounding_reply(message)
+    if _grounded_reply_too_generic(
+        reply=cleaned,
+        grounded_result=grounded_result,
+        response_mode=response_mode,
+        final_route=final_route,
+    ):
+        grounded_fallback = _build_grounded_specific_reply(grounded_result)
+        if grounded_fallback:
+            return grounded_fallback
+    return cleaned
+
+
 def _normalize_text_for_match(value: str) -> str:
     text = unicodedata.normalize("NFD", str(value or ""))
     text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
     text = text.lower()
     text = re.sub(r"[^a-z0-9\s]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
-
-
-def _extract_project_name_hint(message: str) -> str | None:
-    raw = str(message or "").strip()
-    if not raw:
-        return None
-
-    # First-pass on raw text to survive mojibake forms like "dá»± Ã¡n".
-    raw_patterns = [
-        r"(?:dự án|du an|project|dá»±\s*Ã¡n)\s+([^\n\r]{2,120})",
-    ]
-    generic_hint_phrases = {
-        "ban",
-        "ban dang co",
-        "ban hien co",
-        "dang co",
-        "hien co",
-        "cac du an ban dang co",
-        "cac du an ban hien co",
-        "cac du an dang co",
-        "cac du an hien co",
-    }
-    generic_hint_tokens = {
-        "ban", "dang", "ang", "hien", "co", "cac", "du", "an",
-        "bat", "dong", "san", "hienco", "dangco", "tong", "quan",
-    }
-
-    def _is_generic_project_hint(hint: str) -> bool:
-        if not hint:
-            return True
-        if hint in generic_hint_phrases:
-            return True
-        tokens = [t for t in hint.split() if t]
-        if not tokens:
-            return True
-        return all(token in generic_hint_tokens for token in tokens)
-
-    for pattern in raw_patterns:
-        match = re.search(pattern, raw, re.IGNORECASE)
-        if not match:
-            continue
-        hint_raw = match.group(1).strip(" -")
-        hint_norm = _normalize_text_for_match(hint_raw)
-        hint_norm = re.sub(r"\b(la gi|the nao|ra sao|o dau|gia bao nhieu)$", "", hint_norm).strip()
-        if _is_generic_project_hint(hint_norm):
-            return None
-        if hint_norm and len(hint_norm) >= 3:
-            return hint_norm[:80]
-
-    normalized = _normalize_text_for_match(raw)
-    if not normalized:
-        return None
-    patterns = [
-        r"(?:du an|project)\s+([a-z0-9][a-z0-9\s\-]{1,80})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, normalized)
-        if not match:
-            continue
-        hint = re.sub(r"\s+", " ", match.group(1)).strip(" -")
-        # trim trailing filler words
-        hint = re.sub(r"\b(la gi|the nao|ra sao|o dau|gia bao nhieu)$", "", hint).strip()
-        if _is_generic_project_hint(hint):
-            return None
-        if hint and len(hint) >= 3:
-            return hint[:80]
-    return None
-
-
-def _grounded_result_matches_project_hint(grounded_result: dict[str, Any] | None, project_hint: str | None) -> bool:
-    if not project_hint:
-        return True
-    if not isinstance(grounded_result, dict):
-        return False
-    target = _normalize_text_for_match(project_hint)
-    haystack_parts: list[str] = []
-    for project_id in grounded_result.get("used_projects", []) or []:
-        haystack_parts.append(str(project_id))
-    for card in grounded_result.get("project_cards", []) or []:
-        if isinstance(card, dict):
-            haystack_parts.append(str(card.get("project_id") or ""))
-            haystack_parts.append(str(card.get("summary") or ""))
-    for ev in (grounded_result.get("evidence_chunks", []) or [])[:8]:
-        if isinstance(ev, dict):
-            haystack_parts.append(str(ev.get("text") or ""))
-            haystack_parts.append(str(ev.get("source") or ""))
-    haystack = _normalize_text_for_match(" ".join(haystack_parts))
-    return bool(target and target in haystack)
-
-
-def _build_project_name_mismatch_reply(project_hint: str) -> str:
-    return (
-        f"Hiện tại em chưa tìm thấy dữ liệu phù hợp cho dự án \"{project_hint}\" trong kho tri thức. "
-        "Anh/chị vui lòng kiểm tra lại tên dự án hoặc cho em thêm thông tin để em tra cứu chính xác."
-    )
 
 
 def _coerce_extracted_name(raw: Any) -> str | None:
@@ -2560,98 +2567,60 @@ def synthesize_assistant_reply(
             log.info("synthesis cache hit (stable-key)")
             return _compact_text(cached_response, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
     
-    attempt_prompt = primary_prompt
-    attempt_messages = primary_messages
-    last_failure_reason = "reply_synthesis_not_attempted"
-    for attempt_index in range(2):
-        try:
-            # Record synthesis timing
-            if timing_inst:
-                timing_inst.start("synthesis_call")
-            
-            response_payload = _call_model_generate(
-                api_format=settings.synthesis_api_format,
-                api_url=settings.synthesis_api_url,
-                api_key=settings.synthesis_api_key,
-                api_key_header=settings.synthesis_api_key_header,
-                model=settings.synthesis_model,
-                timeout_sec=settings.synthesis_timeout_sec,
-                keep_alive=settings.synthesis_keep_alive,
-                prompt=attempt_prompt,
-                messages=attempt_messages,
-                temperature=max(0.0, min(1.0, settings.synthesis_temperature)),
-                response_format="json",
-                max_tokens=settings.synthesis_output_max_tokens,
-                enable_stream=settings.synthesis_enable_streaming,
-                call_role="synthesis",
-            )
-            
-            if timing_inst:
-                elapsed_ms = timing_inst.end("synthesis_call")
-                log.debug(f"synthesis stage latency: {elapsed_ms:.1f}ms")
-            
-            reply = _sanitize_reply_for_policy(
-                reply=_extract_assistant_reply(response_payload),
-                ask_policy=reply_plan.ask_policy,
-                single_project_mode=single_project_mode,
-                question_focus=reply_plan.question_focus,
-            )
-            if _has_personal_budget_phrase(reply) and not user_has_budget_context:
-                log.info("reply synthesis rejected unsupported personal budget phrase")
-                last_failure_reason = "unsupported_personal_budget_phrase"
-            elif _grounded_reply_too_generic(
-                reply=reply,
-                grounded_result=grounded_result,
-                response_mode=reply_plan.response_mode,
-                final_route=final_route,
-            ):
-                log.info("reply synthesis rejected generic grounded reply")
-                last_failure_reason = "grounded_reply_missing_specific_details"
-            elif _reply_needs_retry(
-                reply=reply,
-                single_project_mode=single_project_mode,
-                ask_policy=reply_plan.ask_policy,
-            ):
-                last_failure_reason = "reply_failed_policy_or_quality_gate"
-            elif reply:
-                # Cache the successful response
-                if synthesis_cache and attempt_index == 0:
-                    synthesis_cache.set(
-                        cache_key,
-                        reply,
-                        metadata={"route": final_route, "query_type": analysis.query_type}
-                    )
-                return _compact_text(reply, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
-            else:
-                last_failure_reason = "empty_reply_after_sanitize"
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="ignore")[:240]
-            log.warning("reply synthesis HTTP %s: %s", exc.code, detail)
-            raise RuntimeError(f"reply synthesis HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            log.warning("reply synthesis unreachable: %s", exc.reason)
-            raise RuntimeError(f"reply synthesis unreachable: {exc.reason}") from exc
-        except socket.timeout as exc:
-            log.warning("reply synthesis timeout after %ss", settings.synthesis_timeout_sec)
-            raise RuntimeError(f"reply synthesis timeout after {settings.synthesis_timeout_sec}s") from exc
-        except Exception as exc:
-            log.warning("reply synthesis failed: %s", exc)
-            raise RuntimeError(f"reply synthesis failed: {exc}") from exc
+    try:
+        if timing_inst:
+            timing_inst.start("synthesis_call")
 
-        if attempt_index == 0:
-            invalid_reply = locals().get("reply", "")
-            attempt_prompt = _build_reply_repair_prompt(
-                original_prompt=primary_prompt,
-                invalid_reply=invalid_reply,
-                invalid_reason=last_failure_reason,
-            )
-            attempt_messages = list(primary_messages) + [{"role": "user", "content": attempt_prompt}]
+        response_payload = _call_model_generate(
+            api_format=settings.synthesis_api_format,
+            api_url=settings.synthesis_api_url,
+            api_key=settings.synthesis_api_key,
+            api_key_header=settings.synthesis_api_key_header,
+            model=settings.synthesis_model,
+            timeout_sec=settings.synthesis_timeout_sec,
+            keep_alive=settings.synthesis_keep_alive,
+            prompt=primary_prompt,
+            messages=primary_messages,
+            temperature=max(0.0, min(1.0, settings.synthesis_temperature)),
+            response_format="json",
+            max_tokens=settings.synthesis_output_max_tokens,
+            enable_stream=settings.synthesis_enable_streaming,
+            call_role="synthesis",
+        )
 
-    grounded_fallback = _build_grounded_specific_reply(grounded_result)
-    if grounded_fallback:
-        log.info("reply synthesis fallback to grounded-specific local rewrite")
-        return _compact_text(grounded_fallback, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
-    raise RuntimeError(f"reply synthesis returned unusable output after retries: {last_failure_reason}")
+        if timing_inst:
+            elapsed_ms = timing_inst.end("synthesis_call")
+            log.debug(f"synthesis stage latency: {elapsed_ms:.1f}ms")
+
+        reply = _sanitize_reply_for_policy(
+            reply=_extract_assistant_reply(response_payload),
+            ask_policy=reply_plan.ask_policy,
+            single_project_mode=single_project_mode,
+            question_focus=reply_plan.question_focus,
+        )
+        if not reply:
+            raise RuntimeError("reply synthesis returned empty reply")
+
+        if synthesis_cache:
+            synthesis_cache.set(
+                cache_key,
+                reply,
+                metadata={"route": final_route, "query_type": analysis.query_type}
+            )
+        return _compact_text(reply, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")[:240]
+        log.warning("reply synthesis HTTP %s: %s", exc.code, detail)
+        raise RuntimeError(f"reply synthesis HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        log.warning("reply synthesis unreachable: %s", exc.reason)
+        raise RuntimeError(f"reply synthesis unreachable: {exc.reason}") from exc
+    except socket.timeout as exc:
+        log.warning("reply synthesis timeout after %ss", settings.synthesis_timeout_sec)
+        raise RuntimeError(f"reply synthesis timeout after {settings.synthesis_timeout_sec}s") from exc
+    except Exception as exc:
+        log.warning("reply synthesis failed: %s", exc)
+        raise RuntimeError(f"reply synthesis failed: {exc}") from exc
 
 
 def _build_decider_prompt(
@@ -3079,28 +3048,6 @@ def run_project_grounded(
     evidence_chunks = retrieval_raw.get("evidence_chunks", []) or []
     low_confidence = bool(retrieval_raw.get("low_confidence", False))
     used_projects = [str(card.get("project_id")) for card in project_cards if card.get("project_id")]
-
-    # Project-name consistency gate at retrieval layer:
-    # if user explicitly names a project but retrieved evidence points to another project,
-    # force empty grounded payload so upper layer returns truthful "not found" message.
-    project_hint = _extract_project_name_hint(message)
-    grounded_probe = {
-        "used_projects": used_projects,
-        "project_cards": project_cards,
-        "evidence_chunks": evidence_chunks,
-    }
-    if project_hint and not _grounded_result_matches_project_hint(grounded_probe, project_hint):
-        log.warning(
-            "project-name consistency mismatch in retrieval layer hint=%s used_projects=%s",
-            project_hint,
-            used_projects,
-        )
-        project_cards = []
-        trait_tags = []
-        proximity_facts = []
-        evidence_chunks = []
-        low_confidence = True
-        used_projects = []
 
     return {
         "used_projects": _dedupe_keep_order(used_projects, max_items=5),
@@ -3956,33 +3903,27 @@ def create_app(
                     if greeting_prefix and _reply_has_greeting_prefix(assistant_reply):
                         final_state = _mark_customer_greeting_applied(final_state)
 
-                    # Hard guardrail: never claim project inventory without grounding evidence.
-                    # If retrieval has no cards/chunks, force a truthful reply.
-                    if final_route == "project_grounded":
-                        has_evidence = _has_grounding_evidence(grounded_result)
-                        if not has_evidence:
-                            if _contains_inventory_claim(assistant_reply):
-                                log.warning(
-                                    "ungrounded inventory claim blocked route=%s reason=%s",
-                                    final_route,
-                                    reason,
-                                )
-                            assistant_reply = _build_no_grounding_reply(message)
-                            reply_source = "grounding_guardrail_no_evidence"
-                            fastpath_gate_reason = "grounding_guardrail_blocked_no_evidence"
-                            reason = "retrieval_empty"
-                        else:
-                            project_hint = _extract_project_name_hint(message)
-                            if not _grounded_result_matches_project_hint(grounded_result, project_hint):
-                                assistant_reply = _build_project_name_mismatch_reply(project_hint or "yêu cầu hiện tại")
-                                reply_source = "grounding_guardrail_project_name_mismatch"
-                                fastpath_gate_reason = "grounding_guardrail_project_name_mismatch"
-                                reason = "project_name_mismatch"
-                                log.warning(
-                                    "project-name consistency blocked hint=%s used_projects=%s",
-                                    project_hint,
-                                    (grounded_result or {}).get("used_projects", []),
-                                )
+                    # Lightweight gate stack optimized for business outcome.
+                    assistant_reply = _apply_grounding_gate(
+                        reply=assistant_reply,
+                        message=message,
+                        final_route=final_route,
+                        grounded_result=grounded_result,
+                        response_mode=reply_plan.response_mode,
+                    )
+                    assistant_reply = _apply_safety_gate(
+                        reply=assistant_reply,
+                        user_has_budget_context=_user_context_has_budget_signal(
+                            message=message,
+                            recent_history=payload.recent_history,
+                        ),
+                    )
+                    assistant_reply = _apply_business_outcome_gate(
+                        reply=assistant_reply,
+                        final_route=final_route,
+                        lead_state=final_state,
+                        response_mode=reply_plan.response_mode,
+                    )
 
                     if final_route == "project_grounded" and grounded_result is not None:
                         response = QueryResponse(
