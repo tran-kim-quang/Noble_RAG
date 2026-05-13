@@ -355,15 +355,9 @@ def _apply_grounding_gate(
         return cleaned
     if not _has_grounding_evidence(grounded_result):
         return _build_no_grounding_reply(message)
-    if _grounded_reply_too_generic(
-        reply=cleaned,
-        grounded_result=grounded_result,
-        response_mode=response_mode,
-        final_route=final_route,
-    ):
-        grounded_fallback = _build_grounded_specific_reply(grounded_result)
-        if grounded_fallback:
-            return grounded_fallback
+    # Keep model output for generic cases to preserve response quality.
+    # Fallback is reserved for no-evidence or synthesis/model failures.
+    _ = response_mode
     return cleaned
 
 
@@ -4050,6 +4044,70 @@ def create_app(
             force_route=payload.force_route,
         )
         return query(query_payload)
+
+    def _stream_query_like_response(build_response_fn, worker_name: str):
+        def event_stream():
+            yield "event: start\ndata: {}\n\n"
+            result_holder: dict[str, Any] = {}
+            done_event = threading.Event()
+
+            def _worker() -> None:
+                try:
+                    result_holder["response"] = build_response_fn()
+                except Exception as exc:
+                    result_holder["error"] = str(exc)[:240]
+                finally:
+                    done_event.set()
+
+            threading.Thread(target=_worker, name=worker_name, daemon=True).start()
+
+            while not done_event.wait(timeout=1.0):
+                yield "event: ping\ndata: {}\n\n"
+
+            error_msg = str(result_holder.get("error") or "").strip()
+            if error_msg:
+                yield f"event: error\ndata: {json.dumps({'error': error_msg}, ensure_ascii=False)}\n\n"
+                return
+
+            response_payload = result_holder.get("response")
+            if response_payload is None:
+                yield f"event: error\ndata: {json.dumps({'error': 'query stream returned no payload'}, ensure_ascii=False)}\n\n"
+                return
+
+            packed = response_payload.model_dump(mode="json")
+            reply = str(packed.get("assistant_reply") or "")
+            if reply:
+                words = reply.split()
+                chunk_words = 8
+                for idx in range(0, len(words), chunk_words):
+                    chunk = " ".join(words[idx : idx + chunk_words]).strip()
+                    if chunk:
+                        yield f"event: delta\ndata: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
+            yield f"event: done\ndata: {json.dumps(packed, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.post("/sales/query-stream")
+    def query_stream(payload: QueryRequest):
+        return _stream_query_like_response(
+            build_response_fn=lambda: query(payload),
+            worker_name="sales-query-stream-worker",
+        )
+
+    @app.post("/sales/query-with-vision-stream")
+    def query_with_vision_stream(payload: VisionQueryRequest):
+        return _stream_query_like_response(
+            build_response_fn=lambda: query_with_vision(payload),
+            worker_name="sales-query-with-vision-stream-worker",
+        )
 
     @app.post("/integrations/livetalking/start", response_model=LiveTalkingSessionStartResponse)
     def livetalking_start(payload: LiveTalkingSessionStartRequest) -> LiveTalkingSessionStartResponse:
