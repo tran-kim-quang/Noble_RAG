@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import re
 import socket
 import tempfile
@@ -415,6 +416,7 @@ def _warmup_synthesis_model(settings: Settings) -> None:
         max_tokens=16,
         enable_stream=False,
         call_role="synthesis",
+        thinking_enabled=settings.synthesis_thinking_enabled,
     )
 
 
@@ -1922,7 +1924,15 @@ def _call_model_generate(
     max_tokens: int | None = None,
     enable_stream: bool = False,
     call_role: str = "general",
+    stream_handler: Callable[[str], None] | None = None,
+    thinking_enabled: bool | None = None,
 ) -> Any:
+    call_started_at = time.perf_counter()
+    is_synthesis_call = call_role == "synthesis"
+
+    def _elapsed_ms(started_at: float) -> float:
+        return (time.perf_counter() - started_at) * 1000.0
+
     def _normalize_ollama_cloud_native_url(raw_url: str) -> str:
         parsed = urllib.parse.urlsplit(raw_url)
         base = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
@@ -1994,6 +2004,8 @@ def _call_model_generate(
             payload["messages"] = messages if messages else [{"role": "user", "content": prompt}]
         if call_role == "decider":
             payload["think"] = False
+        elif call_role == "synthesis" and thinking_enabled is not None:
+            payload["think"] = bool(thinking_enabled)
         if response_format:
             payload["format"] = response_format
             # Some reasoning-capable Ollama models return only `thinking` with empty
@@ -2008,69 +2020,186 @@ def _call_model_generate(
         headers=headers,
         method="POST",
     )
+    if is_synthesis_call:
+        log.info(
+            "synthesis_upstream stage=request_prepared elapsed_ms=%.1f api_format=%s api_url=%s model=%s stream=%s prompt_chars=%s message_count=%s",
+            _elapsed_ms(call_started_at),
+            api_format,
+            api_url,
+            model,
+            bool(enable_stream),
+            len(str(prompt or "")),
+            len(messages or []),
+        )
     if enable_stream:
-        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            if api_format == "openai":
-                parts: list[str] = []
+        open_started_at = time.perf_counter()
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                if is_synthesis_call:
+                    log.info(
+                        "synthesis_upstream stage=response_open elapsed_ms=%.1f status=%s",
+                        _elapsed_ms(call_started_at),
+                        getattr(resp, "status", None),
+                    )
+                if api_format == "openai":
+                    parts: list[str] = []
+                    first_line_logged = False
+                    first_chunk_logged = False
+                    while True:
+                        line_bytes = resp.readline()
+                        if line_bytes and not first_line_logged and is_synthesis_call:
+                            first_line_logged = True
+                            log.info(
+                                "synthesis_upstream stage=first_stream_bytes elapsed_ms=%.1f open_wait_ms=%.1f",
+                                _elapsed_ms(call_started_at),
+                                _elapsed_ms(open_started_at),
+                            )
+                        if not line_bytes:
+                            break
+                        line = line_bytes.decode("utf-8", errors="ignore").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if not data or data == "[DONE]":
+                            continue
+                        try:
+                            event = json.loads(data)
+                        except Exception:
+                            continue
+                        choices = event.get("choices", [])
+                        if not isinstance(choices, list) or not choices:
+                            continue
+                        first = choices[0] if isinstance(choices[0], dict) else {}
+                        delta = first.get("delta") if isinstance(first, dict) else {}
+                        if not isinstance(delta, dict):
+                            continue
+                        content = delta.get("content")
+                        if isinstance(content, str) and content:
+                            parts.append(content)
+                            if is_synthesis_call and not first_chunk_logged:
+                                first_chunk_logged = True
+                                log.info(
+                                    "synthesis_upstream stage=first_text_chunk elapsed_ms=%.1f bytes_len=%s",
+                                    _elapsed_ms(call_started_at),
+                                    len(content),
+                                )
+                            if stream_handler:
+                                stream_handler(content)
+                        elif isinstance(content, list):
+                            for item in content:
+                                if isinstance(item, dict):
+                                    text = item.get("text")
+                                    if isinstance(text, str) and text:
+                                        parts.append(text)
+                                        if is_synthesis_call and not first_chunk_logged:
+                                            first_chunk_logged = True
+                                            log.info(
+                                                "synthesis_upstream stage=first_text_chunk elapsed_ms=%.1f bytes_len=%s",
+                                                _elapsed_ms(call_started_at),
+                                                len(text),
+                                            )
+                                        if stream_handler:
+                                            stream_handler(text)
+                    if is_synthesis_call:
+                        log.info(
+                            "synthesis_upstream stage=stream_completed elapsed_ms=%.1f output_chars=%s",
+                            _elapsed_ms(call_started_at),
+                            sum(len(p) for p in parts),
+                        )
+                    return "".join(parts)
+
+                # Ollama streaming: newline-delimited JSON with `response` chunks
+                # (generate) or `message.content` chunks (chat).
+                parts = []
+                first_line_logged = False
+                first_chunk_logged = False
                 while True:
                     line_bytes = resp.readline()
+                    if line_bytes and not first_line_logged and is_synthesis_call:
+                        first_line_logged = True
+                        log.info(
+                            "synthesis_upstream stage=first_stream_bytes elapsed_ms=%.1f open_wait_ms=%.1f",
+                            _elapsed_ms(call_started_at),
+                            _elapsed_ms(open_started_at),
+                        )
                     if not line_bytes:
                         break
                     line = line_bytes.decode("utf-8", errors="ignore").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if not data or data == "[DONE]":
+                    if not line:
                         continue
                     try:
-                        event = json.loads(data)
+                        event = json.loads(line)
                     except Exception:
                         continue
-                    choices = event.get("choices", [])
-                    if not isinstance(choices, list) or not choices:
+                    chunk = event.get("response")
+                    if isinstance(chunk, str) and chunk:
+                        parts.append(chunk)
+                        if is_synthesis_call and not first_chunk_logged:
+                            first_chunk_logged = True
+                            log.info(
+                                "synthesis_upstream stage=first_text_chunk elapsed_ms=%.1f bytes_len=%s",
+                                _elapsed_ms(call_started_at),
+                                len(chunk),
+                            )
+                        if stream_handler:
+                            stream_handler(chunk)
                         continue
-                    first = choices[0] if isinstance(choices[0], dict) else {}
-                    delta = first.get("delta") if isinstance(first, dict) else {}
-                    if not isinstance(delta, dict):
-                        continue
-                    content = delta.get("content")
-                    if isinstance(content, str) and content:
-                        parts.append(content)
-                    elif isinstance(content, list):
-                        for item in content:
-                            if isinstance(item, dict):
-                                text = item.get("text")
-                                if isinstance(text, str) and text:
-                                    parts.append(text)
+                    message = event.get("message")
+                    if isinstance(message, dict):
+                        content = message.get("content")
+                        if isinstance(content, str) and content:
+                            parts.append(content)
+                            if is_synthesis_call and not first_chunk_logged:
+                                first_chunk_logged = True
+                                log.info(
+                                    "synthesis_upstream stage=first_text_chunk elapsed_ms=%.1f bytes_len=%s",
+                                    _elapsed_ms(call_started_at),
+                                    len(content),
+                                )
+                            if stream_handler:
+                                stream_handler(content)
+                if is_synthesis_call:
+                    log.info(
+                        "synthesis_upstream stage=stream_completed elapsed_ms=%.1f output_chars=%s",
+                        _elapsed_ms(call_started_at),
+                        sum(len(p) for p in parts),
+                    )
                 return "".join(parts)
+        except Exception as exc:
+            if is_synthesis_call:
+                log.warning(
+                    "synthesis_upstream stage=stream_error elapsed_ms=%.1f open_wait_ms=%.1f error_type=%s error=%s",
+                    _elapsed_ms(call_started_at),
+                    _elapsed_ms(open_started_at),
+                    type(exc).__name__,
+                    str(exc)[:240],
+                )
+            raise
 
-            # Ollama streaming: newline-delimited JSON with `response` chunks
-            # (generate) or `message.content` chunks (chat).
-            parts = []
-            while True:
-                line_bytes = resp.readline()
-                if not line_bytes:
-                    break
-                line = line_bytes.decode("utf-8", errors="ignore").strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except Exception:
-                    continue
-                chunk = event.get("response")
-                if isinstance(chunk, str) and chunk:
-                    parts.append(chunk)
-                    continue
-                message = event.get("message")
-                if isinstance(message, dict):
-                    content = message.get("content")
-                    if isinstance(content, str) and content:
-                        parts.append(content)
-            return "".join(parts)
-
-    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-        raw = resp.read().decode("utf-8")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            if is_synthesis_call:
+                log.info(
+                    "synthesis_upstream stage=response_open elapsed_ms=%.1f status=%s",
+                    _elapsed_ms(call_started_at),
+                    getattr(resp, "status", None),
+                )
+            raw = resp.read().decode("utf-8")
+    except Exception as exc:
+        if is_synthesis_call:
+            log.warning(
+                "synthesis_upstream stage=non_stream_error elapsed_ms=%.1f error_type=%s error=%s",
+                _elapsed_ms(call_started_at),
+                type(exc).__name__,
+                str(exc)[:240],
+            )
+        raise
+    if is_synthesis_call:
+        log.info(
+            "synthesis_upstream stage=non_stream_completed elapsed_ms=%.1f output_chars=%s",
+            _elapsed_ms(call_started_at),
+            len(raw),
+        )
     parsed = json.loads(raw)
     if not isinstance(parsed, dict):
         raise RuntimeError("model response is not a JSON object")
@@ -2274,8 +2403,14 @@ def _sanitize_reply_for_policy(
 def _extract_assistant_reply(response_payload: Any) -> str:
     if isinstance(response_payload, dict):
         return str(response_payload.get("assistant_reply", "")).strip()
-    parsed_obj = _extract_json_object(str(response_payload))
-    return str(parsed_obj.get("assistant_reply", "")).strip()
+    raw_text = str(response_payload or "").strip()
+    if not raw_text:
+        return ""
+    try:
+        parsed_obj = _extract_json_object(raw_text)
+    except Exception:
+        return raw_text
+    return str(parsed_obj.get("assistant_reply", "")).strip() or raw_text
 
 
 def _build_synthesis_cache_key(
@@ -2459,7 +2594,9 @@ def synthesize_assistant_reply_no_decider(
     lead_state: LeadState,
     reply_plan: ReplyPlan,
     settings: Settings,
+    stream_handler: Callable[[str], None] | None = None,
 ) -> str:
+    synthesis_response_format = None if stream_handler else "json"
     chat_messages = _build_no_decider_direct_reply_messages(
         message=message,
         recent_history=recent_history,
@@ -2478,10 +2615,12 @@ def synthesize_assistant_reply_no_decider(
         prompt=message,
         messages=chat_messages,
         temperature=max(0.0, min(1.0, settings.synthesis_temperature)),
-        response_format="json",
+        response_format=synthesis_response_format,
         max_tokens=settings.synthesis_output_max_tokens,
-        enable_stream=False,
+        enable_stream=settings.synthesis_enable_streaming,
         call_role="synthesis",
+        stream_handler=stream_handler,
+        thinking_enabled=settings.synthesis_thinking_enabled,
     )
     reply = _sanitize_reply_for_policy(
         reply=_extract_assistant_reply(response_payload),
@@ -2506,6 +2645,7 @@ def synthesize_assistant_reply(
     reply_plan: ReplyPlan,
     grounded_result: dict[str, Any] | None,
     settings: Settings,
+    stream_handler: Callable[[str], None] | None = None,
 ) -> str:
     user_has_budget_context = _user_context_has_budget_signal(message=message, recent_history=recent_history)
     primary_prompt = _build_reply_synthesis_prompt(
@@ -2561,6 +2701,7 @@ def synthesize_assistant_reply(
             log.info("synthesis cache hit (stable-key)")
             return _compact_text(cached_response, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
     
+    synthesis_response_format = None if stream_handler else "json"
     try:
         if timing_inst:
             timing_inst.start("synthesis_call")
@@ -2576,10 +2717,12 @@ def synthesize_assistant_reply(
             prompt=primary_prompt,
             messages=primary_messages,
             temperature=max(0.0, min(1.0, settings.synthesis_temperature)),
-            response_format="json",
+            response_format=synthesis_response_format,
             max_tokens=settings.synthesis_output_max_tokens,
             enable_stream=settings.synthesis_enable_streaming,
             call_role="synthesis",
+            stream_handler=stream_handler,
+            thinking_enabled=settings.synthesis_thinking_enabled,
         )
 
         if timing_inst:
@@ -2673,25 +2816,63 @@ def _analyze_turn_with_model(
     recent_history: list[HistoryTurn],
     settings: Settings,
 ) -> TurnAnalysis:
-    response_payload = _call_model_generate(
-        api_format=settings.decider_api_format,
-        api_url=settings.decider_api_url,
-        api_key=settings.decider_api_key,
-        api_key_header=settings.decider_api_key_header,
-        model=settings.decider_model,
-        timeout_sec=settings.decider_timeout_sec,
-        keep_alive=settings.decider_keep_alive,
-        prompt=_build_decider_prompt(
-            message=message,
-            lead_state=lead_state,
-            recent_history=recent_history,
-            settings=settings,
-        ),
-        temperature=settings.decider_temperature,
-        response_format="json",
-        max_tokens=settings.decider_output_max_tokens,
-        call_role="decider",
+    decider_prompt = _build_decider_prompt(
+        message=message,
+        lead_state=lead_state,
+        recent_history=recent_history,
+        settings=settings,
     )
+    t0 = time.perf_counter()
+    response_payload: Any
+    try:
+        response_payload = _call_model_generate(
+            api_format=settings.decider_api_format,
+            api_url=settings.decider_api_url,
+            api_key=settings.decider_api_key,
+            api_key_header=settings.decider_api_key_header,
+            model=settings.decider_model,
+            timeout_sec=settings.decider_timeout_sec,
+            keep_alive=settings.decider_keep_alive,
+            prompt=decider_prompt,
+            temperature=settings.decider_temperature,
+            response_format="json",
+            max_tokens=settings.decider_output_max_tokens,
+            call_role="decider",
+        )
+    except Exception:
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        log.warning(
+            "decider_latency stage=model_call status=error elapsed_ms=%.1f model=%s api_format=%s api_url=%s "
+            "prompt_chars=%s message_chars=%s history_turns=%s timeout_sec=%s",
+            elapsed_ms,
+            settings.decider_model,
+            settings.decider_api_format,
+            settings.decider_api_url,
+            len(decider_prompt),
+            len(message or ""),
+            len(recent_history or []),
+            settings.decider_timeout_sec,
+        )
+        raise
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    if isinstance(response_payload, dict):
+        response_size = len(json.dumps(response_payload, ensure_ascii=False))
+    else:
+        response_size = len(str(response_payload or ""))
+    log.info(
+        "decider_latency stage=model_call status=ok elapsed_ms=%.1f model=%s api_format=%s api_url=%s "
+        "prompt_chars=%s message_chars=%s history_turns=%s response_chars=%s",
+        elapsed_ms,
+        settings.decider_model,
+        settings.decider_api_format,
+        settings.decider_api_url,
+        len(decider_prompt),
+        len(message or ""),
+        len(recent_history or []),
+        response_size,
+    )
+
     if isinstance(response_payload, dict):
         result_obj = response_payload
     else:
@@ -3436,7 +3617,30 @@ def create_app(
         return session, lead_state, recent_history, vision_context
 
     @app.post("/sales/query", response_model=QueryResponse)
-    def query(payload: QueryRequest) -> QueryResponse:
+    def query(payload: QueryRequest, stream_handler: Callable[[str], None] | None = None) -> QueryResponse:
+        request_started_at = time.perf_counter()
+        phase_metrics_ms: dict[str, float] = {}
+        stream_first_delta_ms: float | None = None
+
+        def _mark_phase(phase_name: str, started_at: float) -> None:
+            phase_metrics_ms[phase_name] = round((time.perf_counter() - started_at) * 1000.0, 1)
+
+        def _mark_total() -> None:
+            phase_metrics_ms["total"] = round((time.perf_counter() - request_started_at) * 1000.0, 1)
+
+        def _build_stream_handler_wrapper(
+            upstream_handler: Callable[[str], None] | None,
+            phase_started_at: float,
+        ) -> Callable[[str], None]:
+            def _wrapped(chunk: str) -> None:
+                nonlocal stream_first_delta_ms
+                if stream_first_delta_ms is None and str(chunk or "").strip():
+                    stream_first_delta_ms = round((time.perf_counter() - phase_started_at) * 1000.0, 1)
+                if upstream_handler:
+                    upstream_handler(chunk)
+
+            return _wrapped
+
         message = payload.message.strip()
         lead_state = _merge_customer_profile(payload.lead_state or LeadState(), payload.vision_context)
         top_k = payload.top_k or settings.default_top_k
@@ -3479,7 +3683,9 @@ def create_app(
                             "history_turns": len(payload.recent_history),
                         },
                     ) as analyze_obs:
+                        analyze_started_at = time.perf_counter()
                         analysis = turn_analyzer(message, lead_state, payload.recent_history)
+                        _mark_phase("analyze_turn", analyze_started_at)
                         analyze_obs.update(
                             output={
                                 "start_route": analysis.route,
@@ -3522,7 +3728,9 @@ def create_app(
                             as_type="span",
                             input={"query_type": analysis.query_type},
                         ) as consult_obs:
+                            consult_started_at = time.perf_counter()
                             consult_result = run_consult_discovery(message=message, lead_state=lead_state, analysis=analysis)
+                            _mark_phase("consult_discovery", consult_started_at)
                             routing_signal = consult_result.get("routing_signal")
                             after_consult_state = merge_lead_state(
                                 lead_state=lead_state,
@@ -3557,6 +3765,7 @@ def create_app(
                                     as_type="span",
                                     input={"query": project_message[:500], "top_k": top_k},
                                 ) as grounded_obs:
+                                    chain_retrieval_started_at = time.perf_counter()
                                     grounded_result = run_project_grounded(
                                         message=project_message,
                                         lead_state=after_consult_state,
@@ -3570,6 +3779,7 @@ def create_app(
                                         session_id=session_id,
                                         user_id=user_id,
                                     )
+                                    _mark_phase("project_grounded_chain", chain_retrieval_started_at)
                                     grounded_obs.update(
                                         output={
                                             "project_cards": len(grounded_result.get("project_cards", []) or []),
@@ -3602,6 +3812,7 @@ def create_app(
                                 as_type="span",
                                 input={"query": message[:500], "top_k": top_k},
                             ) as grounded_obs:
+                                direct_retrieval_started_at = time.perf_counter()
                                 grounded_result = run_project_grounded(
                                     message=message,
                                     lead_state=lead_state,
@@ -3615,6 +3826,7 @@ def create_app(
                                     session_id=session_id,
                                     user_id=user_id,
                                 )
+                                _mark_phase("project_grounded_direct", direct_retrieval_started_at)
                                 grounded_obs.update(
                                     output={
                                         "project_cards": len(grounded_result.get("project_cards", []) or []),
@@ -3648,6 +3860,7 @@ def create_app(
                             "final_route": final_route,
                         },
                     ) as state_obs:
+                        state_started_at = time.perf_counter()
                         sales_state_before = _normalize_sales_state(lead_state.sales_state)
                         engagement_state_before = _normalize_engagement_state(lead_state.engagement_state)
                         engagement_state_after = update_engagement_state(
@@ -3716,6 +3929,7 @@ def create_app(
                                 "next_best_action": next_best_action,
                             }
                         )
+                        _mark_phase("sales_state_engine", state_started_at)
 
                     with start_observation(
                         langfuse_enabled,
@@ -3723,6 +3937,7 @@ def create_app(
                         as_type="span",
                         input={"sales_state": final_state.sales_state, "conversation_goal": conversation_goal},
                     ) as plan_obs:
+                        planning_started_at = time.perf_counter()
                         reply_plan = build_reply_plan(
                             message=message,
                             recent_history=payload.recent_history,
@@ -3755,6 +3970,7 @@ def create_app(
                                 "question_focus": reply_plan.question_focus,
                             }
                         )
+                        _mark_phase("reply_planning", planning_started_at)
 
                     used_fastpath_consult_reply = False
                     reply_source = "reply_synthesis"
@@ -3796,6 +4012,11 @@ def create_app(
                                 "fastpath_gate_reason": fastpath_gate_reason,
                             },
                         ) as reply_obs:
+                            synthesis_started_at = time.perf_counter()
+                            synthesis_stream_handler = _build_stream_handler_wrapper(
+                                stream_handler,
+                                synthesis_started_at,
+                            )
                             assistant_reply = ""
                             try:
                                 assistant_reply = synthesize_assistant_reply(
@@ -3808,7 +4029,9 @@ def create_app(
                                     reply_plan=reply_plan,
                                     grounded_result=grounded_result,
                                     settings=settings,
+                                    stream_handler=synthesis_stream_handler,
                                 )
+                                _mark_phase("reply_synthesis", synthesis_started_at)
                             except Exception as exc:
                                 reply_obs.update(output={"error": str(exc)[:240]})
                                 log.exception(
@@ -3828,7 +4051,9 @@ def create_app(
                                             lead_state=final_state,
                                             reply_plan=reply_plan,
                                             settings=settings,
+                                            stream_handler=synthesis_stream_handler,
                                         )
+                                        _mark_phase("reply_synthesis_no_decider", synthesis_started_at)
                                         reply_source = "reply_synthesis_no_decider_direct"
                                         fastpath_gate_reason = "no_decider_model_direct"
                                         used_fastpath_consult_reply = False
@@ -3879,6 +4104,8 @@ def create_app(
                                         reply_source = "reply_synthesis_fallback_consult"
                                         fastpath_gate_reason = "synthesis_error_fallback"
                                         used_fastpath_consult_reply = True
+                                if "reply_synthesis" not in phase_metrics_ms and "reply_synthesis_no_decider" not in phase_metrics_ms:
+                                    _mark_phase("reply_synthesis_error_path", synthesis_started_at)
                             reply_obs.update(
                                 output={
                                     "assistant_reply_chars": len(assistant_reply),
@@ -3920,6 +4147,9 @@ def create_app(
                     )
 
                     if final_route == "project_grounded" and grounded_result is not None:
+                        if stream_first_delta_ms is not None:
+                            phase_metrics_ms["synthesis_ttft_ms"] = stream_first_delta_ms
+                        _mark_total()
                         response = QueryResponse(
                             route="project_grounded",
                             assistant_reply=assistant_reply,
@@ -3939,10 +4169,14 @@ def create_app(
                                 "low_confidence": grounded_result["low_confidence"],
                             },
                             decision_trace=trace,
+                            phase_metrics_ms=phase_metrics_ms,
                         )
                     else:
                         if consult_result is None:
                             consult_result = run_consult_discovery(message=message, lead_state=lead_state, analysis=analysis)
+                        if stream_first_delta_ms is not None:
+                            phase_metrics_ms["synthesis_ttft_ms"] = stream_first_delta_ms
+                        _mark_total()
                         response = QueryResponse(
                             route="consult_discovery",
                             assistant_reply=assistant_reply,
@@ -3953,6 +4187,7 @@ def create_app(
                             routing_signal=consult_result.get("routing_signal"),
                             project_grounded_payload=None,
                             decision_trace=trace,
+                            phase_metrics_ms=phase_metrics_ms,
                         )
 
                     request_obs.update(
@@ -4000,7 +4235,7 @@ def create_app(
                             "query_type=%s retrieval_readiness=%s route_source=%s "
                             "engagement_before=%s engagement_after=%s "
                             "sales_state_before=%s sales_state_after=%s conversation_goal=%s next_best_action=%s "
-                            "response_mode=%s ask_policy=%s reply_source=%s fastpath_gate=%s reason=%s"
+                            "response_mode=%s ask_policy=%s reply_source=%s fastpath_gate=%s reason=%s phase_metrics_ms=%s"
                         ),
                         trace.start_route,
                         trace.final_route,
@@ -4019,6 +4254,7 @@ def create_app(
                         reply_source,
                         fastpath_gate_reason,
                         trace.decision_reason,
+                        json.dumps(phase_metrics_ms, ensure_ascii=False),
                     )
                     return response
         finally:
@@ -4026,7 +4262,10 @@ def create_app(
                 flush_observability(langfuse_enabled)
 
     @app.post("/sales/query-with-vision", response_model=QueryResponse)
-    def query_with_vision(payload: VisionQueryRequest) -> QueryResponse:
+    def query_with_vision(
+        payload: VisionQueryRequest,
+        stream_handler: Callable[[str], None] | None = None,
+    ) -> QueryResponse:
         vision_context = _identify_vision_context(
             image_base64=payload.image_base64,
             image_filename=payload.image_filename,
@@ -4043,17 +4282,24 @@ def create_app(
             session_id=payload.session_id,
             force_route=payload.force_route,
         )
-        return query(query_payload)
+        return query(query_payload, stream_handler=stream_handler)
 
     def _stream_query_like_response(build_response_fn, worker_name: str):
         def event_stream():
             yield "event: start\ndata: {}\n\n"
             result_holder: dict[str, Any] = {}
             done_event = threading.Event()
+            chunk_queue: queue.Queue[str] = queue.Queue()
+
+            def _on_stream_chunk(text: str) -> None:
+                chunk = str(text or "").strip()
+                if not chunk:
+                    return
+                chunk_queue.put(chunk)
 
             def _worker() -> None:
                 try:
-                    result_holder["response"] = build_response_fn()
+                    result_holder["response"] = build_response_fn(_on_stream_chunk)
                 except Exception as exc:
                     result_holder["error"] = str(exc)[:240]
                 finally:
@@ -4061,7 +4307,15 @@ def create_app(
 
             threading.Thread(target=_worker, name=worker_name, daemon=True).start()
 
-            while not done_event.wait(timeout=1.0):
+            while True:
+                try:
+                    chunk = chunk_queue.get(timeout=0.7)
+                    yield f"event: delta\ndata: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
+                    continue
+                except queue.Empty:
+                    pass
+                if done_event.is_set():
+                    break
                 yield "event: ping\ndata: {}\n\n"
 
             error_msg = str(result_holder.get("error") or "").strip()
@@ -4075,14 +4329,6 @@ def create_app(
                 return
 
             packed = response_payload.model_dump(mode="json")
-            reply = str(packed.get("assistant_reply") or "")
-            if reply:
-                words = reply.split()
-                chunk_words = 8
-                for idx in range(0, len(words), chunk_words):
-                    chunk = " ".join(words[idx : idx + chunk_words]).strip()
-                    if chunk:
-                        yield f"event: delta\ndata: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
             yield f"event: done\ndata: {json.dumps(packed, ensure_ascii=False)}\n\n"
 
         return StreamingResponse(
@@ -4098,14 +4344,14 @@ def create_app(
     @app.post("/sales/query-stream")
     def query_stream(payload: QueryRequest):
         return _stream_query_like_response(
-            build_response_fn=lambda: query(payload),
+            build_response_fn=lambda stream_handler: query(payload, stream_handler=stream_handler),
             worker_name="sales-query-stream-worker",
         )
 
     @app.post("/sales/query-with-vision-stream")
     def query_with_vision_stream(payload: VisionQueryRequest):
         return _stream_query_like_response(
-            build_response_fn=lambda: query_with_vision(payload),
+            build_response_fn=lambda stream_handler: query_with_vision(payload, stream_handler=stream_handler),
             worker_name="sales-query-with-vision-stream-worker",
         )
 

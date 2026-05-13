@@ -167,6 +167,7 @@ class Settings:
     
     # Streaming enables progressive response return (faster perceived latency)
     synthesis_enable_streaming: bool = _env_bool("ORCHESTRATOR_SYNTHESIS_ENABLE_STREAMING", "false")
+    synthesis_thinking_enabled: bool = _env_bool("ORCHESTRATOR_SYNTHESIS_THINKING_ENABLED", "false")
 
     # Fast response lane for greeting only to keep latency low.
     quick_intent_fast_response_enabled: bool = _env_bool("ORCHESTRATOR_QUICK_INTENT_FAST_RESPONSE_ENABLED", "true")
