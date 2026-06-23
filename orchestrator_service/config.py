@@ -15,6 +15,11 @@ def _env_text(name: str) -> str:
     return os.getenv(name, "").strip()
 
 
+def _env_csv(name: str, default: str = "") -> tuple[str, ...]:
+    raw = _env_text(name) or default
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
 def _env_first(*names: str, default: str = "") -> str:
     for name in names:
         value = _env_text(name)
@@ -24,6 +29,8 @@ def _env_first(*names: str, default: str = "") -> str:
 
 
 def _use_llm_decider_alias() -> bool:
+    # Backward compatibility: when legacy LLM_DECIDER_* is provided,
+    # prefer it over ORCHESTRATOR_DECIDER_*.
     return any(
         _env_text(name)
         for name in (
@@ -52,15 +59,21 @@ def _decider_api_url() -> str:
 
 
 def _decider_api_key() -> str:
-    return _env_first("LLM_DECIDER_KEY", "ORCHESTRATOR_DECIDER_API_KEY", default="")
+    if _use_llm_decider_alias():
+        return _env_first("LLM_DECIDER_KEY", "ORCHESTRATOR_DECIDER_API_KEY", "OLLAMA_API_KEY", default="")
+    return _env_first("ORCHESTRATOR_DECIDER_API_KEY", "LLM_DECIDER_KEY", "OLLAMA_API_KEY", default="")
 
 
 def _decider_api_key_header() -> str:
-    return _env_first("LLM_DECIDER_API_KEY_HEADER", "ORCHESTRATOR_DECIDER_API_KEY_HEADER", default="Authorization")
+    if _use_llm_decider_alias():
+        return _env_first("LLM_DECIDER_API_KEY_HEADER", "ORCHESTRATOR_DECIDER_API_KEY_HEADER", default="Authorization")
+    return _env_first("ORCHESTRATOR_DECIDER_API_KEY_HEADER", "LLM_DECIDER_API_KEY_HEADER", default="Authorization")
 
 
 def _decider_model() -> str:
-    return _env_first("LLM_DECIDER_NAME", "ORCHESTRATOR_DECIDER_MODEL", default="gemma4:latest")
+    if _use_llm_decider_alias():
+        return _env_first("LLM_DECIDER_NAME", "ORCHESTRATOR_DECIDER_MODEL", default="gemma4:latest")
+    return _env_first("ORCHESTRATOR_DECIDER_MODEL", "LLM_DECIDER_NAME", default="gemma4:latest")
 
 
 def _synthesis_api_format() -> str:
@@ -68,11 +81,16 @@ def _synthesis_api_format() -> str:
 
 
 def _synthesis_api_url() -> str:
-    return _env_first("ORCHESTRATOR_SYNTHESIS_API_URL", "ORCHESTRATOR_DECIDER_API_URL", default=_decider_api_url())
+    return _env_first("ORCHESTRATOR_SYNTHESIS_API_URL", "ORCHESTRATOR_DECIDER_API_URL", default="http://ollama:11434/api/chat")
 
 
 def _synthesis_api_key() -> str:
-    return _env_first("ORCHESTRATOR_SYNTHESIS_API_KEY", "ORCHESTRATOR_DECIDER_API_KEY", default=_decider_api_key())
+    return _env_first(
+        "ORCHESTRATOR_SYNTHESIS_API_KEY",
+        "ORCHESTRATOR_DECIDER_API_KEY",
+        "OLLAMA_API_KEY",
+        default=_decider_api_key(),
+    )
 
 
 def _synthesis_api_key_header() -> str:
@@ -89,8 +107,24 @@ def _synthesis_model() -> str:
 
 @dataclass(frozen=True)
 class Settings:
-    retrieval_service_url: str = os.getenv("RETRIEVAL_SERVICE_URL", "http://127.0.0.1:8011")
+    retrieval_service_url: str = os.getenv("RETRIEVAL_SERVICE_URL", "http://127.0.0.1:8111")
     retrieval_timeout_sec: float = float(os.getenv("RETRIEVAL_TIMEOUT_SEC", "15"))
+    vision_enabled: bool = _env_bool("VISION_ENABLED", "true")
+    vision_service_url: str = os.getenv("VISION_SERVICE_URL", "http://127.0.0.1:8031").strip()
+    vision_timeout_sec: float = float(os.getenv("VISION_TIMEOUT_SEC", "12"))
+    vision_greeting_enabled: bool = _env_bool("VISION_GREETING_ENABLED", "true")
+    redis_url: str = os.getenv("REDIS_URL", "").strip()
+    redis_namespace: str = os.getenv("REDIS_NAMESPACE", "noble_rag").strip() or "noble_rag"
+    shared_identity_db_path: str = os.getenv(
+        "SHARED_IDENTITY_DB_PATH",
+        "data/shared_identity/identity.sqlite3",
+    ).strip()
+    session_known_ttl_sec: int = int(os.getenv("SESSION_KNOWN_TTL_SEC", "3600"))
+    session_guest_ttl_sec: int = int(os.getenv("SESSION_GUEST_TTL_SEC", "300"))
+    cors_allow_origins: tuple[str, ...] = _env_csv(
+        "ORCHESTRATOR_CORS_ALLOW_ORIGINS",
+        default="http://127.0.0.1:8011,http://localhost:8011",
+    )
     default_top_k: int = int(os.getenv("ORCHESTRATOR_DEFAULT_TOP_K", "5"))
     decider_enabled: bool = _env_bool("ORCHESTRATOR_DECIDER_ENABLED", "true" if _use_llm_decider_alias() else "false")
     decider_api_format: str = _decider_api_format()
@@ -133,6 +167,7 @@ class Settings:
     
     # Streaming enables progressive response return (faster perceived latency)
     synthesis_enable_streaming: bool = _env_bool("ORCHESTRATOR_SYNTHESIS_ENABLE_STREAMING", "false")
+    synthesis_thinking_enabled: bool = _env_bool("ORCHESTRATOR_SYNTHESIS_THINKING_ENABLED", "false")
 
     # Fast response lane for greeting only to keep latency low.
     quick_intent_fast_response_enabled: bool = _env_bool("ORCHESTRATOR_QUICK_INTENT_FAST_RESPONSE_ENABLED", "true")

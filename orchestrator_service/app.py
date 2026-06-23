@@ -1,19 +1,30 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import base64
+import binascii
+import hashlib
 import json
 import logging
+import os
+import queue
 import re
 import socket
+import tempfile
 import threading
 import time
+import unicodedata
 from typing import Any, Callable
 import urllib.error
+import urllib.parse
 import urllib.request
+from uuid import uuid4
 
 from fastapi import FastAPI
 from fastapi import HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 from orchestrator_service.config import Settings
 from orchestrator_service.config import get_settings
@@ -27,17 +38,29 @@ from orchestrator_service.prompt_optimization import (
     PromptCompressor,
 )
 from orchestrator_service.retrieval_client import RetrievalClient
+from orchestrator_service.session_store import SessionStore
 from orchestrator_service.schemas import (
     DecisionTrace,
     HistoryTurn,
     LeadState,
+    LiveTalkingQueryRequest,
+    LiveTalkingQueryResponse,
+    LiveTalkingSessionStartRequest,
+    LiveTalkingSessionStartResponse,
+    LiveTalkingSessionState,
+    LiveTalkingStopRequest,
+    LiveTalkingStopResponse,
     NeedPainpointDelta,
     NeedPainpointState,
     QueryRequest,
     QueryResponse,
     RoutingSignal,
     TopicWeight,
+    VisionContext,
+    VisionQueryRequest,
 )
+from orchestrator_service.vision_client import VisionClient
+from shared.identity_store import SharedIdentityStore
 
 log = logging.getLogger("sales-orchestrator")
 _MODEL_HTTP_USER_AGENT = "Noble-RAG-Orchestrator/1.0"
@@ -110,6 +133,14 @@ _FASTPATH_CONSULT_RESPONSE_MODES = {
 }
 _SYNTHESIS_REPLY_MAX_WORDS = 180
 _DECIDER_CONSULT_REPLY_MAX_WORDS = 140
+_INVENTORY_CLAIM_PATTERNS = (
+    "hiện em đang có",
+    "hiện em có",
+    "đang có nhiều dự án",
+    "có nhiều dự án",
+    "dữ liệu từ nhiều dự án",
+    "nhiều dự án trong hệ thống",
+)
 
 
 @dataclass(frozen=True)
@@ -180,14 +211,22 @@ def _normalize_retrieval_readiness(raw: Any) -> str:
 
 
 def _extract_name(message: str) -> str | None:
+    if not isinstance(message, str) or not message.strip():
+        return None
+
+    # Unicode letter without digits/underscore. This avoids fragile hard-coded
+    # ranges that can break after mojibake/encoding drift.
+    name_word = r"[^\W\d_]+(?:[-'][^\W\d_]+)*"
+    name_group = rf"({name_word}(?:\s+{name_word}){{0,5}})"
     patterns = [
-        r"(?:mình|toi|tôi|em|anh|chi|chị)\s+(?:là|la)\s+([a-zA-ZÀ-ỹ][a-zA-ZÀ-ỹ\s]{1,30})",
-        r"(?:tên|ten)\s+(?:mình|toi|tôi|em|anh|chi|chị)\s+(?:là|la)\s+([a-zA-ZÀ-ỹ][a-zA-ZÀ-ỹ\s]{1,30})",
+        rf"(?:mình|minh|toi|tôi|em|anh|chi|chị)\s+(?:là|la)\s+{name_group}",
+        rf"(?:tên|ten)\s+(?:mình|minh|toi|tôi|em|anh|chi|chị)\s+(?:là|la)\s+{name_group}",
     ]
     for pattern in patterns:
-        match = re.search(pattern, message, re.IGNORECASE)
-        if match:
-            return " ".join(match.group(1).strip().split())[:64]
+        match = re.search(pattern, message, re.IGNORECASE | re.UNICODE)
+        if not match:
+            continue
+        return " ".join(match.group(1).strip().split())[:64]
     return None
 
 
@@ -199,13 +238,145 @@ def _extract_phone_contact(message: str) -> str | None:
     return phone
 
 
+def _has_grounding_evidence(grounded_result: dict[str, Any] | None) -> bool:
+    if not isinstance(grounded_result, dict):
+        return False
+    cards = grounded_result.get("project_cards", []) or []
+    chunks = grounded_result.get("evidence_chunks", []) or []
+    return bool(cards and chunks)
+
+
+def _contains_inventory_claim(reply: str) -> bool:
+    lowered = str(reply or "").strip().lower()
+    if not lowered:
+        return False
+    return any(pattern in lowered for pattern in _INVENTORY_CLAIM_PATTERNS)
+
+
+def _build_no_grounding_reply(message: str) -> str:
+    query = str(message or "").strip()
+    if query:
+        return (
+            f"Hiện tại em chưa truy xuất được dữ liệu dự án cho yêu cầu: \"{query}\". "
+            "Anh/chị vui lòng thử lại sau ít phút để em phản hồi chính xác theo dữ liệu hệ thống."
+        )
+    return (
+        "Hiện tại em chưa truy xuất được dữ liệu dự án từ hệ thống. "
+        "Anh/chị vui lòng thử lại sau ít phút để em phản hồi chính xác."
+    )
+
+
+def _has_lead_capture_cta(reply: str) -> bool:
+    cleaned = _normalize_text_for_match(reply)
+    if not cleaned:
+        return False
+    cta_patterns = [
+        r"\bso dien thoai\b",
+        r"\bsdt\b",
+        r"\bten\b",
+        r"\bxin phep goi\b",
+        r"\bgoi dien\b",
+        r"\bhen\b",
+        r"\btu van\b",
+    ]
+    return any(re.search(pattern, cleaned) for pattern in cta_patterns)
+
+
+def _build_lead_capture_cta(lead_state: LeadState) -> str:
+    missing_name, missing_phone = _missing_contact_fields(lead_state)
+    if missing_name and missing_phone:
+        return "Anh/chị cho em xin tên và số điện thoại để em gửi so sánh chi tiết và tư vấn đúng nhu cầu."
+    if missing_phone:
+        return "Anh/chị cho em xin số điện thoại để em gọi tư vấn nhanh 15-20 phút theo nhu cầu của mình."
+    if missing_name:
+        return "Anh/chị cho em xin tên để em cá nhân hóa phương án tư vấn phù hợp nhất."
+    return "Nếu anh/chị đồng ý, em xin phép hẹn lịch tư vấn nhanh 15-20 phút để chốt phương án phù hợp."
+
+
+def _apply_business_outcome_gate(
+    *,
+    reply: str,
+    final_route: str,
+    lead_state: LeadState,
+    response_mode: str,
+) -> str:
+    cleaned = (reply or "").strip()
+    if not cleaned:
+        return cleaned
+    # Prioritize lead capture when discussing projects or recommendation.
+    requires_cta = (
+        _normalize_route(final_route) == "project_grounded"
+        or response_mode in {"grounded_recommendation", "contact_capture"}
+    )
+    if not requires_cta:
+        return cleaned
+    if _has_lead_capture_cta(cleaned):
+        return cleaned
+    cta = _build_lead_capture_cta(lead_state)
+    if cleaned.endswith((".", "!", "?")):
+        return f"{cleaned} {cta}"
+    return f"{cleaned}. {cta}"
+
+
+def _apply_safety_gate(
+    *,
+    reply: str,
+    user_has_budget_context: bool,
+) -> str:
+    cleaned = (reply or "").strip()
+    if not cleaned:
+        return cleaned
+    if user_has_budget_context:
+        return cleaned
+    if not _has_personal_budget_phrase(cleaned):
+        return cleaned
+    # Remove unsupported personal budget statements when user has not provided budget.
+    normalized = re.sub(
+        r"[^.?!]*(ngan sach|tài chính|tai chinh|khả năng chi trả|kha nang chi tra)[^.?!]*[.?!]?",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if normalized:
+        return normalized
+    return "Em có thể tư vấn theo các mức ngân sách phổ biến nếu anh/chị chia sẻ khung tài chính mong muốn."
+
+
+def _apply_grounding_gate(
+    *,
+    reply: str,
+    message: str,
+    final_route: str,
+    grounded_result: dict[str, Any] | None,
+    response_mode: str,
+) -> str:
+    cleaned = (reply or "").strip()
+    if _normalize_route(final_route) != "project_grounded":
+        return cleaned
+    if not _has_grounding_evidence(grounded_result):
+        return _build_no_grounding_reply(message)
+    # Keep model output for generic cases to preserve response quality.
+    # Fallback is reserved for no-evidence or synthesis/model failures.
+    _ = response_mode
+    return cleaned
+
+
+def _normalize_text_for_match(value: str) -> str:
+    text = unicodedata.normalize("NFD", str(value or ""))
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _coerce_extracted_name(raw: Any) -> str | None:
     cleaned = " ".join(str(raw or "").strip().split())
     if not cleaned:
         return None
     if cleaned.lower() in {"none", "null", "n/a"}:
         return None
-    if not re.search(r"[a-zA-ZÀ-ỹ]", cleaned):
+    if not re.search(r"[^\W\d_]", cleaned, re.UNICODE):
         return None
     return cleaned[:64]
 
@@ -224,6 +395,7 @@ def _warmup_decider_model(settings: Settings) -> None:
         prompt="Warmup ping. Reply briefly with OK.",
         temperature=0.0,
         response_format=None,
+        call_role="decider",
     )
 
 
@@ -243,6 +415,8 @@ def _warmup_synthesis_model(settings: Settings) -> None:
         response_format=None,
         max_tokens=16,
         enable_stream=False,
+        call_role="synthesis",
+        thinking_enabled=settings.synthesis_thinking_enabled,
     )
 
 
@@ -433,6 +607,7 @@ def merge_lead_state(
         phone_contact=extracted_phone or lead_state.phone_contact,
         need=_merge_block(lead_state.need, need_update),
         painpoint=_merge_block(lead_state.painpoint, painpoint_update),
+        customer_profile=lead_state.customer_profile,
         engagement_state=lead_state.engagement_state,
         engagement_confidence=lead_state.engagement_confidence,
         sales_state=lead_state.sales_state,
@@ -441,6 +616,41 @@ def merge_lead_state(
         next_best_action=lead_state.next_best_action,
         contact_capture_status=lead_state.contact_capture_status,
     )
+
+
+def _merge_customer_profile(lead_state: LeadState, vision_context: VisionContext | None) -> LeadState:
+    if vision_context is None:
+        return lead_state
+
+    current = lead_state.customer_profile
+    resolved_name = current.name
+    if vision_context.recognized and vision_context.name:
+        resolved_name = vision_context.name
+    resolved_gender = vision_context.gender if vision_context.gender is not None else current.gender
+    resolved_age = vision_context.age if vision_context.age is not None else current.age
+    resolved_source = current.source
+    if vision_context.source and (vision_context.source != "none" or not current.source):
+        resolved_source = vision_context.source
+    resolved_confidence = current.confidence
+    if vision_context.confidence is not None:
+        resolved_confidence = vision_context.confidence
+    resolved_face_id = vision_context.face_id or current.face_id
+
+    updated_profile = current.model_copy(
+        update={
+            "recognized": bool(current.recognized or vision_context.recognized),
+            "name": resolved_name,
+            "age": resolved_age,
+            "gender": resolved_gender,
+            "source": resolved_source,
+            "confidence": resolved_confidence,
+            "last_seen_at": _now_iso(),
+            "greeted_by_name": current.greeted_by_name if resolved_name == current.name else False,
+            "greeted_generic": current.greeted_generic if resolved_gender == current.gender else False,
+            "face_id": resolved_face_id,
+        }
+    )
+    return lead_state.model_copy(update={"customer_profile": updated_profile})
 
 
 def _derive_observability_session_id(payload: QueryRequest, lead_state: LeadState) -> str | None:
@@ -454,6 +664,11 @@ def _derive_observability_session_id(payload: QueryRequest, lead_state: LeadStat
         normalized = re.sub(r"[^a-z0-9_\-]", "", normalized)
         if normalized:
             return f"name:{normalized}"[:128]
+    if lead_state.customer_profile.name:
+        normalized = re.sub(r"\s+", "-", lead_state.customer_profile.name.strip().lower())
+        normalized = re.sub(r"[^a-z0-9_\-]", "", normalized)
+        if normalized:
+            return f"vision:{normalized}"[:128]
     return None
 
 
@@ -464,7 +679,24 @@ def _derive_observability_user_id(lead_state: LeadState) -> str | None:
     name = str(lead_state.name or "").strip()
     if name:
         return name[:128]
+    profile_name = str(lead_state.customer_profile.name or "").strip()
+    if profile_name:
+        return profile_name[:128]
     return None
+
+
+def _vision_image_diagnostics(image_base64: str) -> tuple[int, int | None, str | None, str | None]:
+    cleaned = str(image_base64 or "").strip()
+    if cleaned.startswith("data:"):
+        _, _, cleaned = cleaned.partition(",")
+    b64_len = len(cleaned)
+    if not cleaned:
+        return b64_len, None, None, "empty"
+    try:
+        raw = base64.b64decode(cleaned, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        return b64_len, None, None, str(exc)
+    return b64_len, len(raw), hashlib.sha1(raw).hexdigest()[:16], None
 
 
 def _build_retrieval_intent(
@@ -598,6 +830,36 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         pass
 
+    # Common case: markdown fenced JSON.
+    fenced_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    if fenced_match:
+        candidate = fenced_match.group(1).strip()
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # Robust fallback: try every balanced {...} candidate and return the first valid JSON object.
+    starts = [idx for idx, ch in enumerate(text) if ch == "{"]
+    for start in starts:
+        depth = 0
+        for idx in range(start, len(text)):
+            ch = text[idx]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : idx + 1]
+                    try:
+                        parsed = json.loads(candidate)
+                        if isinstance(parsed, dict):
+                            return parsed
+                    except json.JSONDecodeError:
+                        break
+
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
@@ -625,6 +887,54 @@ def _friendly_project_name(project_id: str) -> str:
     if "_" in cleaned:
         cleaned = cleaned.replace("_", " ")
     return cleaned.title()
+
+
+def _friendly_product_type_name(product_type: str) -> str:
+    raw = str(product_type or "").strip().lower()
+    mapping = {
+        "apartment": "căn hộ",
+        "shophouse": "shophouse",
+        "villa": "biệt thự",
+        "townhouse": "nhà phố",
+        "penthouse": "penthouse",
+        "duplex": "duplex",
+        "unspecified": "sản phẩm đa dạng",
+    }
+    return mapping.get(raw, raw.replace("_", " ").strip() or "sản phẩm đa dạng")
+
+
+def _build_project_catalog_overview(project_cards: list[dict[str, Any]]) -> str:
+    if not project_cards:
+        return (
+            "Hiện em đang có dữ liệu từ nhiều dự án trong hệ thống, "
+            "có thể giới thiệu nhanh các dòng căn hộ, shophouse và biệt thự phù hợp nhu cầu."
+        )
+
+    project_names: list[str] = []
+    product_types: list[str] = []
+
+    for card in project_cards[:5]:
+        project_id = str(card.get("project_id", "")).strip()
+        if project_id:
+            name = _friendly_project_name(project_id)
+            if name and name not in project_names:
+                project_names.append(name)
+        for raw_type in card.get("product_types", []) or []:
+            type_name = _friendly_product_type_name(str(raw_type))
+            if type_name and type_name not in product_types:
+                product_types.append(type_name)
+
+    if not product_types:
+        product_types = ["căn hộ", "shophouse", "biệt thự"]
+
+    products_text = ", ".join(product_types[:4])
+    if project_names:
+        projects_text = ", ".join(project_names[:3])
+        return (
+            f"Hiện em đang có dữ liệu các dòng {products_text} "
+            f"tại nhiều dự án như {projects_text}."
+        )
+    return f"Hiện em đang có dữ liệu các dòng {products_text} tại nhiều dự án."
 
 
 def _is_single_project_mode(project_cards: list[dict], proximity_facts: list[dict]) -> bool:
@@ -712,9 +1022,154 @@ def _has_grounded_fit(grounded_result: dict[str, Any] | None) -> bool:
 
 
 def _missing_contact_fields(lead_state: LeadState) -> tuple[bool, bool]:
-    missing_name = not bool((lead_state.name or "").strip())
+    missing_name = not bool((lead_state.name or lead_state.customer_profile.name or "").strip())
     missing_phone = not bool((lead_state.phone_contact or "").strip())
     return missing_name, missing_phone
+
+
+def _slugify_identifier(value: str, fallback: str = "guest") -> str:
+    normalized = re.sub(r"\s+", "-", str(value or "").strip().lower())
+    normalized = re.sub(r"[^a-z0-9_\-]", "", normalized)
+    return normalized or fallback
+
+
+def _derive_customer_honorific(lead_state: LeadState) -> str | None:
+    gender = lead_state.customer_profile.gender
+    if gender == "female":
+        return "chị"
+    if gender == "male":
+        return "anh"
+    return None
+
+
+def _build_customer_greeting_prefix(
+    lead_state: LeadState,
+    recent_history: list[HistoryTurn],
+    settings: Settings,
+) -> str | None:
+    if not settings.vision_greeting_enabled:
+        return None
+    if any(str(turn.role).strip().lower() == "assistant" for turn in recent_history):
+        return None
+
+    profile = lead_state.customer_profile
+    honorific = _derive_customer_honorific(lead_state)
+    if profile.recognized and profile.name and not profile.greeted_by_name:
+        if honorific:
+            return f"Em chào {honorific} {profile.name} ạ."
+        return f"Em chào {profile.name} ạ."
+    if (not profile.recognized) and profile.gender and not profile.greeted_generic:
+        if honorific:
+            return f"Em chào {honorific} ạ."
+    return None
+
+
+def _build_livetalking_greeting(
+    lead_state: LeadState,
+    *,
+    product_catalog_overview: str | None = None,
+) -> str:
+    profile = lead_state.customer_profile
+    honorific = _derive_customer_honorific(lead_state)
+    if profile.recognized and profile.name:
+        if honorific:
+            return (
+                f"Em chào {honorific} {profile.name} ạ. "
+                "Vì mình là khách hàng cũ nên anh/chị muốn tìm hiểu thêm về sản phẩm nào khác không ạ?"
+            )
+        return (
+            f"Em chào {profile.name} ạ. "
+            "Vì mình là khách hàng cũ nên anh/chị muốn tìm hiểu thêm về sản phẩm nào khác không ạ?"
+        )
+
+    overview = str(product_catalog_overview or "").strip()
+    if overview:
+        return f"Em chào anh/chị ạ. {overview}"
+    if honorific:
+        return (
+            f"Em chào {honorific} ạ. "
+            "Hiện em có thể giới thiệu nhanh các dòng căn hộ, shophouse và biệt thự đang có trong hệ thống."
+        )
+    return (
+        "Em chào anh/chị ạ. "
+        "Hiện em có thể giới thiệu nhanh các dòng căn hộ, shophouse và biệt thự đang có trong hệ thống."
+    )
+
+def _reply_has_greeting_prefix(reply: str) -> bool:
+    lowered = str(reply or "").strip().lower()
+    return lowered.startswith("em chào") or lowered.startswith("xin chào")
+
+
+def _prepend_customer_greeting(reply: str, prefix: str | None) -> str:
+    cleaned_reply = str(reply or "").strip()
+    if not prefix:
+        return cleaned_reply
+    if not cleaned_reply:
+        return prefix
+    if _reply_has_greeting_prefix(cleaned_reply):
+        return cleaned_reply
+    return f"{prefix} {cleaned_reply}".strip()
+
+
+def _mark_customer_greeting_applied(lead_state: LeadState) -> LeadState:
+    profile = lead_state.customer_profile
+    if profile.recognized and profile.name:
+        updated_profile = profile.model_copy(update={"greeted_by_name": True})
+        return lead_state.model_copy(update={"customer_profile": updated_profile})
+    if profile.gender:
+        updated_profile = profile.model_copy(update={"greeted_generic": True})
+        return lead_state.model_copy(update={"customer_profile": updated_profile})
+    return lead_state
+
+
+def _build_face_session_binding(
+    vision_context: VisionContext | None,
+    *,
+    fallback_session_id: str | None = None,
+) -> tuple[str, str]:
+    if vision_context and vision_context.recognized and vision_context.name:
+        return "known", _slugify_identifier(vision_context.name, fallback="known-customer")
+    if vision_context and vision_context.face_id:
+        return "guest", _slugify_identifier(vision_context.face_id, fallback="guest-face")
+    if fallback_session_id:
+        return "anonymous", _slugify_identifier(fallback_session_id, fallback="anonymous")
+    return "anonymous", f"anonymous-{uuid4().hex[:12]}"
+
+
+def _build_face_session_key(customer_kind: str, face_id: str) -> str:
+    return f"{customer_kind}:{face_id}"
+
+
+def _build_session_ttl_sec(customer_kind: str, settings: Settings) -> int:
+    if customer_kind == "known":
+        return max(1, settings.session_known_ttl_sec)
+    return max(1, settings.session_guest_ttl_sec)
+
+
+def _serialize_history(history: list[HistoryTurn]) -> list[dict[str, str]]:
+    return [{"role": turn.role, "message": turn.message} for turn in history]
+
+
+def _deserialize_history(raw: list[dict[str, Any]] | None) -> list[HistoryTurn]:
+    out: list[HistoryTurn] = []
+    for item in raw or []:
+        try:
+            out.append(HistoryTurn.model_validate(item))
+        except Exception:
+            continue
+    return out
+
+
+def _load_livetalking_session_record(
+    record: dict[str, Any] | None,
+) -> tuple[LeadState, list[HistoryTurn], VisionContext | None]:
+    if not isinstance(record, dict):
+        return LeadState(), [], None
+    lead_state = LeadState.model_validate(record.get("lead_state") or {})
+    recent_history = _deserialize_history(record.get("recent_history") or [])
+    raw_vision = record.get("vision_context")
+    vision_context = VisionContext.model_validate(raw_vision) if isinstance(raw_vision, dict) else None
+    return lead_state, recent_history, vision_context
 
 
 def _message_requests_followup(message: str) -> bool:
@@ -1342,6 +1797,17 @@ def _build_reply_synthesis_prompt(
         "last_conversation_goal": lead_state.last_conversation_goal,
         "next_best_action": lead_state.next_best_action,
         "contact_capture_status": lead_state.contact_capture_status,
+        "customer_profile": {
+            "recognized": lead_state.customer_profile.recognized,
+            "name": lead_state.customer_profile.name,
+            "age": lead_state.customer_profile.age,
+            "gender": lead_state.customer_profile.gender,
+            "source": lead_state.customer_profile.source,
+            "confidence": lead_state.customer_profile.confidence,
+            "greeted_by_name": lead_state.customer_profile.greeted_by_name,
+            "greeted_generic": lead_state.customer_profile.greeted_generic,
+            "face_id": lead_state.customer_profile.face_id,
+        },
     }
     grounded_snapshot = _build_grounded_snapshot(grounded_result=grounded_result, settings=settings)
     
@@ -1378,6 +1844,12 @@ def _build_reply_synthesis_prompt(
         "- Không dùng cụm từ kỹ thuật như route/retrieval/metadata/payload/confidence/vector/schema.\n"
         "- Độ dài linh hoạt theo nhu cầu câu hỏi: mặc định ngắn gọn (thường 1-3 câu), chỉ dài hơn khi user cần chi tiết.\n"
         "- Nếu có dữ liệu phù hợp thì nêu nhận định cụ thể; nếu chưa đủ dữ liệu thì nói rõ còn thiếu gì.\n"
+        "- Khi có grounded_context với evidence_chunks: phải nêu TỐI THIỂU 2 chi tiết cụ thể từ dữ liệu (ví dụ vị trí, quy mô, loại hình sản phẩm, tiến độ bàn giao, khung giá nếu có).\n"
+        "- Nếu grounded_context có dữ liệu định lượng (con số, mốc thời gian, quy mô, tiến độ, giá): bắt buộc đưa ít nhất 1 dữ liệu định lượng vào câu trả lời.\n"
+        "- Không dùng câu chung chung kiểu 'có nhiều dự án', 'dữ liệu từ nhiều dự án', 'sản phẩm đa dạng' nếu không kèm chi tiết cụ thể.\n"
+        "- Không được chỉ trả lời bằng thông điệp marketing/CTA; phần tư vấn cụ thể phải xuất hiện trước CTA.\n"
+        "- Cấu trúc ưu tiên cho câu trả lời dự án: (1) trả lời trực tiếp câu hỏi, (2) nêu 2-3 chi tiết cụ thể, (3) mở một phần thông tin sâu hơn để mời hẹn.\n"
+        "- Phần mời hẹn chỉ xuất hiện ở cuối và phải nêu rõ giá trị buổi hẹn (ví dụ so sánh căn, bóc tách bảng giá, phương án tài chính), không được thay thế phần trả lời chính.\n"
         "- Không tự suy diễn ngân sách cá nhân cụ thể (ví dụ 'với 5 tỷ...') nếu người dùng chưa nêu ngân sách.\n"
         "- Khi nhắc con số tài chính, chỉ dùng số đã có trong grounded_context hoặc user_message/recent_history.\n"
         "- Nếu người dùng cần phân tích quá sâu (tài chính chi tiết, pháp lý sâu, phương án căn cụ thể), đề xuất 1 buổi hẹn trực tiếp.\n"
@@ -1398,7 +1870,7 @@ def _build_reply_synthesis_prompt(
         "- response_mode=value_teaser: nêu 1-2 điểm hợp nổi bật để tạo hứng thú tìm hiểu tiếp.\n"
         "- response_mode=discover_need: tư vấn trước, sau đó mới làm rõ nhẹ nếu cần.\n"
         "- response_mode=consultive_recommendation: tư vấn như consultant, nêu logic vì sao phù hợp.\n"
-        "- response_mode=grounded_recommendation: nêu điểm phù hợp dựa trên grounded_context, ngắn và chắc.\n"
+        "- response_mode=grounded_recommendation: trả lời trực diện theo query và grounded_context; bắt buộc có chi tiết cụ thể, rồi mới CTA mềm ở cuối nếu phù hợp.\n"
         "- response_mode=handle_concern: giải tỏa băn khoăn nhẹ, không tranh cãi.\n"
         "- response_mode=soft_next_step: mời bước tiếp theo mềm, không gây áp lực.\n"
         "- response_mode=nurture_followup: nuôi lead, không gây áp lực.\n"
@@ -1410,7 +1882,14 @@ def _build_reply_synthesis_prompt(
         "- ask_policy=avoid_question: kết thúc KHÔNG có dấu hỏi.\n"
         "- ask_policy=allow_question: có thể không hỏi, hoặc hỏi tối đa 1 câu mở.\n"
         "- ask_policy=must_clarify: hỏi đúng 1 câu ngắn về question_focus sau khi đã có nhận định.\n"
-        "- Nếu có câu hỏi: chỉ 1 câu, không hỏi form, không lặp mẫu câu hỏi gần đây.\n\n"
+        "- Nếu có câu hỏi: chỉ 1 câu, không hỏi form, không lặp mẫu câu hỏi gần đây.\n"
+        "- Nếu customer_profile.recognized=true và có customer_profile.name, có thể xưng hô tự nhiên với tên khách hàng khi chào hỏi.\n"
+        "- Nếu customer_profile.recognized=false nhưng customer_profile.gender đã biết, có thể dùng anh/chị cho lời chào mở đầu.\n\n"
+        "- Luôn ưu tiên tham chiếu customer_profile từ vision nếu có (name, gender, age).\n"
+        "- Nếu customer_profile.gender đã biết: chọn đại từ xưng hô phù hợp và nhất quán trong toàn bộ câu trả lời.\n"
+        "- Nếu customer_profile.age='trẻ': ưu tiên văn phong năng động, ngắn gọn, nhấn mạnh tính linh hoạt, tiềm năng tăng giá, tiện ích sống hiện đại.\n"
+        "- Nếu customer_profile.age='trung niên': ưu tiên văn phong điềm tĩnh, rõ ràng, nhấn mạnh pháp lý, an toàn, vận hành ổn định và giá trị sử dụng lâu dài.\n"
+        "- Không nêu trực tiếp kiểu 'vì anh/chị thuộc nhóm tuổi ...'; chỉ điều chỉnh cách tư vấn một cách tự nhiên.\n\n"
         f"user_message={json.dumps(message, ensure_ascii=False)}\n"
         f"final_route={json.dumps(final_route, ensure_ascii=False)}\n"
         f"query_type={json.dumps(query_type, ensure_ascii=False)}\n"
@@ -1439,13 +1918,52 @@ def _call_model_generate(
     timeout_sec: float,
     keep_alive: str,
     prompt: str,
+    messages: list[dict[str, str]] | None = None,
     temperature: float,
     response_format: str | None = "json",
     max_tokens: int | None = None,
     enable_stream: bool = False,
+    call_role: str = "general",
+    stream_handler: Callable[[str], None] | None = None,
+    thinking_enabled: bool | None = None,
 ) -> Any:
+    call_started_at = time.perf_counter()
+    is_synthesis_call = call_role == "synthesis"
+
+    def _elapsed_ms(started_at: float) -> float:
+        return (time.perf_counter() - started_at) * 1000.0
+
+    def _normalize_ollama_cloud_native_url(raw_url: str) -> str:
+        parsed = urllib.parse.urlsplit(raw_url)
+        base = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+        path = (parsed.path or "").rstrip("/")
+        if not path:
+            return base + "/api/generate"
+        if path.endswith("/api/generate") or path.endswith("/api/chat"):
+            return base + path
+        return base + path
+
     api_format = str(api_format or "ollama").strip().lower()
     model_name = str(model or "").strip().lower()
+    api_url = str(api_url or "").strip()
+    log.info("model_call config: format=%s url=%s model=%s stream=%s", api_format, api_url, model, bool(enable_stream))
+
+    # Ollama Cloud supports native `/api/...` directly on ollama.com.
+    # For orchestrator behavior consistency:
+    # - decider is forced to `/api/generate`
+    # - synthesis is forced to `/api/chat`
+    if api_format == "ollama":
+        if "ollama.com" in api_url:
+            api_url = _normalize_ollama_cloud_native_url(api_url)
+        parsed = urllib.parse.urlsplit(api_url)
+        base = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+        path = (parsed.path or "").rstrip("/")
+        if call_role == "decider":
+            api_url = base + "/api/generate"
+        elif call_role == "synthesis":
+            api_url = base + "/api/chat"
+        elif not path:
+            api_url = base + "/api/generate"
     headers: dict[str, str] = {
         "Content-Type": "application/json",
         "User-Agent": _MODEL_HTTP_USER_AGENT,
@@ -1458,28 +1976,36 @@ def _call_model_generate(
             headers[header_name] = api_key
 
     if api_format == "openai":
+        message_payload = messages if messages else [{"role": "user", "content": prompt}]
         payload: dict[str, Any] = {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": message_payload,
             "stream": bool(enable_stream),
         }
-        # Kimi k2.5 supports thinking/non-thinking modes; disable thinking for faster routing/synthesis turns.
-        if model_name.startswith("kimi-k2.5"):
+        if call_role == "decider":
             payload["thinking"] = {"type": "disabled"}
-            # Add max_tokens constraint to optimize synthesis latency (Kimi responds faster with token limit)
-            if max_tokens:
-                payload["max_tokens"] = max_tokens
         else:
             payload["temperature"] = temperature
+            if max_tokens:
+                payload["max_tokens"] = max_tokens
         if response_format == "json":
             payload["response_format"] = {"type": "json_object"}
     else:
+        parsed_url = urllib.parse.urlsplit(api_url)
+        is_ollama_chat_api = (parsed_url.path or "").rstrip("/").endswith("/api/chat")
         payload = {
             "model": model,
             "prompt": prompt,
             "stream": bool(enable_stream),
             "options": {"temperature": temperature},
         }
+        if is_ollama_chat_api:
+            payload.pop("prompt", None)
+            payload["messages"] = messages if messages else [{"role": "user", "content": prompt}]
+        if call_role == "decider":
+            payload["think"] = False
+        elif call_role == "synthesis" and thinking_enabled is not None:
+            payload["think"] = bool(thinking_enabled)
         if response_format:
             payload["format"] = response_format
             # Some reasoning-capable Ollama models return only `thinking` with empty
@@ -1494,62 +2020,186 @@ def _call_model_generate(
         headers=headers,
         method="POST",
     )
+    if is_synthesis_call:
+        log.info(
+            "synthesis_upstream stage=request_prepared elapsed_ms=%.1f api_format=%s api_url=%s model=%s stream=%s prompt_chars=%s message_count=%s",
+            _elapsed_ms(call_started_at),
+            api_format,
+            api_url,
+            model,
+            bool(enable_stream),
+            len(str(prompt or "")),
+            len(messages or []),
+        )
     if enable_stream:
-        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            if api_format == "openai":
-                parts: list[str] = []
+        open_started_at = time.perf_counter()
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                if is_synthesis_call:
+                    log.info(
+                        "synthesis_upstream stage=response_open elapsed_ms=%.1f status=%s",
+                        _elapsed_ms(call_started_at),
+                        getattr(resp, "status", None),
+                    )
+                if api_format == "openai":
+                    parts: list[str] = []
+                    first_line_logged = False
+                    first_chunk_logged = False
+                    while True:
+                        line_bytes = resp.readline()
+                        if line_bytes and not first_line_logged and is_synthesis_call:
+                            first_line_logged = True
+                            log.info(
+                                "synthesis_upstream stage=first_stream_bytes elapsed_ms=%.1f open_wait_ms=%.1f",
+                                _elapsed_ms(call_started_at),
+                                _elapsed_ms(open_started_at),
+                            )
+                        if not line_bytes:
+                            break
+                        line = line_bytes.decode("utf-8", errors="ignore").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if not data or data == "[DONE]":
+                            continue
+                        try:
+                            event = json.loads(data)
+                        except Exception:
+                            continue
+                        choices = event.get("choices", [])
+                        if not isinstance(choices, list) or not choices:
+                            continue
+                        first = choices[0] if isinstance(choices[0], dict) else {}
+                        delta = first.get("delta") if isinstance(first, dict) else {}
+                        if not isinstance(delta, dict):
+                            continue
+                        content = delta.get("content")
+                        if isinstance(content, str) and content:
+                            parts.append(content)
+                            if is_synthesis_call and not first_chunk_logged:
+                                first_chunk_logged = True
+                                log.info(
+                                    "synthesis_upstream stage=first_text_chunk elapsed_ms=%.1f bytes_len=%s",
+                                    _elapsed_ms(call_started_at),
+                                    len(content),
+                                )
+                            if stream_handler:
+                                stream_handler(content)
+                        elif isinstance(content, list):
+                            for item in content:
+                                if isinstance(item, dict):
+                                    text = item.get("text")
+                                    if isinstance(text, str) and text:
+                                        parts.append(text)
+                                        if is_synthesis_call and not first_chunk_logged:
+                                            first_chunk_logged = True
+                                            log.info(
+                                                "synthesis_upstream stage=first_text_chunk elapsed_ms=%.1f bytes_len=%s",
+                                                _elapsed_ms(call_started_at),
+                                                len(text),
+                                            )
+                                        if stream_handler:
+                                            stream_handler(text)
+                    if is_synthesis_call:
+                        log.info(
+                            "synthesis_upstream stage=stream_completed elapsed_ms=%.1f output_chars=%s",
+                            _elapsed_ms(call_started_at),
+                            sum(len(p) for p in parts),
+                        )
+                    return "".join(parts)
+
+                # Ollama streaming: newline-delimited JSON with `response` chunks
+                # (generate) or `message.content` chunks (chat).
+                parts = []
+                first_line_logged = False
+                first_chunk_logged = False
                 while True:
                     line_bytes = resp.readline()
+                    if line_bytes and not first_line_logged and is_synthesis_call:
+                        first_line_logged = True
+                        log.info(
+                            "synthesis_upstream stage=first_stream_bytes elapsed_ms=%.1f open_wait_ms=%.1f",
+                            _elapsed_ms(call_started_at),
+                            _elapsed_ms(open_started_at),
+                        )
                     if not line_bytes:
                         break
                     line = line_bytes.decode("utf-8", errors="ignore").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if not data or data == "[DONE]":
+                    if not line:
                         continue
                     try:
-                        event = json.loads(data)
+                        event = json.loads(line)
                     except Exception:
                         continue
-                    choices = event.get("choices", [])
-                    if not isinstance(choices, list) or not choices:
+                    chunk = event.get("response")
+                    if isinstance(chunk, str) and chunk:
+                        parts.append(chunk)
+                        if is_synthesis_call and not first_chunk_logged:
+                            first_chunk_logged = True
+                            log.info(
+                                "synthesis_upstream stage=first_text_chunk elapsed_ms=%.1f bytes_len=%s",
+                                _elapsed_ms(call_started_at),
+                                len(chunk),
+                            )
+                        if stream_handler:
+                            stream_handler(chunk)
                         continue
-                    first = choices[0] if isinstance(choices[0], dict) else {}
-                    delta = first.get("delta") if isinstance(first, dict) else {}
-                    if not isinstance(delta, dict):
-                        continue
-                    content = delta.get("content")
-                    if isinstance(content, str) and content:
-                        parts.append(content)
-                    elif isinstance(content, list):
-                        for item in content:
-                            if isinstance(item, dict):
-                                text = item.get("text")
-                                if isinstance(text, str) and text:
-                                    parts.append(text)
+                    message = event.get("message")
+                    if isinstance(message, dict):
+                        content = message.get("content")
+                        if isinstance(content, str) and content:
+                            parts.append(content)
+                            if is_synthesis_call and not first_chunk_logged:
+                                first_chunk_logged = True
+                                log.info(
+                                    "synthesis_upstream stage=first_text_chunk elapsed_ms=%.1f bytes_len=%s",
+                                    _elapsed_ms(call_started_at),
+                                    len(content),
+                                )
+                            if stream_handler:
+                                stream_handler(content)
+                if is_synthesis_call:
+                    log.info(
+                        "synthesis_upstream stage=stream_completed elapsed_ms=%.1f output_chars=%s",
+                        _elapsed_ms(call_started_at),
+                        sum(len(p) for p in parts),
+                    )
                 return "".join(parts)
+        except Exception as exc:
+            if is_synthesis_call:
+                log.warning(
+                    "synthesis_upstream stage=stream_error elapsed_ms=%.1f open_wait_ms=%.1f error_type=%s error=%s",
+                    _elapsed_ms(call_started_at),
+                    _elapsed_ms(open_started_at),
+                    type(exc).__name__,
+                    str(exc)[:240],
+                )
+            raise
 
-            # Ollama streaming: newline-delimited JSON objects with `response` chunks.
-            parts = []
-            while True:
-                line_bytes = resp.readline()
-                if not line_bytes:
-                    break
-                line = line_bytes.decode("utf-8", errors="ignore").strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except Exception:
-                    continue
-                chunk = event.get("response")
-                if isinstance(chunk, str) and chunk:
-                    parts.append(chunk)
-            return "".join(parts)
-
-    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-        raw = resp.read().decode("utf-8")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            if is_synthesis_call:
+                log.info(
+                    "synthesis_upstream stage=response_open elapsed_ms=%.1f status=%s",
+                    _elapsed_ms(call_started_at),
+                    getattr(resp, "status", None),
+                )
+            raw = resp.read().decode("utf-8")
+    except Exception as exc:
+        if is_synthesis_call:
+            log.warning(
+                "synthesis_upstream stage=non_stream_error elapsed_ms=%.1f error_type=%s error=%s",
+                _elapsed_ms(call_started_at),
+                type(exc).__name__,
+                str(exc)[:240],
+            )
+        raise
+    if is_synthesis_call:
+        log.info(
+            "synthesis_upstream stage=non_stream_completed elapsed_ms=%.1f output_chars=%s",
+            _elapsed_ms(call_started_at),
+            len(raw),
+        )
     parsed = json.loads(raw)
     if not isinstance(parsed, dict):
         raise RuntimeError("model response is not a JSON object")
@@ -1574,6 +2224,11 @@ def _call_model_generate(
     response_text = parsed.get("response", "")
     if isinstance(response_text, str) and response_text.strip():
         return response_text
+    message = parsed.get("message")
+    if isinstance(message, dict):
+        message_content = message.get("content")
+        if isinstance(message_content, str) and message_content.strip():
+            return message_content
     thinking_text = parsed.get("thinking", "")
     if isinstance(thinking_text, str):
         return thinking_text
@@ -1611,6 +2266,91 @@ def _reply_needs_retry(reply: str, single_project_mode: bool, ask_policy: str) -
         return True
 
     return False
+
+
+def _extract_grounding_keywords(grounded_result: dict[str, Any] | None) -> list[str]:
+    if not isinstance(grounded_result, dict):
+        return []
+    tokens: list[str] = []
+    for project_id in grounded_result.get("used_projects", []) or []:
+        tokens.extend(re.findall(r"[a-z0-9]+", _normalize_text_for_match(str(project_id))))
+    for card in (grounded_result.get("project_cards", []) or [])[:2]:
+        if isinstance(card, dict):
+            tokens.extend(re.findall(r"[a-z0-9]+", _normalize_text_for_match(str(card.get("project_id") or ""))))
+            tokens.extend(re.findall(r"[a-z0-9]+", _normalize_text_for_match(str(card.get("summary") or ""))))
+    unique: list[str] = []
+    for token in tokens:
+        if len(token) < 4:
+            continue
+        if token in {"du", "an", "project", "city", "legend"}:
+            continue
+        if token not in unique:
+            unique.append(token)
+    return unique[:16]
+
+
+def _grounded_reply_too_generic(
+    *,
+    reply: str,
+    grounded_result: dict[str, Any] | None,
+    response_mode: str,
+    final_route: str,
+) -> bool:
+    if _normalize_route(final_route) != "project_grounded":
+        return False
+    if not _has_grounding_evidence(grounded_result):
+        return False
+
+    cleaned = str(reply or "").strip()
+    if not cleaned:
+        return True
+
+    normalized_reply = _normalize_text_for_match(cleaned)
+    # Must include at least one quantitative detail when evidence exists.
+    has_number = bool(re.search(r"\d", normalized_reply))
+    # Must include at least one project-specific keyword from grounded payload.
+    keywords = _extract_grounding_keywords(grounded_result)
+    has_keyword = any(k in normalized_reply for k in keywords) if keywords else False
+
+    # For grounded project answers, reject generic marketing copy lacking
+    # both project-specific anchors and quantitative evidence.
+    return not (has_number and has_keyword)
+
+
+def _build_grounded_specific_reply(grounded_result: dict[str, Any] | None) -> str:
+    if not isinstance(grounded_result, dict):
+        return ""
+    project_cards = grounded_result.get("project_cards", []) or []
+    evidence_chunks = grounded_result.get("evidence_chunks", []) or []
+    if not project_cards or not evidence_chunks:
+        return ""
+
+    project_id = str((project_cards[0] or {}).get("project_id") or "").strip()
+    project_name = project_id.replace("_", " ").title() if project_id else "Dự án này"
+    evidence_text = " ".join(str((item or {}).get("text") or "") for item in evidence_chunks[:3])
+    normalized = re.sub(r"\s+", " ", evidence_text)
+
+    # Pull a few concrete quantitative details if present.
+    area_match = re.search(r"(\d+(?:[.,]\d+)?)\s*ha", normalized, re.IGNORECASE)
+    product_match = re.search(r"(\d[\d\.\,]{2,})\s*sản phẩm", normalized, re.IGNORECASE)
+    handover_match = re.search(r"quý\s*\d\/\d{4}", normalized, re.IGNORECASE)
+    location_match = re.search(r"vị trí:\s*([^.\n-]{4,80})", normalized, re.IGNORECASE)
+
+    details: list[str] = []
+    if location_match:
+        details.append(f"vị trí tại {location_match.group(1).strip()}")
+    if area_match:
+        details.append(f"quy mô khoảng {area_match.group(1)} ha")
+    if product_match:
+        details.append(f"tổng nguồn cung khoảng {product_match.group(1)} sản phẩm")
+    if handover_match:
+        details.append(f"dự kiến bàn giao {handover_match.group(0)}")
+
+    detail_text = ", ".join(details[:3]) if details else "đã công bố khá rõ thông tin tổng quan, loại hình và tiến độ"
+    return (
+        f"{project_name} hiện {detail_text}. "
+        "Nếu anh/chị muốn, em có thể đi sâu bảng giá theo từng dòng sản phẩm và chọn phương án căn phù hợp nhất trong buổi tư vấn trực tiếp."
+    )
 
 
 def _rewrite_reply_by_policy(reply: str, single_project_mode: bool, ask_policy: str, settings: Settings) -> str:
@@ -1663,8 +2403,14 @@ def _sanitize_reply_for_policy(
 def _extract_assistant_reply(response_payload: Any) -> str:
     if isinstance(response_payload, dict):
         return str(response_payload.get("assistant_reply", "")).strip()
-    parsed_obj = _extract_json_object(str(response_payload))
-    return str(parsed_obj.get("assistant_reply", "")).strip()
+    raw_text = str(response_payload or "").strip()
+    if not raw_text:
+        return ""
+    try:
+        parsed_obj = _extract_json_object(raw_text)
+    except Exception:
+        return raw_text
+    return str(parsed_obj.get("assistant_reply", "")).strip() or raw_text
 
 
 def _build_synthesis_cache_key(
@@ -1706,6 +2452,189 @@ def _build_reply_repair_prompt(
     )
 
 
+def _build_no_decider_direct_reply_prompt(
+    *,
+    message: str,
+    recent_history: list[HistoryTurn],
+    lead_state: LeadState,
+    reply_plan: ReplyPlan,
+    settings: Settings,
+) -> str:
+    compact_history = [
+        {"role": turn.role, "message": turn.message}
+        for turn in recent_history[-settings.synthesis_history_turns :]
+    ]
+    state_payload = {
+        "need_summary": lead_state.need.summary,
+        "painpoint_summary": lead_state.painpoint.summary,
+        "sales_state": lead_state.sales_state,
+        "engagement_state": lead_state.engagement_state,
+        "conversation_goal": lead_state.last_conversation_goal,
+        "next_best_action": lead_state.next_best_action,
+    }
+    return (
+        "Ban la tro ly tu van bat dong san.\n"
+        "Boi canh: decider tam thoi khong san sang. Van phai tu van theo noi dung query cua khach.\n"
+        "Muc tieu: tra loi gon, tu nhien, bam sat query, khong noi ve loi he thong.\n"
+        "Bat buoc: tra ve DUY NHAT 1 JSON object theo schema {\"assistant_reply\":\"...\"}.\n"
+        "Khong markdown, khong giai thich them.\n"
+        f"ask_policy={json.dumps(reply_plan.ask_policy, ensure_ascii=False)}\n"
+        f"response_mode={json.dumps(reply_plan.response_mode, ensure_ascii=False)}\n"
+        f"focus={json.dumps(reply_plan.focus, ensure_ascii=False)}\n"
+        f"question_focus={json.dumps(reply_plan.question_focus, ensure_ascii=False)}\n"
+        f"user_message={json.dumps(message, ensure_ascii=False)}\n"
+        f"lead_state={json.dumps(state_payload, ensure_ascii=False)}\n"
+        f"recent_history={json.dumps(compact_history, ensure_ascii=False)}\n"
+    )
+
+
+def _history_to_chat_messages(recent_history: list[HistoryTurn], max_turns: int) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for turn in recent_history[-max_turns:]:
+        role = str(turn.role or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = str(turn.message or "").strip()
+        if not content:
+            continue
+        out.append({"role": role, "content": content})
+    return out
+
+
+def _build_no_decider_direct_reply_messages(
+    *,
+    message: str,
+    recent_history: list[HistoryTurn],
+    lead_state: LeadState,
+    reply_plan: ReplyPlan,
+    settings: Settings,
+) -> list[dict[str, str]]:
+    state_payload = {
+        "need_summary": lead_state.need.summary,
+        "painpoint_summary": lead_state.painpoint.summary,
+        "sales_state": lead_state.sales_state,
+        "engagement_state": lead_state.engagement_state,
+        "conversation_goal": lead_state.last_conversation_goal,
+        "next_best_action": lead_state.next_best_action,
+    }
+    system_prompt = (
+        "Ban la tro ly tu van bat dong san.\n"
+        "Boi canh: decider tam thoi khong san sang. Van phai tu van theo noi dung query cua khach.\n"
+        "Muc tieu: tra loi gon, tu nhien, bam sat query, khong noi ve loi he thong.\n"
+        "Bat buoc: tra ve DUY NHAT 1 JSON object theo schema {\"assistant_reply\":\"...\"}.\n"
+        "Khong markdown, khong giai thich them.\n"
+        f"ask_policy={json.dumps(reply_plan.ask_policy, ensure_ascii=False)}\n"
+        f"response_mode={json.dumps(reply_plan.response_mode, ensure_ascii=False)}\n"
+        f"focus={json.dumps(reply_plan.focus, ensure_ascii=False)}\n"
+        f"question_focus={json.dumps(reply_plan.question_focus, ensure_ascii=False)}\n"
+        f"lead_state={json.dumps(state_payload, ensure_ascii=False)}\n"
+    )
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(_history_to_chat_messages(recent_history, settings.synthesis_history_turns))
+    messages.append({"role": "user", "content": message})
+    return messages
+
+
+def _build_synthesis_chat_messages(
+    *,
+    message: str,
+    lead_state: LeadState,
+    recent_history: list[HistoryTurn],
+    final_route: str,
+    query_type: str,
+    decision_reason: str,
+    reply_plan: ReplyPlan,
+    grounded_result: dict[str, Any] | None,
+    settings: Settings,
+) -> list[dict[str, str]]:
+    compact_state = {
+        "need_summary": lead_state.need.summary,
+        "painpoint_summary": lead_state.painpoint.summary,
+        "sales_state": lead_state.sales_state,
+        "engagement_state": lead_state.engagement_state,
+        "conversation_goal": lead_state.last_conversation_goal,
+        "next_best_action": lead_state.next_best_action,
+    }
+    grounded_context = {
+        "used_projects": (grounded_result or {}).get("used_projects", []) if isinstance(grounded_result, dict) else [],
+        "project_cards": (grounded_result or {}).get("project_cards", []) if isinstance(grounded_result, dict) else [],
+        "trait_tags": (grounded_result or {}).get("trait_tags", []) if isinstance(grounded_result, dict) else [],
+        "proximity_facts": (grounded_result or {}).get("proximity_facts", []) if isinstance(grounded_result, dict) else [],
+        "evidence_chunks": (grounded_result or {}).get("evidence_chunks", []) if isinstance(grounded_result, dict) else [],
+        "retrieval_intent": (grounded_result or {}).get("retrieval_intent", {}) if isinstance(grounded_result, dict) else {},
+        "confidence": (grounded_result or {}).get("confidence", 0.0) if isinstance(grounded_result, dict) else 0.0,
+        "low_confidence": bool((grounded_result or {}).get("low_confidence", True)) if isinstance(grounded_result, dict) else True,
+    }
+
+    system_prompt = (
+        "Ban la tro ly tu van bat dong san.\n"
+        "Nhiem vu: tra loi phu hop theo route/chien luoc, ngan gon, tu nhien, khong noi ky thuat he thong.\n"
+        "Bat buoc tra ve DUY NHAT 1 JSON object theo schema {\"assistant_reply\":\"...\"}.\n"
+        "Khong markdown, khong giai thich them.\n"
+        f"final_route={json.dumps(_normalize_route(final_route), ensure_ascii=False)}\n"
+        f"query_type={json.dumps(_normalize_query_type(query_type), ensure_ascii=False)}\n"
+        f"decision_reason={json.dumps(decision_reason, ensure_ascii=False)}\n"
+        f"response_mode={json.dumps(_normalize_response_mode(reply_plan.response_mode), ensure_ascii=False)}\n"
+        f"ask_policy={json.dumps(_normalize_ask_policy(reply_plan.ask_policy), ensure_ascii=False)}\n"
+        f"focus={json.dumps(reply_plan.focus, ensure_ascii=False)}\n"
+        f"question_focus={json.dumps(reply_plan.question_focus, ensure_ascii=False)}\n"
+        f"lead_state={json.dumps(compact_state, ensure_ascii=False)}\n"
+        f"grounded_context={json.dumps(grounded_context, ensure_ascii=False)}\n"
+    )
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(_history_to_chat_messages(recent_history, settings.synthesis_history_turns))
+    messages.append({"role": "user", "content": message})
+    return messages
+
+
+def synthesize_assistant_reply_no_decider(
+    *,
+    message: str,
+    recent_history: list[HistoryTurn],
+    lead_state: LeadState,
+    reply_plan: ReplyPlan,
+    settings: Settings,
+    stream_handler: Callable[[str], None] | None = None,
+) -> str:
+    synthesis_response_format = None if stream_handler else "json"
+    chat_messages = _build_no_decider_direct_reply_messages(
+        message=message,
+        recent_history=recent_history,
+        lead_state=lead_state,
+        reply_plan=reply_plan,
+        settings=settings,
+    )
+    response_payload = _call_model_generate(
+        api_format=settings.synthesis_api_format,
+        api_url=settings.synthesis_api_url,
+        api_key=settings.synthesis_api_key,
+        api_key_header=settings.synthesis_api_key_header,
+        model=settings.synthesis_model,
+        timeout_sec=settings.synthesis_timeout_sec,
+        keep_alive=settings.synthesis_keep_alive,
+        prompt=message,
+        messages=chat_messages,
+        temperature=max(0.0, min(1.0, settings.synthesis_temperature)),
+        response_format=synthesis_response_format,
+        max_tokens=settings.synthesis_output_max_tokens,
+        enable_stream=settings.synthesis_enable_streaming,
+        call_role="synthesis",
+        stream_handler=stream_handler,
+        thinking_enabled=settings.synthesis_thinking_enabled,
+    )
+    reply = _sanitize_reply_for_policy(
+        reply=_extract_assistant_reply(response_payload),
+        ask_policy=reply_plan.ask_policy,
+        single_project_mode=False,
+        question_focus=reply_plan.question_focus,
+    )
+    if not reply:
+        raise RuntimeError("no_decider direct synthesis returned empty reply")
+    if _reply_needs_retry(reply=reply, single_project_mode=False, ask_policy=reply_plan.ask_policy):
+        raise RuntimeError("no_decider direct synthesis failed policy/quality gate")
+    return _compact_text(reply, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
+
+
 def synthesize_assistant_reply(
     message: str,
     recent_history: list[HistoryTurn],
@@ -1716,6 +2645,7 @@ def synthesize_assistant_reply(
     reply_plan: ReplyPlan,
     grounded_result: dict[str, Any] | None,
     settings: Settings,
+    stream_handler: Callable[[str], None] | None = None,
 ) -> str:
     user_has_budget_context = _user_context_has_budget_signal(message=message, recent_history=recent_history)
     primary_prompt = _build_reply_synthesis_prompt(
@@ -1736,6 +2666,17 @@ def synthesize_assistant_reply(
         grounded_result=grounded_result,
         settings=settings,
     )
+    primary_messages = _build_synthesis_chat_messages(
+        message=message,
+        lead_state=lead_state,
+        recent_history=recent_history,
+        final_route=final_route,
+        query_type=analysis.query_type,
+        decision_reason=decision_reason,
+        reply_plan=reply_plan,
+        grounded_result=grounded_result,
+        settings=settings,
+    )
     single_project_mode = False
     if grounded_result:
         single_project_mode = _is_single_project_mode(
@@ -1744,7 +2685,7 @@ def synthesize_assistant_reply(
         )
     
     # Try to retrieve from cache (before retry loop)
-    synthesis_cache = get_synthesis_cache()
+    synthesis_cache = get_synthesis_cache() if settings.synthesis_cache_enabled else None
     timing_inst = get_timing_instrument()
     cached_response = None
     cache_key = _build_synthesis_cache_key(
@@ -1760,81 +2701,63 @@ def synthesize_assistant_reply(
             log.info("synthesis cache hit (stable-key)")
             return _compact_text(cached_response, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
     
-    attempt_prompt = primary_prompt
-    last_failure_reason = "reply_synthesis_not_attempted"
-    for attempt_index in range(2):
-        try:
-            # Record synthesis timing
-            if timing_inst:
-                timing_inst.start("synthesis_call")
-            
-            response_payload = _call_model_generate(
-                api_format=settings.synthesis_api_format,
-                api_url=settings.synthesis_api_url,
-                api_key=settings.synthesis_api_key,
-                api_key_header=settings.synthesis_api_key_header,
-                model=settings.synthesis_model,
-                timeout_sec=settings.synthesis_timeout_sec,
-                keep_alive=settings.synthesis_keep_alive,
-                prompt=attempt_prompt,
-                temperature=max(0.0, min(1.0, settings.synthesis_temperature)),
-                response_format="json",
-                max_tokens=settings.synthesis_output_max_tokens,
-                enable_stream=settings.synthesis_enable_streaming,
-            )
-            
-            if timing_inst:
-                elapsed_ms = timing_inst.end("synthesis_call")
-                log.debug(f"synthesis stage latency: {elapsed_ms:.1f}ms")
-            
-            reply = _sanitize_reply_for_policy(
-                reply=_extract_assistant_reply(response_payload),
-                ask_policy=reply_plan.ask_policy,
-                single_project_mode=single_project_mode,
-                question_focus=reply_plan.question_focus,
-            )
-            if _has_personal_budget_phrase(reply) and not user_has_budget_context:
-                log.info("reply synthesis rejected unsupported personal budget phrase")
-                last_failure_reason = "unsupported_personal_budget_phrase"
-            elif _reply_needs_retry(
-                reply=reply,
-                single_project_mode=single_project_mode,
-                ask_policy=reply_plan.ask_policy,
-            ):
-                last_failure_reason = "reply_failed_policy_or_quality_gate"
-            elif reply:
-                # Cache the successful response
-                if synthesis_cache and attempt_index == 0:
-                    synthesis_cache.set(
-                        cache_key,
-                        reply,
-                        metadata={"route": final_route, "query_type": analysis.query_type}
-                    )
-                return _compact_text(reply, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
-            else:
-                last_failure_reason = "empty_reply_after_sanitize"
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="ignore")[:240]
-            log.warning("reply synthesis HTTP %s: %s", exc.code, detail)
-            raise RuntimeError(f"reply synthesis HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            log.warning("reply synthesis unreachable: %s", exc.reason)
-            raise RuntimeError(f"reply synthesis unreachable: {exc.reason}") from exc
-        except socket.timeout as exc:
-            log.warning("reply synthesis timeout after %ss", settings.synthesis_timeout_sec)
-            raise RuntimeError(f"reply synthesis timeout after {settings.synthesis_timeout_sec}s") from exc
-        except Exception as exc:
-            log.warning("reply synthesis failed: %s", exc)
-            raise RuntimeError(f"reply synthesis failed: {exc}") from exc
+    synthesis_response_format = None if stream_handler else "json"
+    try:
+        if timing_inst:
+            timing_inst.start("synthesis_call")
 
-        if attempt_index == 0:
-            attempt_prompt = _build_reply_repair_prompt(
-                original_prompt=primary_prompt,
-                invalid_reply=reply,
-                invalid_reason=last_failure_reason,
-            )
+        response_payload = _call_model_generate(
+            api_format=settings.synthesis_api_format,
+            api_url=settings.synthesis_api_url,
+            api_key=settings.synthesis_api_key,
+            api_key_header=settings.synthesis_api_key_header,
+            model=settings.synthesis_model,
+            timeout_sec=settings.synthesis_timeout_sec,
+            keep_alive=settings.synthesis_keep_alive,
+            prompt=primary_prompt,
+            messages=primary_messages,
+            temperature=max(0.0, min(1.0, settings.synthesis_temperature)),
+            response_format=synthesis_response_format,
+            max_tokens=settings.synthesis_output_max_tokens,
+            enable_stream=settings.synthesis_enable_streaming,
+            call_role="synthesis",
+            stream_handler=stream_handler,
+            thinking_enabled=settings.synthesis_thinking_enabled,
+        )
 
-    raise RuntimeError(f"reply synthesis returned unusable output after retries: {last_failure_reason}")
+        if timing_inst:
+            elapsed_ms = timing_inst.end("synthesis_call")
+            log.debug(f"synthesis stage latency: {elapsed_ms:.1f}ms")
+
+        reply = _sanitize_reply_for_policy(
+            reply=_extract_assistant_reply(response_payload),
+            ask_policy=reply_plan.ask_policy,
+            single_project_mode=single_project_mode,
+            question_focus=reply_plan.question_focus,
+        )
+        if not reply:
+            raise RuntimeError("reply synthesis returned empty reply")
+
+        if synthesis_cache:
+            synthesis_cache.set(
+                cache_key,
+                reply,
+                metadata={"route": final_route, "query_type": analysis.query_type}
+            )
+        return _compact_text(reply, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")[:240]
+        log.warning("reply synthesis HTTP %s: %s", exc.code, detail)
+        raise RuntimeError(f"reply synthesis HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        log.warning("reply synthesis unreachable: %s", exc.reason)
+        raise RuntimeError(f"reply synthesis unreachable: {exc.reason}") from exc
+    except socket.timeout as exc:
+        log.warning("reply synthesis timeout after %ss", settings.synthesis_timeout_sec)
+        raise RuntimeError(f"reply synthesis timeout after {settings.synthesis_timeout_sec}s") from exc
+    except Exception as exc:
+        log.warning("reply synthesis failed: %s", exc)
+        raise RuntimeError(f"reply synthesis failed: {exc}") from exc
 
 
 def _build_decider_prompt(
@@ -1877,6 +2800,10 @@ def _build_decider_prompt(
         '  "should_route_project": true|false,\n'
         '  "project_query_hint": "string|null"\n'
         "}\n\n"
+        "QUY DINH DINH DANG CUNG:\n"
+        "- Chi tra ve DUY NHAT JSON object.\n"
+        "- Khong markdown, khong ```json, khong giai thich, khong text truoc/sau JSON.\n"
+        "- project_query_hint: neu should_route_project=false thi bat buoc la null.\n\n"
         f"message={json.dumps(message, ensure_ascii=False)}\n"
         f"lead_state={json.dumps(compact_state, ensure_ascii=False)}\n"
         f"recent_history={json.dumps(compact_history, ensure_ascii=False)}\n"
@@ -1889,24 +2816,63 @@ def _analyze_turn_with_model(
     recent_history: list[HistoryTurn],
     settings: Settings,
 ) -> TurnAnalysis:
-    response_payload = _call_model_generate(
-        api_format=settings.decider_api_format,
-        api_url=settings.decider_api_url,
-        api_key=settings.decider_api_key,
-        api_key_header=settings.decider_api_key_header,
-        model=settings.decider_model,
-        timeout_sec=settings.decider_timeout_sec,
-        keep_alive=settings.decider_keep_alive,
-        prompt=_build_decider_prompt(
-            message=message,
-            lead_state=lead_state,
-            recent_history=recent_history,
-            settings=settings,
-        ),
-        temperature=settings.decider_temperature,
-        response_format="json",
-        max_tokens=settings.decider_output_max_tokens,
+    decider_prompt = _build_decider_prompt(
+        message=message,
+        lead_state=lead_state,
+        recent_history=recent_history,
+        settings=settings,
     )
+    t0 = time.perf_counter()
+    response_payload: Any
+    try:
+        response_payload = _call_model_generate(
+            api_format=settings.decider_api_format,
+            api_url=settings.decider_api_url,
+            api_key=settings.decider_api_key,
+            api_key_header=settings.decider_api_key_header,
+            model=settings.decider_model,
+            timeout_sec=settings.decider_timeout_sec,
+            keep_alive=settings.decider_keep_alive,
+            prompt=decider_prompt,
+            temperature=settings.decider_temperature,
+            response_format="json",
+            max_tokens=settings.decider_output_max_tokens,
+            call_role="decider",
+        )
+    except Exception:
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        log.warning(
+            "decider_latency stage=model_call status=error elapsed_ms=%.1f model=%s api_format=%s api_url=%s "
+            "prompt_chars=%s message_chars=%s history_turns=%s timeout_sec=%s",
+            elapsed_ms,
+            settings.decider_model,
+            settings.decider_api_format,
+            settings.decider_api_url,
+            len(decider_prompt),
+            len(message or ""),
+            len(recent_history or []),
+            settings.decider_timeout_sec,
+        )
+        raise
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    if isinstance(response_payload, dict):
+        response_size = len(json.dumps(response_payload, ensure_ascii=False))
+    else:
+        response_size = len(str(response_payload or ""))
+    log.info(
+        "decider_latency stage=model_call status=ok elapsed_ms=%.1f model=%s api_format=%s api_url=%s "
+        "prompt_chars=%s message_chars=%s history_turns=%s response_chars=%s",
+        elapsed_ms,
+        settings.decider_model,
+        settings.decider_api_format,
+        settings.decider_api_url,
+        len(decider_prompt),
+        len(message or ""),
+        len(recent_history or []),
+        response_size,
+    )
+
     if isinstance(response_payload, dict):
         result_obj = response_payload
     else:
@@ -2003,7 +2969,33 @@ def _analyze_turn_fallback(message: str, lead_state: LeadState, recent_history: 
             "Nếu bạn cần phân tích sâu theo phương án cụ thể, mình đề xuất một buổi hẹn trực tiếp."
         )
     )
+    normalized = _normalize_text_for_match(message)
+    project_signal = bool(
+        re.search(r"\b(du an|project|sunshine|noble|can ho|bang gia|phap ly)\b", normalized)
+    )
     reason = "fallback_no_decider"
+    if project_signal:
+        reason = "fallback_no_decider_project_signal"
+        return TurnAnalysis(
+            route="project_grounded",
+            decision_reason=reason,
+            need_update=need_update,
+            painpoint_update=painpoint_update,
+            routing_signal=RoutingSignal(
+                should_route_project=True,
+                project_query_hint=message.strip() or None,
+                reason=reason,
+            ),
+            consult_reply=consult_reply,
+            query_type="project_specific",
+            retrieval_readiness="ready",
+            route_source="fallback",
+            engagement_state_after_hint=lead_state.engagement_state,
+            sales_state_after_hint=lead_state.sales_state,
+            conversation_goal_hint=lead_state.last_conversation_goal or "show_fit",
+            extracted_name=_extract_name(message),
+            extracted_phone=_extract_phone_contact(message),
+        )
     return TurnAnalysis(
         route="consult_discovery",
         decision_reason=reason,
@@ -2231,6 +3223,7 @@ def run_project_grounded(
     evidence_chunks = retrieval_raw.get("evidence_chunks", []) or []
     low_confidence = bool(retrieval_raw.get("low_confidence", False))
     used_projects = [str(card.get("project_id")) for card in project_cards if card.get("project_id")]
+
     return {
         "used_projects": _dedupe_keep_order(used_projects, max_items=5),
         "project_cards": project_cards,
@@ -2248,9 +3241,21 @@ def run_project_grounded(
 def create_app(
     project_grounded_fetcher=None,
     turn_analyzer: Callable[[str, LeadState, list[HistoryTurn]], TurnAnalysis] | None = None,
+    vision_identify=None,
+    session_store: SessionStore | None = None,
+    identity_store: SharedIdentityStore | None = None,
 ) -> FastAPI:
     app = FastAPI(title="Sales Orchestrator 2 Routes", version="1.0.0")
     settings = get_settings()
+
+    if settings.cors_allow_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(settings.cors_allow_origins),
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
 
     if not logging.getLogger().handlers:
         logging.basicConfig(
@@ -2303,8 +3308,26 @@ def create_app(
         base_url=settings.retrieval_service_url,
         timeout_sec=settings.retrieval_timeout_sec,
     )
+    vision_client = VisionClient(
+        base_url=settings.vision_service_url,
+        timeout_sec=settings.vision_timeout_sec,
+    )
     if project_grounded_fetcher is None:
         project_grounded_fetcher = client.retrieve_project_grounded
+    if vision_identify is None:
+        if settings.vision_enabled:
+            vision_identify = vision_client.identify
+    if session_store is None:
+        session_store = SessionStore(settings.redis_url, settings.redis_namespace)
+    if identity_store is None:
+        identity_db_path = settings.shared_identity_db_path
+        # Keep pytest runs isolated from persisted runtime identity DB.
+        if os.getenv("PYTEST_CURRENT_TEST"):
+            identity_db_path = os.path.join(
+                tempfile.gettempdir(),
+                f"noble_identity_test_{uuid4().hex}.sqlite3",
+            )
+        identity_store = SharedIdentityStore(identity_db_path)
 
     if turn_analyzer is None:
 
@@ -2322,10 +3345,304 @@ def create_app(
     def health() -> dict[str, str]:
         return {"status": "ok", "service": "sales-orchestrator-2-routes"}
 
+    def _identify_vision_context(
+        *,
+        image_base64: str,
+        image_filename: str | None,
+        image_content_type: str | None,
+        trace_id: str | None = None,
+        session_id: str | None = None,
+        user_id: str | None = None,
+    ) -> VisionContext | None:
+        if not settings.vision_enabled or vision_identify is None:
+            return None
+        if not str(image_base64 or "").strip():
+            return None
+        b64_len, byte_size, image_sha1, decode_error = _vision_image_diagnostics(image_base64)
+        try:
+            payload = vision_identify(
+                image_base64=image_base64,
+                image_filename=image_filename,
+                image_content_type=image_content_type,
+                trace_id=trace_id,
+                session_id=session_id,
+                user_id=user_id,
+            )
+            return VisionContext.model_validate(payload)
+        except Exception as exc:
+            log.warning(
+                (
+                    "vision identify failed: %s session_id=%s trace_id=%s "
+                    "image_b64_len=%s image_bytes=%s image_sha1=%s predecode_error=%s "
+                    "filename=%s content_type=%s"
+                ),
+                exc,
+                session_id,
+                trace_id,
+                b64_len,
+                byte_size,
+                image_sha1,
+                decode_error,
+                image_filename,
+                image_content_type,
+            )
+            return VisionContext(
+                recognized=False,
+                confidence=0.0,
+                source="error",
+                face_count=0,
+                reason=str(exc)[:200],
+            )
+
+    def _build_session_record(
+        *,
+        session_id: str,
+        face_session_key: str,
+        customer_kind: str,
+        ttl_sec: int,
+        lead_state: LeadState,
+        recent_history: list[HistoryTurn],
+        vision_context: VisionContext | None,
+    ) -> dict[str, Any]:
+        return {
+            "session_id": session_id,
+            "face_session_key": face_session_key,
+            "customer_kind": customer_kind,
+            "ttl_sec": ttl_sec,
+            "lead_state": lead_state.model_dump(mode="json"),
+            "recent_history": _serialize_history(recent_history),
+            "vision_context": vision_context.model_dump(mode="json") if vision_context is not None else None,
+            "updated_at": _now_iso(),
+        }
+
+    def _sync_identity_snapshot(
+        *,
+        session: LiveTalkingSessionState,
+        lead_state: LeadState,
+        vision_context: VisionContext | None,
+    ) -> None:
+        face_key = str(session.face_session_key or "").strip()
+        if ":" not in face_key:
+            return
+        customer_kind, _, face_id = face_key.partition(":")
+        if not face_id.strip():
+            return
+        identity_store.upsert_identity(
+            face_id=face_id.strip(),
+            face_session_key=face_key,
+            customer_kind=(customer_kind.strip() or session.customer_kind or "guest"),
+            name=lead_state.name or lead_state.customer_profile.name,
+            age=lead_state.customer_profile.age,
+            gender=lead_state.customer_profile.gender,
+            source=lead_state.customer_profile.source,
+            confidence=lead_state.customer_profile.confidence,
+            vision_context=vision_context.model_dump(mode="json") if vision_context is not None else None,
+            lead_state=lead_state.model_dump(mode="json"),
+            session_id=session.session_id,
+        )
+
+    def _build_qdrant_overview_for_livetalking_start(
+        *,
+        trace_id: str | None = None,
+        session_id: str | None = None,
+        user_id: str | None = None,
+    ) -> str:
+        try:
+            intent = _build_retrieval_intent(
+                message="Giới thiệu tổng quan các sản phẩm hiện có",
+                lead_state=LeadState(),
+                query_type="project_matching",
+                retrieval_readiness="ready",
+            )
+            retrieval_raw = _call_project_grounded_fetcher(
+                project_grounded_fetcher,
+                "Giới thiệu tổng quan các sản phẩm hiện có",
+                intent,
+                max(3, min(settings.default_top_k, 8)),
+                trace_id=trace_id,
+                session_id=session_id,
+                user_id=user_id,
+            )
+            cards = retrieval_raw.get("project_cards", []) or []
+            return _build_project_catalog_overview(cards)
+        except Exception as exc:
+            log.warning("livetalking start qdrant overview failed: %s", exc)
+            return _build_project_catalog_overview([])
+
+    def _resolve_livetalking_session(
+        *,
+        image_base64: str,
+        image_filename: str | None,
+        image_content_type: str | None,
+        requested_session_id: str | None,
+        trace_id: str | None = None,
+        user_id: str | None = None,
+    ) -> tuple[LiveTalkingSessionState, LeadState, list[HistoryTurn], VisionContext | None]:
+        vision_context = _identify_vision_context(
+            image_base64=image_base64,
+            image_filename=image_filename,
+            image_content_type=image_content_type,
+            trace_id=trace_id,
+            session_id=requested_session_id,
+            user_id=user_id,
+        )
+        customer_kind, face_identifier = _build_face_session_binding(
+            vision_context,
+            fallback_session_id=requested_session_id,
+        )
+        face_session_key = _build_face_session_key(customer_kind, face_identifier)
+        ttl_sec = _build_session_ttl_sec(customer_kind, settings)
+        record = session_store.load_by_face_key(face_session_key)
+        if record is None and customer_kind == "anonymous" and requested_session_id:
+            record = session_store.load_by_session_id(requested_session_id)
+        if record is not None:
+            lead_state, recent_history, stored_vision_context = _load_livetalking_session_record(record)
+            effective_vision_context = vision_context or stored_vision_context
+            lead_state = _merge_customer_profile(lead_state, effective_vision_context)
+            session = LiveTalkingSessionState(
+                session_id=str(record.get("session_id", requested_session_id or "")) or requested_session_id or uuid4().hex,
+                face_session_key=str(record.get("face_session_key", face_session_key)) or face_session_key,
+                customer_kind=str(record.get("customer_kind", customer_kind)) or customer_kind,
+                ttl_sec=max(1, int(record.get("ttl_sec", ttl_sec) or ttl_sec)),
+                resumed=True,
+                should_greet=False,
+                greeting=None,
+            )
+            _sync_identity_snapshot(
+                session=session,
+                lead_state=lead_state,
+                vision_context=effective_vision_context,
+            )
+            return session, lead_state, recent_history, effective_vision_context
+
+        snapshot = identity_store.load_by_face_session_key(face_session_key)
+        if snapshot is not None and snapshot.lead_state:
+            try:
+                base_state = LeadState.model_validate(snapshot.lead_state)
+            except Exception:
+                base_state = LeadState()
+            effective_vision_context = vision_context
+            if effective_vision_context is None and snapshot.vision_context:
+                try:
+                    effective_vision_context = VisionContext.model_validate(snapshot.vision_context)
+                except Exception:
+                    effective_vision_context = None
+            base_state = _merge_customer_profile(base_state, effective_vision_context)
+            session = LiveTalkingSessionState(
+                session_id=str(requested_session_id or snapshot.session_id or uuid4().hex),
+                face_session_key=face_session_key,
+                customer_kind=customer_kind,
+                ttl_sec=ttl_sec,
+                resumed=True,
+                should_greet=False,
+                greeting=None,
+            )
+            _sync_identity_snapshot(
+                session=session,
+                lead_state=base_state,
+                vision_context=effective_vision_context,
+            )
+            return session, base_state, [], effective_vision_context
+
+        base_state = _merge_customer_profile(LeadState(), vision_context)
+        product_catalog_overview = None
+        if not (base_state.customer_profile.recognized and base_state.customer_profile.name):
+            product_catalog_overview = _build_qdrant_overview_for_livetalking_start(
+                trace_id=trace_id,
+                session_id=requested_session_id,
+                user_id=user_id,
+            )
+        session = LiveTalkingSessionState(
+            session_id=str(requested_session_id or uuid4().hex),
+            face_session_key=face_session_key,
+            customer_kind=customer_kind,
+            ttl_sec=ttl_sec,
+            resumed=False,
+            should_greet=settings.vision_greeting_enabled,
+            greeting=(
+                _build_livetalking_greeting(
+                    base_state,
+                    product_catalog_overview=product_catalog_overview,
+                )
+                if settings.vision_greeting_enabled
+                else None
+            ),
+        )
+        _sync_identity_snapshot(
+            session=session,
+            lead_state=base_state,
+            vision_context=vision_context,
+        )
+        return session, base_state, [], vision_context
+
+    def _resolve_livetalking_query_session(
+        *,
+        requested_session_id: str | None,
+    ) -> tuple[LiveTalkingSessionState, LeadState, list[HistoryTurn], VisionContext | None]:
+        session_id = str(requested_session_id or "").strip()
+        if not session_id:
+            raise HTTPException(
+                status_code=400,
+                detail="session_id is required for /integrations/livetalking/query. Call /integrations/livetalking/start first.",
+            )
+
+        record = session_store.load_by_session_id(session_id)
+        if record is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"livetalking session not found or expired: {session_id}",
+            )
+
+        lead_state, recent_history, vision_context = _load_livetalking_session_record(record)
+        resolved_face_key = str(record.get("face_session_key", "")).strip() or f"anonymous:{session_id}"
+        resolved_customer_kind = str(record.get("customer_kind", "anonymous")).strip() or "anonymous"
+        if resolved_customer_kind not in {"known", "guest", "anonymous"}:
+            resolved_customer_kind = "anonymous"
+        resolved_ttl_sec = max(1, int(record.get("ttl_sec", settings.session_guest_ttl_sec) or settings.session_guest_ttl_sec))
+
+        session = LiveTalkingSessionState(
+            session_id=str(record.get("session_id", session_id)) or session_id,
+            face_session_key=resolved_face_key,
+            customer_kind=resolved_customer_kind,
+            ttl_sec=resolved_ttl_sec,
+            resumed=True,
+            should_greet=False,
+            greeting=None,
+        )
+        _sync_identity_snapshot(
+            session=session,
+            lead_state=lead_state,
+            vision_context=vision_context,
+        )
+        return session, lead_state, recent_history, vision_context
+
     @app.post("/sales/query", response_model=QueryResponse)
-    def query(payload: QueryRequest) -> QueryResponse:
+    def query(payload: QueryRequest, stream_handler: Callable[[str], None] | None = None) -> QueryResponse:
+        request_started_at = time.perf_counter()
+        phase_metrics_ms: dict[str, float] = {}
+        stream_first_delta_ms: float | None = None
+
+        def _mark_phase(phase_name: str, started_at: float) -> None:
+            phase_metrics_ms[phase_name] = round((time.perf_counter() - started_at) * 1000.0, 1)
+
+        def _mark_total() -> None:
+            phase_metrics_ms["total"] = round((time.perf_counter() - request_started_at) * 1000.0, 1)
+
+        def _build_stream_handler_wrapper(
+            upstream_handler: Callable[[str], None] | None,
+            phase_started_at: float,
+        ) -> Callable[[str], None]:
+            def _wrapped(chunk: str) -> None:
+                nonlocal stream_first_delta_ms
+                if stream_first_delta_ms is None and str(chunk or "").strip():
+                    stream_first_delta_ms = round((time.perf_counter() - phase_started_at) * 1000.0, 1)
+                if upstream_handler:
+                    upstream_handler(chunk)
+
+            return _wrapped
+
         message = payload.message.strip()
-        lead_state = payload.lead_state or LeadState()
+        lead_state = _merge_customer_profile(payload.lead_state or LeadState(), payload.vision_context)
         top_k = payload.top_k or settings.default_top_k
         langfuse_enabled = bool(settings.langfuse_enabled)
         session_id = _derive_observability_session_id(payload=payload, lead_state=lead_state)
@@ -2366,7 +3683,9 @@ def create_app(
                             "history_turns": len(payload.recent_history),
                         },
                     ) as analyze_obs:
+                        analyze_started_at = time.perf_counter()
                         analysis = turn_analyzer(message, lead_state, payload.recent_history)
+                        _mark_phase("analyze_turn", analyze_started_at)
                         analyze_obs.update(
                             output={
                                 "start_route": analysis.route,
@@ -2409,7 +3728,9 @@ def create_app(
                             as_type="span",
                             input={"query_type": analysis.query_type},
                         ) as consult_obs:
+                            consult_started_at = time.perf_counter()
                             consult_result = run_consult_discovery(message=message, lead_state=lead_state, analysis=analysis)
+                            _mark_phase("consult_discovery", consult_started_at)
                             routing_signal = consult_result.get("routing_signal")
                             after_consult_state = merge_lead_state(
                                 lead_state=lead_state,
@@ -2444,6 +3765,7 @@ def create_app(
                                     as_type="span",
                                     input={"query": project_message[:500], "top_k": top_k},
                                 ) as grounded_obs:
+                                    chain_retrieval_started_at = time.perf_counter()
                                     grounded_result = run_project_grounded(
                                         message=project_message,
                                         lead_state=after_consult_state,
@@ -2457,6 +3779,7 @@ def create_app(
                                         session_id=session_id,
                                         user_id=user_id,
                                     )
+                                    _mark_phase("project_grounded_chain", chain_retrieval_started_at)
                                     grounded_obs.update(
                                         output={
                                             "project_cards": len(grounded_result.get("project_cards", []) or []),
@@ -2489,6 +3812,7 @@ def create_app(
                                 as_type="span",
                                 input={"query": message[:500], "top_k": top_k},
                             ) as grounded_obs:
+                                direct_retrieval_started_at = time.perf_counter()
                                 grounded_result = run_project_grounded(
                                     message=message,
                                     lead_state=lead_state,
@@ -2502,6 +3826,7 @@ def create_app(
                                     session_id=session_id,
                                     user_id=user_id,
                                 )
+                                _mark_phase("project_grounded_direct", direct_retrieval_started_at)
                                 grounded_obs.update(
                                     output={
                                         "project_cards": len(grounded_result.get("project_cards", []) or []),
@@ -2535,6 +3860,7 @@ def create_app(
                             "final_route": final_route,
                         },
                     ) as state_obs:
+                        state_started_at = time.perf_counter()
                         sales_state_before = _normalize_sales_state(lead_state.sales_state)
                         engagement_state_before = _normalize_engagement_state(lead_state.engagement_state)
                         engagement_state_after = update_engagement_state(
@@ -2584,9 +3910,11 @@ def create_app(
                                 "next_best_action": next_best_action,
                                 "contact_capture_status": (
                                     "complete"
-                                    if final_state.name and final_state.phone_contact
+                                    if bool((final_state.name or final_state.customer_profile.name or "").strip())
+                                    and final_state.phone_contact
                                     else "partial"
-                                    if final_state.name or final_state.phone_contact
+                                    if bool((final_state.name or final_state.customer_profile.name or "").strip())
+                                    or final_state.phone_contact
                                     else "requested"
                                     if conversation_goal == "capture_contact"
                                     else final_state.contact_capture_status
@@ -2601,6 +3929,7 @@ def create_app(
                                 "next_best_action": next_best_action,
                             }
                         )
+                        _mark_phase("sales_state_engine", state_started_at)
 
                     with start_observation(
                         langfuse_enabled,
@@ -2608,6 +3937,7 @@ def create_app(
                         as_type="span",
                         input={"sales_state": final_state.sales_state, "conversation_goal": conversation_goal},
                     ) as plan_obs:
+                        planning_started_at = time.perf_counter()
                         reply_plan = build_reply_plan(
                             message=message,
                             recent_history=payload.recent_history,
@@ -2640,6 +3970,7 @@ def create_app(
                                 "question_focus": reply_plan.question_focus,
                             }
                         )
+                        _mark_phase("reply_planning", planning_started_at)
 
                     used_fastpath_consult_reply = False
                     reply_source = "reply_synthesis"
@@ -2654,6 +3985,7 @@ def create_app(
                         settings.quick_intent_fast_response_enabled
                         and final_route == "consult_discovery"
                         and _normalize_query_type(analysis.query_type) == "clarification"
+                        and reason != "fallback_no_decider"
                     ):
                         quick_intent_reply = _build_quick_intent_response(
                             message=message,
@@ -2680,6 +4012,12 @@ def create_app(
                                 "fastpath_gate_reason": fastpath_gate_reason,
                             },
                         ) as reply_obs:
+                            synthesis_started_at = time.perf_counter()
+                            synthesis_stream_handler = _build_stream_handler_wrapper(
+                                stream_handler,
+                                synthesis_started_at,
+                            )
+                            assistant_reply = ""
                             try:
                                 assistant_reply = synthesize_assistant_reply(
                                     message=message,
@@ -2691,7 +4029,9 @@ def create_app(
                                     reply_plan=reply_plan,
                                     grounded_result=grounded_result,
                                     settings=settings,
+                                    stream_handler=synthesis_stream_handler,
                                 )
+                                _mark_phase("reply_synthesis", synthesis_started_at)
                             except Exception as exc:
                                 reply_obs.update(output={"error": str(exc)[:240]})
                                 log.exception(
@@ -2701,30 +4041,71 @@ def create_app(
                                     reply_plan.ask_policy,
                                     reason,
                                 )
-                                # Graceful degradation: keep the API responsive when model
-                                # synthesis is slow/unavailable by returning fallback consult text.
-                                if consult_result is None:
-                                    consult_result = run_consult_discovery(
-                                        message=message,
-                                        lead_state=lead_state,
-                                        analysis=analysis,
-                                    )
-                                fallback_reply = (
-                                    str(consult_result.get("assistant_reply", "")).strip()
-                                    if consult_result
-                                    else ""
-                                ) or analysis.consult_reply
-                                assistant_reply = _compact_text(
-                                    fallback_reply
-                                    or (
-                                        "Em xin lỗi, hệ thống trả lời đang bận. "
-                                        "Anh/chị cho em 1 tiêu chí ưu tiên để em tư vấn nhanh hơn ạ."
-                                    ),
-                                    max_words=max(24, settings.quick_intent_response_max_words),
-                                )
-                                reply_source = "reply_synthesis_fallback_consult"
-                                fastpath_gate_reason = "synthesis_error_fallback"
-                                used_fastpath_consult_reply = True
+                                # For no-decider fallback, force a second model-only attempt
+                                # instead of immediately returning deterministic template text.
+                                if reason == "fallback_no_decider":
+                                    try:
+                                        assistant_reply = synthesize_assistant_reply_no_decider(
+                                            message=message,
+                                            recent_history=payload.recent_history,
+                                            lead_state=final_state,
+                                            reply_plan=reply_plan,
+                                            settings=settings,
+                                            stream_handler=synthesis_stream_handler,
+                                        )
+                                        _mark_phase("reply_synthesis_no_decider", synthesis_started_at)
+                                        reply_source = "reply_synthesis_no_decider_direct"
+                                        fastpath_gate_reason = "no_decider_model_direct"
+                                        used_fastpath_consult_reply = False
+                                        log.info(
+                                            "reply synthesis recovered via no_decider direct mode final_route=%s",
+                                            final_route,
+                                        )
+                                    except Exception as direct_exc:
+                                        log.warning(
+                                            "no_decider direct synthesis failed final_route=%s error=%s",
+                                            final_route,
+                                            str(direct_exc)[:240],
+                                        )
+                                        assistant_reply = ""
+                                if not assistant_reply:
+                                    # Graceful degradation: keep the API responsive when model
+                                    # synthesis is slow/unavailable by returning fallback consult text.
+                                    grounded_fallback_reply = ""
+                                    if final_route == "project_grounded" and _has_grounding_evidence(grounded_result):
+                                        grounded_fallback_reply = _build_grounded_specific_reply(grounded_result)
+                                        if not grounded_fallback_reply:
+                                            cards = (grounded_result or {}).get("project_cards", []) or []
+                                            grounded_fallback_reply = _build_project_catalog_overview(cards)
+                                    if grounded_fallback_reply:
+                                        assistant_reply = _compact_text(grounded_fallback_reply, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
+                                        reply_source = "reply_synthesis_fallback_grounded"
+                                        fastpath_gate_reason = "synthesis_error_grounded_fallback"
+                                    else:
+                                        if consult_result is None:
+                                            consult_result = run_consult_discovery(
+                                                message=message,
+                                                lead_state=lead_state,
+                                                analysis=analysis,
+                                            )
+                                        fallback_reply = (
+                                            str(consult_result.get("assistant_reply", "")).strip()
+                                            if consult_result
+                                            else ""
+                                        ) or analysis.consult_reply
+                                        assistant_reply = _compact_text(
+                                            fallback_reply
+                                            or (
+                                                "Em xin lỗi, hệ thống trả lời đang bận. "
+                                                "Anh/chị cho em 1 tiêu chí ưu tiên để em tư vấn nhanh hơn ạ."
+                                            ),
+                                            max_words=max(24, settings.quick_intent_response_max_words),
+                                        )
+                                        reply_source = "reply_synthesis_fallback_consult"
+                                        fastpath_gate_reason = "synthesis_error_fallback"
+                                        used_fastpath_consult_reply = True
+                                if "reply_synthesis" not in phase_metrics_ms and "reply_synthesis_no_decider" not in phase_metrics_ms:
+                                    _mark_phase("reply_synthesis_error_path", synthesis_started_at)
                             reply_obs.update(
                                 output={
                                     "assistant_reply_chars": len(assistant_reply),
@@ -2734,7 +4115,41 @@ def create_app(
                                 }
                             )
 
+                    greeting_prefix = _build_customer_greeting_prefix(
+                        final_state,
+                        payload.recent_history,
+                        settings,
+                    )
+                    assistant_reply = _prepend_customer_greeting(assistant_reply, greeting_prefix)
+                    if greeting_prefix and _reply_has_greeting_prefix(assistant_reply):
+                        final_state = _mark_customer_greeting_applied(final_state)
+
+                    # Lightweight gate stack optimized for business outcome.
+                    assistant_reply = _apply_grounding_gate(
+                        reply=assistant_reply,
+                        message=message,
+                        final_route=final_route,
+                        grounded_result=grounded_result,
+                        response_mode=reply_plan.response_mode,
+                    )
+                    assistant_reply = _apply_safety_gate(
+                        reply=assistant_reply,
+                        user_has_budget_context=_user_context_has_budget_signal(
+                            message=message,
+                            recent_history=payload.recent_history,
+                        ),
+                    )
+                    assistant_reply = _apply_business_outcome_gate(
+                        reply=assistant_reply,
+                        final_route=final_route,
+                        lead_state=final_state,
+                        response_mode=reply_plan.response_mode,
+                    )
+
                     if final_route == "project_grounded" and grounded_result is not None:
+                        if stream_first_delta_ms is not None:
+                            phase_metrics_ms["synthesis_ttft_ms"] = stream_first_delta_ms
+                        _mark_total()
                         response = QueryResponse(
                             route="project_grounded",
                             assistant_reply=assistant_reply,
@@ -2754,10 +4169,14 @@ def create_app(
                                 "low_confidence": grounded_result["low_confidence"],
                             },
                             decision_trace=trace,
+                            phase_metrics_ms=phase_metrics_ms,
                         )
                     else:
                         if consult_result is None:
                             consult_result = run_consult_discovery(message=message, lead_state=lead_state, analysis=analysis)
+                        if stream_first_delta_ms is not None:
+                            phase_metrics_ms["synthesis_ttft_ms"] = stream_first_delta_ms
+                        _mark_total()
                         response = QueryResponse(
                             route="consult_discovery",
                             assistant_reply=assistant_reply,
@@ -2768,6 +4187,7 @@ def create_app(
                             routing_signal=consult_result.get("routing_signal"),
                             project_grounded_payload=None,
                             decision_trace=trace,
+                            phase_metrics_ms=phase_metrics_ms,
                         )
 
                     request_obs.update(
@@ -2796,6 +4216,16 @@ def create_app(
                             "low_confidence": bool(grounded_result.get("low_confidence", False))
                             if grounded_result
                             else None,
+                            "grounding_status": (
+                                "ok"
+                                if _has_grounding_evidence(grounded_result)
+                                else "empty"
+                                if final_route == "project_grounded"
+                                else None
+                            ),
+                            "evidence_count": len((grounded_result or {}).get("evidence_chunks", []) or [])
+                            if grounded_result
+                            else 0,
                         }
                     )
 
@@ -2805,7 +4235,7 @@ def create_app(
                             "query_type=%s retrieval_readiness=%s route_source=%s "
                             "engagement_before=%s engagement_after=%s "
                             "sales_state_before=%s sales_state_after=%s conversation_goal=%s next_best_action=%s "
-                            "response_mode=%s ask_policy=%s reply_source=%s fastpath_gate=%s reason=%s"
+                            "response_mode=%s ask_policy=%s reply_source=%s fastpath_gate=%s reason=%s phase_metrics_ms=%s"
                         ),
                         trace.start_route,
                         trace.final_route,
@@ -2824,11 +4254,291 @@ def create_app(
                         reply_source,
                         fastpath_gate_reason,
                         trace.decision_reason,
+                        json.dumps(phase_metrics_ms, ensure_ascii=False),
                     )
                     return response
         finally:
             if settings.langfuse_flush_at_request_end:
                 flush_observability(langfuse_enabled)
+
+    @app.post("/sales/query-with-vision", response_model=QueryResponse)
+    def query_with_vision(
+        payload: VisionQueryRequest,
+        stream_handler: Callable[[str], None] | None = None,
+    ) -> QueryResponse:
+        vision_context = _identify_vision_context(
+            image_base64=payload.image_base64,
+            image_filename=payload.image_filename,
+            image_content_type=payload.image_content_type,
+            trace_id=payload.request_id,
+            session_id=payload.session_id,
+        )
+        query_payload = QueryRequest(
+            message=payload.message,
+            lead_state=payload.lead_state,
+            vision_context=vision_context,
+            recent_history=payload.recent_history,
+            top_k=payload.top_k,
+            session_id=payload.session_id,
+            force_route=payload.force_route,
+        )
+        return query(query_payload, stream_handler=stream_handler)
+
+    def _stream_query_like_response(build_response_fn, worker_name: str):
+        def event_stream():
+            yield "event: start\ndata: {}\n\n"
+            result_holder: dict[str, Any] = {}
+            done_event = threading.Event()
+            chunk_queue: queue.Queue[str] = queue.Queue()
+
+            def _on_stream_chunk(text: str) -> None:
+                chunk = str(text or "").strip()
+                if not chunk:
+                    return
+                chunk_queue.put(chunk)
+
+            def _worker() -> None:
+                try:
+                    result_holder["response"] = build_response_fn(_on_stream_chunk)
+                except Exception as exc:
+                    result_holder["error"] = str(exc)[:240]
+                finally:
+                    done_event.set()
+
+            threading.Thread(target=_worker, name=worker_name, daemon=True).start()
+
+            while True:
+                try:
+                    chunk = chunk_queue.get(timeout=0.7)
+                    yield f"event: delta\ndata: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
+                    continue
+                except queue.Empty:
+                    pass
+                if done_event.is_set():
+                    break
+                yield "event: ping\ndata: {}\n\n"
+
+            error_msg = str(result_holder.get("error") or "").strip()
+            if error_msg:
+                yield f"event: error\ndata: {json.dumps({'error': error_msg}, ensure_ascii=False)}\n\n"
+                return
+
+            response_payload = result_holder.get("response")
+            if response_payload is None:
+                yield f"event: error\ndata: {json.dumps({'error': 'query stream returned no payload'}, ensure_ascii=False)}\n\n"
+                return
+
+            packed = response_payload.model_dump(mode="json")
+            yield f"event: done\ndata: {json.dumps(packed, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.post("/sales/query-stream")
+    def query_stream(payload: QueryRequest):
+        return _stream_query_like_response(
+            build_response_fn=lambda stream_handler: query(payload, stream_handler=stream_handler),
+            worker_name="sales-query-stream-worker",
+        )
+
+    @app.post("/sales/query-with-vision-stream")
+    def query_with_vision_stream(payload: VisionQueryRequest):
+        return _stream_query_like_response(
+            build_response_fn=lambda stream_handler: query_with_vision(payload, stream_handler=stream_handler),
+            worker_name="sales-query-with-vision-stream-worker",
+        )
+
+    @app.post("/integrations/livetalking/start", response_model=LiveTalkingSessionStartResponse)
+    def livetalking_start(payload: LiveTalkingSessionStartRequest) -> LiveTalkingSessionStartResponse:
+        session, stored_state, recent_history, vision_context = _resolve_livetalking_session(
+            image_base64=payload.image_base64,
+            image_filename=payload.image_filename,
+            image_content_type=payload.image_content_type,
+            requested_session_id=payload.session_id,
+            trace_id=payload.request_id,
+            user_id=_derive_observability_user_id(payload.lead_state or LeadState()),
+        )
+        lead_state = payload.lead_state or stored_state
+        if recent_history:
+            lead_state = stored_state
+        lead_state = _merge_customer_profile(lead_state, vision_context)
+
+        history_to_store = list(recent_history)
+        if session.should_greet and session.greeting:
+            history_to_store.append(HistoryTurn(role="assistant", message=session.greeting))
+            lead_state = _mark_customer_greeting_applied(lead_state)
+
+        session_store.save(
+            _build_session_record(
+                session_id=session.session_id,
+                face_session_key=session.face_session_key,
+                customer_kind=session.customer_kind,
+                ttl_sec=session.ttl_sec,
+                lead_state=lead_state,
+                recent_history=history_to_store,
+                vision_context=vision_context,
+            ),
+            session.ttl_sec,
+        )
+        _sync_identity_snapshot(
+            session=session,
+            lead_state=lead_state,
+            vision_context=vision_context,
+        )
+        return LiveTalkingSessionStartResponse(
+            session=session,
+            lead_state=lead_state,
+            vision_context=vision_context,
+        )
+
+    def _build_livetalking_query_response(payload: LiveTalkingQueryRequest) -> LiveTalkingQueryResponse:
+        # Query phase reuses the session resolved at /integrations/livetalking/start.
+        # We intentionally skip vision re-scan here to keep latency stable.
+        session, stored_state, recent_history, vision_context = _resolve_livetalking_query_session(
+            requested_session_id=payload.session_id,
+        )
+        lead_state = payload.lead_state or stored_state
+        if recent_history:
+            lead_state = stored_state
+        lead_state = _merge_customer_profile(lead_state, vision_context)
+
+        query_payload = QueryRequest(
+            message=payload.message,
+            lead_state=lead_state,
+            vision_context=vision_context,
+            recent_history=recent_history,
+            top_k=payload.top_k,
+            session_id=session.session_id,
+            force_route=payload.force_route,
+        )
+        query_response = query(query_payload)
+
+        updated_history = [
+            *recent_history,
+            HistoryTurn(role="user", message=payload.message.strip()),
+            HistoryTurn(role="assistant", message=query_response.assistant_reply),
+        ]
+        session_store.save(
+            _build_session_record(
+                session_id=session.session_id,
+                face_session_key=session.face_session_key,
+                customer_kind=session.customer_kind,
+                ttl_sec=session.ttl_sec,
+                lead_state=query_response.lead_state,
+                recent_history=updated_history,
+                vision_context=vision_context,
+            ),
+            session.ttl_sec,
+        )
+        _sync_identity_snapshot(
+            session=session,
+            lead_state=query_response.lead_state,
+            vision_context=vision_context,
+        )
+        return LiveTalkingQueryResponse(
+            **query_response.model_dump(),
+            session=session,
+            vision_context=vision_context,
+        )
+
+    @app.post("/integrations/livetalking/query", response_model=LiveTalkingQueryResponse)
+    def livetalking_query(payload: LiveTalkingQueryRequest):
+        response_payload = _build_livetalking_query_response(payload)
+        if not bool(payload.stream):
+            return response_payload
+
+        def event_stream():
+            packed = response_payload.model_dump(mode="json")
+            yield "event: start\ndata: {}\n\n"
+            reply = str(packed.get("assistant_reply") or "")
+            if reply:
+                words = reply.split()
+                chunk_words = 8
+                for idx in range(0, len(words), chunk_words):
+                    chunk = " ".join(words[idx : idx + chunk_words]).strip()
+                    if chunk:
+                        yield f"event: delta\ndata: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
+            yield f"event: done\ndata: {json.dumps(packed, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.post("/integrations/livetalking/query-stream")
+    def livetalking_query_stream(payload: LiveTalkingQueryRequest):
+        def event_stream():
+            yield "event: start\ndata: {}\n\n"
+            result_holder: dict[str, Any] = {}
+            done_event = threading.Event()
+
+            def _worker() -> None:
+                try:
+                    result_holder["response"] = _build_livetalking_query_response(payload)
+                except Exception as exc:
+                    result_holder["error"] = str(exc)[:240]
+                finally:
+                    done_event.set()
+
+            threading.Thread(target=_worker, name="livetalking-query-stream-worker", daemon=True).start()
+
+            while not done_event.wait(timeout=1.0):
+                yield "event: ping\ndata: {}\n\n"
+
+            error_msg = str(result_holder.get("error") or "").strip()
+            if error_msg:
+                yield f"event: error\ndata: {json.dumps({'error': error_msg}, ensure_ascii=False)}\n\n"
+                return
+
+            response_payload = result_holder.get("response")
+            if response_payload is None:
+                yield f"event: error\ndata: {json.dumps({'error': 'query stream returned no payload'}, ensure_ascii=False)}\n\n"
+                return
+
+            packed = response_payload.model_dump(mode="json")
+            reply = str(packed.get("assistant_reply") or "")
+            if reply:
+                words = reply.split()
+                chunk_words = 8
+                for idx in range(0, len(words), chunk_words):
+                    chunk = " ".join(words[idx : idx + chunk_words]).strip()
+                    if chunk:
+                        yield f"event: delta\ndata: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
+            yield f"event: done\ndata: {json.dumps(packed, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.post("/integrations/livetalking/stop", response_model=LiveTalkingStopResponse)
+    def livetalking_stop(payload: LiveTalkingStopRequest) -> LiveTalkingStopResponse:
+        deleted = session_store.delete(
+            session_id=payload.session_id,
+            face_session_key=payload.face_session_key,
+        )
+        return LiveTalkingStopResponse(
+            stopped=deleted is not None,
+            session_id=deleted.session_key if deleted is not None else payload.session_id,
+            face_session_key=deleted.face_key if deleted is not None else payload.face_session_key,
+        )
 
     return app
 

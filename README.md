@@ -3,6 +3,8 @@
 Tai lieu nay huong dan start nhanh he thong Noble RAG trong repo nay, gom:
 - `orchestrator-service` (API chinh): `:8021`
 - `retrieval-service` (noi bo): `:8011`
+- `vision-service` (noi bo): `:8031`
+- `redis` (session store noi bo): `:6379`
 - `qdrant` (vector DB, noi bo)
 - `ollama` (embedding backend, noi bo)
 
@@ -34,6 +36,7 @@ Neu chua co file env runtime, copy tu file mau:
 ```bash
 cp -n deploy/retrieval.example.env deploy/.env.retrieval
 cp -n deploy/orchestrator.example.env deploy/.env.orchestrator
+cp -n deploy/vision.example.env deploy/.env.vision
 ```
 
 ### Buoc 3: cap nhat cau hinh bat buoc
@@ -43,12 +46,25 @@ Sua file `deploy/.env.orchestrator`:
 - `ORCHESTRATOR_DECIDER_API_KEY`
 - `ORCHESTRATOR_SYNTHESIS_API_KEY`
 - Cac bien timeout/history dang so phai la so hop le (khong them ky tu)
+- `VISION_ENABLED=true`
+- `VISION_SERVICE_URL=http://vision-service:8031`
+- `REDIS_URL=redis://redis:6379/0`
+- `ORCHESTRATOR_CORS_ALLOW_ORIGINS=http://127.0.0.1:8011,http://localhost:8011`
 
 Kiem tra file `deploy/.env.retrieval`:
 
-- `EMBEDDING_API_URL=http://ollama:11434/api/embeddings`
+- `EMBEDDING_API_URL=http://ollama:11434/api/embed`
 - `EMBEDDING_MODEL=qwen3-embedding:8b`
 - `EMBEDDING_DIM=4096`
+
+Kiem tra file `deploy/.env.vision`:
+
+- `VISION_FACE_DB=/app/face_db`
+- `VISION_USE_GPU=false` (doi thanh `true` neu may co CUDA support cho insightface)
+- Neu can fallback VLM cho khach la:
+  - `VISION_VLM_ENABLED=true`
+  - `VISION_VLM_API_URL=...`
+  - `VISION_VLM_API_KEY=...`
 
 ### Buoc 4: start stack
 
@@ -88,6 +104,10 @@ curl -s http://127.0.0.1:8021/health | python3 -m json.tool
 curl -s -X POST http://127.0.0.1:8021/sales/query \
   -H "Content-Type: application/json" \
   -d '{"message":"Gia can 2 phong ngu la bao nhieu?"}' | python3 -m json.tool
+
+curl -s -X POST http://127.0.0.1:8021/integrations/livetalking/start \
+  -H "Content-Type: application/json" \
+  -d '{"image_base64":"<base64>"}' | python3 -m json.tool
 ```
 
 ## 3) Van hanh hang ngay
@@ -127,6 +147,7 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install -r retrieval_service/requirements.local.txt
 pip install -r orchestrator_service/requirements.txt
+pip install -r vision_service/requirements.txt
 ```
 
 ### Buoc 2: chay Qdrant local
@@ -156,7 +177,7 @@ source .venv/bin/activate
 QDRANT_URL=http://127.0.0.1:6333 \
 QDRANT_COLLECTION=retrieval_bench_qwen3_8b_local \
 EMBEDDING_BACKEND=remote \
-EMBEDDING_API_URL=http://127.0.0.1:11434/api/embeddings \
+EMBEDDING_API_URL=http://127.0.0.1:11434/api/embed \
 EMBEDDING_API_FORMAT=ollama \
 EMBEDDING_MODEL=qwen3-embedding:8b \
 EMBEDDING_DIM=4096 \
@@ -176,6 +197,18 @@ RETRIEVAL_SERVICE_URL=http://127.0.0.1:8011 \
 ORCHESTRATOR_DEFAULT_TOP_K=5 \
 uvicorn orchestrator_service.app:app --host 127.0.0.1 --port 8021
 ```
+
+### Buoc 6: chay vision service (terminal 3)
+
+```bash
+source .venv/bin/activate
+
+VISION_FACE_DB=face_db \
+VISION_PORT=8031 \
+uvicorn vision_service.app:app --host 127.0.0.1 --port 8031
+```
+
+Neu LiveTalking dang chay host `:8011`, backend da mo CORS san cho `http://127.0.0.1:8011` va `http://localhost:8011`.
 
 ## 5) Loi thuong gap
 

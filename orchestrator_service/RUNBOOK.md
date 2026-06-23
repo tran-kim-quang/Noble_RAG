@@ -8,7 +8,7 @@ source .venv/bin/activate
 QDRANT_URL=http://localhost:6333 \
 QDRANT_COLLECTION=retrieval_bench_qwen3_8b_local \
 EMBEDDING_BACKEND=remote \
-EMBEDDING_API_URL=http://127.0.0.1:11434/api/embeddings \
+EMBEDDING_API_URL=http://127.0.0.1:11434/api/embed \
 EMBEDDING_API_FORMAT=ollama \
 EMBEDDING_MODEL=qwen3-embedding:8b \
 EMBEDDING_DIM=4096 \

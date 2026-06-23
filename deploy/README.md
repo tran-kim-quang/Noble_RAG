@@ -3,6 +3,8 @@
 ## 1) Architecture (minimal)
 - `orchestrator-service`: public on host (`127.0.0.1:8021` by default).
 - `retrieval-service`: internal-only (Docker network, no host port publish).
+- `vision-service`: internal-only (Docker network, no host port publish).
+- `redis`: internal-only session store for known/guest face sessions.
 - `qdrant`: internal-only (Docker network, no host port publish).
 - Qdrant data persisted at `deploy/volumes/qdrant`.
 - Runtime config:
@@ -13,6 +15,7 @@
 - `deploy/docker-compose.yml`
 - `deploy/.env.retrieval`
 - `deploy/.env.orchestrator`
+- `deploy/.env.vision`
 - `docs/huong_dan_ket_noi_host_model_cho_retrieval_service.md`
 - `deploy/volumes/qdrant/`
 - `deploy/scripts/start.sh`
@@ -40,7 +43,7 @@ vi deploy/.env.orchestrator
 # if using local Ollama on host machine
 # set in deploy/.env.retrieval:
 #   EMBEDDING_BACKEND=remote
-#   EMBEDDING_API_URL=http://host.docker.internal:11434/api/embeddings
+#   EMBEDDING_API_URL=http://host.docker.internal:11434/api/embed
 #   EMBEDDING_API_FORMAT=ollama
 #   EMBEDDING_MODEL=qwen3-embedding:8b
 #   EMBEDDING_DIM=4096

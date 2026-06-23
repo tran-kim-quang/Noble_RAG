@@ -9,6 +9,7 @@ COPY orchestrator_service/requirements.txt /app/orchestrator_requirements.txt
 RUN pip install --no-cache-dir -r /app/orchestrator_requirements.txt
 
 COPY orchestrator_service /app/orchestrator_service
+COPY shared /app/shared
 
 EXPOSE 8021
 

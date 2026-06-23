@@ -1,0 +1,931 @@
+﻿<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nền tảng tương tác người số LiveTalking</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+    <style>
+        :root {
+            --primary-color: #4361ee;
+            --secondary-color: #3f37c9;
+            --accent-color: #4895ef;
+            --background-color: #f8f9fa;
+            --card-bg: #ffffff;
+            --text-color: #212529;
+            --border-radius: 10px;
+            --box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--background-color);
+            color: var(--text-color);
+            min-height: 100vh;
+            padding-top: 20px;
+        }
+
+        .dashboard-container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .card {
+            background-color: var(--card-bg);
+            border-radius: var(--border-radius);
+            box-shadow: var(--box-shadow);
+            border: none;
+            margin-bottom: 20px;
+            overflow: hidden;
+        }
+
+        .card-header {
+            background-color: var(--primary-color);
+            color: white;
+            font-weight: 600;
+            padding: 15px 20px;
+            border-bottom: none;
+        }
+
+        .video-container {
+            position: relative;
+            width: 100%;
+            background-color: #000;
+            border-radius: var(--border-radius);
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        video {
+            max-width: 100%;
+            max-height: 100%;
+            display: block;
+            border-radius: var(--border-radius);
+        }
+
+        .controls-container {
+            padding: 20px;
+        }
+
+        .btn-primary {
+            background-color: var(--primary-color);
+            border-color: var(--primary-color);
+        }
+
+        .btn-primary:hover {
+            background-color: var(--secondary-color);
+            border-color: var(--secondary-color);
+        }
+
+        .btn-outline-primary {
+            color: var(--primary-color);
+            border-color: var(--primary-color);
+        }
+
+        .btn-outline-primary:hover {
+            background-color: var(--primary-color);
+            color: white;
+        }
+
+        .form-control {
+            border-radius: var(--border-radius);
+            padding: 10px 15px;
+            border: 1px solid #ced4da;
+        }
+
+        .form-control:focus {
+            border-color: var(--accent-color);
+            box-shadow: 0 0 0 0.25rem rgba(67, 97, 238, 0.25);
+        }
+
+        .status-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 5px;
+        }
+
+        .status-connected {
+            background-color: #28a745;
+        }
+
+        .status-disconnected {
+            background-color: #dc3545;
+        }
+
+        .status-connecting {
+            background-color: #ffc107;
+        }
+
+        .asr-container {
+            height: 300px;
+            overflow-y: auto;
+            padding: 15px;
+            background-color: #f8f9fa;
+            border-radius: var(--border-radius);
+            border: 1px solid #ced4da;
+        }
+
+        .asr-text {
+            margin-bottom: 10px;
+            padding: 10px;
+            background-color: white;
+            border-radius: var(--border-radius);
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+        }
+
+        .user-message {
+            background-color: #e3f2fd;
+            border-left: 4px solid var(--primary-color);
+        }
+
+        .system-message {
+            background-color: #f1f8e9;
+            border-left: 4px solid #8bc34a;
+        }
+
+        .recording-indicator {
+            position: absolute;
+            top: 15px;
+            right: 15px;
+            background-color: rgba(220, 53, 69, 0.8);
+            color: white;
+            padding: 5px 10px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            display: none;
+        }
+
+        .recording-indicator.active {
+            display: flex;
+            align-items: center;
+        }
+
+        .recording-indicator .blink {
+            width: 10px;
+            height: 10px;
+            background-color: #fff;
+            border-radius: 50%;
+            margin-right: 5px;
+            animation: blink 1s infinite;
+        }
+
+        @keyframes blink {
+            0% { opacity: 1; }
+            50% { opacity: 0.3; }
+            100% { opacity: 1; }
+        }
+
+        .mode-switch {
+            margin-bottom: 20px;
+        }
+
+        .nav-tabs .nav-link {
+            color: var(--text-color);
+            border: none;
+            padding: 10px 20px;
+            border-radius: var(--border-radius) var(--border-radius) 0 0;
+        }
+
+        .nav-tabs .nav-link.active {
+            color: var(--primary-color);
+            background-color: var(--card-bg);
+            border-bottom: 3px solid var(--primary-color);
+            font-weight: 600;
+        }
+
+        .tab-content {
+            padding: 20px;
+            background-color: var(--card-bg);
+            border-radius: 0 0 var(--border-radius) var(--border-radius);
+        }
+
+        .settings-panel {
+            padding: 15px;
+            background-color: #f8f9fa;
+            border-radius: var(--border-radius);
+            margin-top: 15px;
+        }
+
+        .footer {
+            text-align: center;
+            margin-top: 30px;
+            padding: 20px 0;
+            color: #6c757d;
+            font-size: 0.9rem;
+        }
+        
+        .voice-record-btn {
+            width: 60px;
+            height: 60px;
+            border-radius: 50%;
+            background-color: var(--primary-color);
+            color: white;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+            margin: 0 auto;
+        }
+        
+        .voice-record-btn:hover {
+            background-color: var(--secondary-color);
+            transform: scale(1.05);
+        }
+        
+        .voice-record-btn:active {
+            background-color: #dc3545;
+            transform: scale(0.95);
+        }
+        
+        .voice-record-btn i {
+            font-size: 24px;
+        }
+        
+        .voice-record-label {
+            text-align: center;
+            margin-top: 10px;
+            font-size: 14px;
+            color: #6c757d;
+        }
+        
+        .video-size-control {
+            margin-top: 15px;
+        }
+
+        .vision-camera-preview {
+            width: 100%;
+            max-width: 220px;
+            border-radius: 8px;
+            border: 1px solid #d9dee3;
+            background: #111;
+        }
+        
+        .recording-pulse {
+            animation: pulse 1.5s infinite;
+        }
+        
+        @keyframes pulse {
+            0% {
+                box-shadow: 0 0 0 0 rgba(220, 53, 69, 0.7);
+            }
+            70% {
+                box-shadow: 0 0 0 15px rgba(220, 53, 69, 0);
+            }
+            100% {
+                box-shadow: 0 0 0 0 rgba(220, 53, 69, 0);
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="dashboard-container">
+        <div class="row">
+            <div class="col-12">
+                <h1 class="text-center mb-4">Nền tảng tương tác người số LiveTalking</h1>
+            </div>
+        </div>
+
+        <div class="row">
+            <!-- 视频区域 -->
+            <div class="col-lg-8">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <div>
+                            <span class="status-indicator status-disconnected" id="connection-status"></span>
+                            <span id="status-text">Chưa kết nối</span>
+                        </div>
+                    </div>
+                    <div class="card-body p-0">
+                        <div class="video-container">
+                            <video id="video" autoplay playsinline></video>
+                            <div class="recording-indicator" id="recording-indicator">
+                                <div class="blink"></div>
+                                <span>Đang ghi</span>
+                            </div>
+                        </div>
+                        
+                        <div class="controls-container">
+                            <div class="row">
+                                <div class="col-md-6 mb-3">
+                                    <button class="btn btn-primary w-100" id="start">
+                                        <i class="bi bi-play-fill"></i> Bắt đầu kết nối
+                                    </button>
+                                    <button class="btn btn-danger w-100" id="stop" style="display: none;">
+                                        <i class="bi bi-stop-fill"></i> Dừng kết nối
+                                    </button>
+                                </div>
+                                <div class="col-md-6 mb-3">
+                                    <div class="d-flex">
+                                        <button class="btn btn-outline-primary flex-grow-1 me-2" id="btn_start_record">
+                                            <i class="bi bi-record-fill"></i> Bắt đầu ghi
+                                        </button>
+                                        <button class="btn btn-outline-danger flex-grow-1" id="btn_stop_record" disabled>
+                                            <i class="bi bi-stop-fill"></i> Dừng ghi
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="row">
+                                <div class="col-12">
+                                    <div class="video-size-control">
+                                        <label for="video-size-slider" class="form-label">Điều chỉnh kích thước video: <span id="video-size-value">100%</span></label>
+                                        <input type="range" class="form-range" id="video-size-slider" min="50" max="150" value="100">
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div class="settings-panel mt-3">
+                                <div class="row">
+                                    <div class="col-md-12">
+                                        <div class="form-check form-switch mb-3">
+                                            <input class="form-check-input" type="checkbox" id="use-stun">
+                                            <label class="form-check-label" for="use-stun">Sử dụng máy chủ STUN</label>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 右侧交互 -->
+            <div class="col-lg-4">
+                <div class="card">
+                    <div class="card-header">
+                        Nhập nội dung & Voice
+                    </div>
+                    <div class="card-body">
+                        <div class="alert alert-light border mb-3" id="vision-status-box">
+                            <div><strong>Nhận diện khách hàng:</strong> <span id="vision-status-text">Đã kết thúc phiên</span></div>
+                            <div class="small text-muted" id="vision-status-detail">Bấm "Bắt đầu kết nối" để tạo phiên mới và nhận diện lại.</div>
+                            <div class="mt-2">
+                                <video id="user-camera-feed" autoplay playsinline muted class="vision-camera-preview"></video>
+                            </div>
+                        </div>
+                        <form id="chat-form">
+                            <div class="input-group mb-3">
+                                <textarea class="form-control" id="chat-message" rows="3" placeholder="Nhập nội dung bạn muốn nói với người số..."></textarea>
+                                <button class="btn btn-primary" type="submit">
+                                    <i class="bi bi-send"></i> Gửi
+                                </button>
+                            </div>
+                        </form>
+
+                        <div class="voice-record-btn" id="voice-record-btn">
+                            <i class="bi bi-mic-fill"></i>
+                        </div>
+                        <div class="voice-record-label">Giữ để nói, thả ra để gửi</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="footer">
+            <p>Tạo bởi Marstaos | Tối ưu giao diện & hiệu năng</p>
+        </div>
+    </div>
+
+    <!-- 隐藏的会话ID -->
+    <input type="hidden" id="sessionid" value="0">
+    <canvas id="snapshot-canvas" style="display:none;"></canvas>
+
+
+    <script src="client.js?v=20260506_1135"></script>
+    <script src="srs.sdk.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script>
+        $(document).ready(function() {
+            $('#video-size-slider').on('input', function() {
+                const value = $(this).val();
+                $('#video-size-value').text(value + '%');
+                $('#video').css('width', value + '%');
+            });
+            function updateConnectionStatus(status) {
+                const statusIndicator = $('#connection-status');
+                const statusText = $('#status-text');
+                
+                statusIndicator.removeClass('status-connected status-disconnected status-connecting');
+                
+                switch(status) {
+                    case 'connected':
+                        statusIndicator.addClass('status-connected');
+                        statusText.text('Đã kết nối');
+                        break;
+                    case 'connecting':
+                        statusIndicator.addClass('status-connecting');
+                        statusText.text('Đang kết nối...');
+                        break;
+                    case 'disconnected':
+                    default:
+                        statusIndicator.addClass('status-disconnected');
+                        statusText.text('Chưa kết nối');
+                        break;
+                }
+            }
+
+            let userCameraStream = null;
+            let startingConnection = false;
+            let nobleStartSentForSession = '';
+            let nobleStartInFlightSession = '';
+            let pendingVoiceSnapshot = null;
+
+            function setVisionStatus(title, detail = '') {
+                $('#vision-status-text').text(title || 'Đã kết thúc phiên');
+                $('#vision-status-detail').text(detail || '');
+            }
+
+            function renderVisionResult(payload) {
+                const data = payload && payload.data ? payload.data : payload;
+                const vision = data && data.vision_context ? data.vision_context : null;
+                const session = data && data.session ? data.session : null;
+
+                if (!vision) {
+                    setVisionStatus('Không có dữ liệu nhận diện', 'Vision service chưa trả về profile.');
+                    return;
+                }
+
+                const recognized = !!vision.recognized;
+                const name = vision.name ? String(vision.name) : 'Không rõ';
+                const rawAge = (vision.age === null || vision.age === undefined) ? '' : String(vision.age).trim();
+                const age =
+                    rawAge === 'trẻ' || rawAge === 'tre' || rawAge === 'young' ? 'Trẻ'
+                    : rawAge === 'trung niên' || rawAge === 'trung nien' || rawAge === 'middle' || rawAge === 'middle-aged' ? 'Trung niên'
+                    : rawAge || 'Không rõ';
+                const gender = vision.gender === 'female' ? 'Nữ' : vision.gender === 'male' ? 'Nam' : 'Không rõ';
+                const kind = session && session.customer_kind ? String(session.customer_kind) : 'anonymous';
+                const kindLabel = kind === 'known' ? 'Khách cũ' : kind === 'guest' ? 'Khách mới' : 'Ẩn danh';
+                const resumed = !!(session && session.resumed);
+                const resumedText = resumed ? ' (đang dùng lại session)' : '';
+                const source = vision.source ? String(vision.source) : 'none';
+                const confidence = Number.isFinite(Number(vision.confidence)) ? Number(vision.confidence).toFixed(3) : '0.000';
+                const faceId = vision.face_id ? String(vision.face_id) : 'N/A';
+                const reason = vision.reason ? String(vision.reason) : '';
+                const headline = recognized ? `${kindLabel}${resumedText} - Đã nhận diện` : `${kindLabel}${resumedText} - Chưa nhận diện`;
+
+                setVisionStatus(
+                    headline,
+                    `Tên: ${name} | Tuổi: ${age} | Giới tính: ${gender} | Source: ${source} | Score: ${confidence} | FaceID: ${faceId}${reason ? ' | Lý do: ' + reason : ''}`,
+                );
+            }
+
+            async function waitForLiveTalkingSessionId(timeoutMs = 12000) {
+                const startedAt = Date.now();
+                while (Date.now() - startedAt < timeoutMs) {
+                    const sid = String(document.getElementById('sessionid').value || '').trim();
+                    if (sid && sid !== '0') {
+                        return sid;
+                    }
+                    await new Promise((resolve) => setTimeout(resolve, 120));
+                }
+                return '';
+            }
+
+            async function ensureUserCamera() {
+                if (userCameraStream) {
+                    return userCameraStream;
+                }
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+                    audio: false
+                });
+                userCameraStream = stream;
+                const userCamera = document.getElementById('user-camera-feed');
+                userCamera.srcObject = stream;
+                await userCamera.play().catch(() => {});
+                return stream;
+            }
+
+            async function captureUserSnapshot() {
+                try {
+                    await ensureUserCamera();
+                    const userCamera = document.getElementById('user-camera-feed');
+                    const canvas = document.getElementById('snapshot-canvas');
+                    const width = userCamera.videoWidth || 640;
+                    const height = userCamera.videoHeight || 480;
+                    canvas.width = width;
+                    canvas.height = height;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(userCamera, 0, 0, width, height);
+                    const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+                    const marker = 'base64,';
+                    const pos = dataUrl.indexOf(marker);
+                    const b64 = pos >= 0 ? dataUrl.substring(pos + marker.length) : '';
+                    if (!b64) {
+                        return null;
+                    }
+                    return {
+                        image_base64: b64,
+                        image_filename: 'snapshot.jpg',
+                        image_content_type: 'image/jpeg',
+                    };
+                } catch (error) {
+                    console.warn('Capture snapshot failed:', error);
+                    return null;
+                }
+            }
+
+            async function captureUserSnapshotWithRetry(maxAttempts = 6, delayMs = 180) {
+                for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+                    const snapshot = await captureUserSnapshot();
+                    if (snapshot && snapshot.image_base64) {
+                        return snapshot;
+                    }
+                    if (attempt < maxAttempts) {
+                        await new Promise((resolve) => setTimeout(resolve, delayMs));
+                    }
+                }
+                return null;
+            }
+
+            async function notifyNobleStart() {
+                const sessionid = String(document.getElementById('sessionid').value || '').trim();
+                if (!sessionid || sessionid === '0') {
+                    return;
+                }
+                if (nobleStartSentForSession === sessionid || nobleStartInFlightSession === sessionid) {
+                    return;
+                }
+                nobleStartInFlightSession = sessionid;
+                try {
+                    const snapshot = await captureUserSnapshotWithRetry();
+                    if (!snapshot || !snapshot.image_base64) {
+                        setVisionStatus('Nhận diện lỗi', 'Không chụp được frame camera để gửi Vision service.');
+                        return;
+                    }
+                    const payload = Object.assign({ sessionid: sessionid }, snapshot);
+                    const controller = new AbortController();
+                    const timer = setTimeout(() => controller.abort(), 9000);
+                    let resp = null;
+                    try {
+                        resp = await fetch('/noble/livetalking/start', {
+                            body: JSON.stringify(payload),
+                            headers: { 'Content-Type': 'application/json' },
+                            method: 'POST',
+                            signal: controller.signal,
+                        });
+                    } catch (err) {
+                        const msg = err && err.message ? err.message : 'Failed to fetch';
+                        setVisionStatus('Nhận diện lỗi', `Không gọi được start Vision: ${msg}`);
+                        return;
+                    } finally {
+                        clearTimeout(timer);
+                    }
+                    if (!resp) {
+                        setVisionStatus('Nhận diện lỗi', 'Không gọi được start Vision: Failed to fetch');
+                        return;
+                    }
+                    const json = await resp.json().catch(() => ({}));
+                    if (json && Number(json.code) === 0) {
+                        nobleStartSentForSession = sessionid;
+                        renderVisionResult(json);
+                    } else {
+                        setVisionStatus('Nhận diện lỗi', (json && json.msg) ? String(json.msg) : 'Không lấy được thông tin khách hàng.');
+                    }
+                } finally {
+                    if (nobleStartInFlightSession === sessionid) {
+                        nobleStartInFlightSession = '';
+                    }
+                }
+            }
+
+            async function notifyNobleStop(sessionid) {
+                if (!sessionid) {
+                    return;
+                }
+                await fetch('/noble/livetalking/stop', {
+                    body: JSON.stringify({ sessionid: String(sessionid) }),
+                    headers: { 'Content-Type': 'application/json' },
+                    method: 'POST',
+                });
+                nobleStartSentForSession = '';
+                nobleStartInFlightSession = '';
+                setVisionStatus('Đã kết thúc phiên', 'Bấm "Bắt đầu kết nối" để tạo phiên mới và nhận diện lại.');
+            }
+
+            // 开始/停止按钮
+            $('#start').click(async function() {
+                if (startingConnection) {
+                    return;
+                }
+                startingConnection = true;
+                updateConnectionStatus('connecting');
+                setVisionStatus('Đang quét khách hàng', 'Hệ thống đang bật camera và gửi ảnh sang Vision service...');
+                $(this).hide();
+                $('#stop').show();
+
+                try {
+                    await start();
+                } catch (error) {
+                    console.error('Start connection failed:', error);
+                }
+
+                const sid = await waitForLiveTalkingSessionId();
+                if (!sid) {
+                    setVisionStatus('Chưa có session', 'Không nhận được sessionid từ LiveTalking sau khi kết nối.');
+                }
+
+                // 添加定时器检查视频流是否已加载
+                let connectionCheckTimer = setInterval(function() {
+                    const video = document.getElementById('video');
+                    if (video.readyState >= 3 && video.videoWidth > 0) {
+                        updateConnectionStatus('connected');
+                        clearInterval(connectionCheckTimer);
+                    }
+                }, 2000);
+
+                setTimeout(function() {
+                    if (connectionCheckTimer) {
+                        clearInterval(connectionCheckTimer);
+                    }
+                }, 60000);
+                startingConnection = false;
+            });
+
+            $('#stop').click(function() {
+                stop();
+                $(this).hide();
+                $('#start').show();
+                updateConnectionStatus('disconnected');
+            });
+
+            window.onLiveTalkingSessionReady = function() {
+                notifyNobleStart().catch((error) => {
+                    console.error('Noble start failed:', error);
+                });
+            };
+
+            window.onLiveTalkingSessionStopped = function(sessionid) {
+                notifyNobleStop(sessionid).catch((error) => {
+                    console.error('Noble stop failed:', error);
+                });
+            };
+
+            // 录制功能
+            $('#btn_start_record').click(function() {
+                console.log('Starting recording...');
+                fetch('/record', {
+                    body: JSON.stringify({
+                        type: 'start_record',
+                        sessionid: String(document.getElementById('sessionid').value),
+                    }),
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    method: 'POST'
+                }).then(function(response) {
+                    if (response.ok) {
+                        console.log('Recording started.');
+                        $('#btn_start_record').prop('disabled', true);
+                        $('#btn_stop_record').prop('disabled', false);
+                        $('#recording-indicator').addClass('active');
+                    } else {
+                        console.error('Failed to start recording.');
+                    }
+                }).catch(function(error) {
+                    console.error('Error:', error);
+                });
+            });
+
+            $('#btn_stop_record').click(function() {
+                console.log('Stopping recording...');
+                fetch('/record', {
+                    body: JSON.stringify({
+                        type: 'end_record',
+                        sessionid: String(document.getElementById('sessionid').value),
+                    }),
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    method: 'POST'
+                }).then(function(response) {
+                    if (response.ok) {
+                        console.log('Recording stopped.');
+                        $('#btn_start_record').prop('disabled', false);
+                        $('#btn_stop_record').prop('disabled', true);
+                        $('#recording-indicator').removeClass('active');
+                    } else {
+                        console.error('Failed to stop recording.');
+                    }
+                }).catch(function(error) {
+                    console.error('Error:', error);
+                });
+            });
+
+            // 聊天模式表单提交
+            $('#chat-form').on('submit', async function(e) {
+                e.preventDefault();
+                var message = $('#chat-message').val();
+                if (!message.trim()) return;
+                
+                console.log('Sending chat message:', message);
+                const snapshot = await captureUserSnapshot();
+                const payload = Object.assign({
+                    text: message,
+                    type: 'chat',
+                    interrupt: true,
+                    sessionid: String(document.getElementById('sessionid').value),
+                }, snapshot || {});
+                
+                fetch('/human', {
+                    body: JSON.stringify(payload),
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    method: 'POST'
+                });
+                $('#chat-message').val('');
+            });
+
+            // 按住说话功能
+            let mediaRecorder;
+            let audioChunks = [];
+            let isRecording = false;
+            let recognition;
+            
+            // 检查浏览器是否支持语音识别
+            const isSpeechRecognitionSupported = 'webkitSpeechRecognition' in window || 'SpeechRecognition' in window;
+            
+            if (isSpeechRecognitionSupported) {
+                recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
+                recognition.continuous = true;
+                recognition.interimResults = true;
+                recognition.lang = 'vi-VN';
+                
+                recognition.onresult = function(event) {
+                    let interimTranscript = '';
+                    let finalTranscript = '';
+                    
+                    for (let i = event.resultIndex; i < event.results.length; ++i) {
+                        if (event.results[i].isFinal) {
+                            finalTranscript += event.results[i][0].transcript;
+                        } else {
+                            interimTranscript += event.results[i][0].transcript;
+                            $('#chat-message').val(interimTranscript);
+                        }
+                    }
+                    
+                    if (finalTranscript) {
+                        $('#chat-message').val(finalTranscript);
+                    }
+                };
+                
+                recognition.onerror = function(event) {
+                    console.error('语音识别错误:', event.error);
+                };
+            }
+            
+            // 按住说话按钮事件
+            $('#voice-record-btn').on('mousedown touchstart', function(e) {
+                e.preventDefault();
+                startRecording();
+            }).on('mouseup mouseleave touchend', function() {
+                if (isRecording) {
+                    stopRecording();
+                }
+            });
+            
+            // 开始录音
+            function startRecording() {
+                if (isRecording) return;
+                captureUserSnapshot()
+                    .then((snapshot) => {
+                        pendingVoiceSnapshot = snapshot;
+                    })
+                    .catch(() => {
+                        pendingVoiceSnapshot = null;
+                    });
+                
+                navigator.mediaDevices.getUserMedia({ audio: true })
+                    .then(function(stream) {
+                        audioChunks = [];
+                        mediaRecorder = new MediaRecorder(stream);
+                        
+                        mediaRecorder.ondataavailable = function(e) {
+                            if (e.data.size > 0) {
+                                audioChunks.push(e.data);
+                            }
+                        };
+                        
+                        mediaRecorder.start();
+                        isRecording = true;
+                        
+                        $('#voice-record-btn').addClass('recording-pulse');
+                        $('#voice-record-btn').css('background-color', '#dc3545');
+                        
+                        if (recognition) {
+                            recognition.start();
+                        }
+                    })
+                    .catch(function(error) {
+                        console.error('无法访问麦克风:', error);
+                        alert('无法访问麦克风，请检查浏览器权限设置。');
+                    });
+            }
+
+            function stopRecording() {
+                if (!isRecording) return;
+                
+                mediaRecorder.stop();
+                isRecording = false;
+                
+                // 停止所有音轨
+                mediaRecorder.stream.getTracks().forEach(track => track.stop());
+                
+                // 视觉反馈恢复
+                $('#voice-record-btn').removeClass('recording-pulse');
+                $('#voice-record-btn').css('background-color', '');
+                
+                // 停止语音识别
+                if (recognition) {
+                    recognition.stop();
+                }
+                
+                // 获取识别的文本并Gửi
+                setTimeout(async function() {
+                    const recognizedText = $('#chat-message').val().trim();
+                    if (recognizedText) {
+                        const snapshot = pendingVoiceSnapshot || await captureUserSnapshot();
+                        pendingVoiceSnapshot = null;
+                        const payload = Object.assign({
+                            text: recognizedText,
+                            type: 'chat',
+                            interrupt: true,
+                            sessionid: String(document.getElementById('sessionid').value),
+                        }, snapshot || {});
+                        fetch('/human', {
+                            body: JSON.stringify(payload),
+                            headers: {
+                                'Content-Type': 'application/json'
+                            },
+                            method: 'POST'
+                        });
+                        $('#chat-message').val('');
+                    } else {
+                        pendingVoiceSnapshot = null;
+                    }
+                }, 500); 
+            }
+
+            // WebRTC 相关功能
+            if (typeof window.onWebRTCConnected === 'function') {
+                const originalOnConnected = window.onWebRTCConnected;
+                window.onWebRTCConnected = function() {
+                    updateConnectionStatus('connected');
+                    if (originalOnConnected) originalOnConnected();
+                };
+            } else {
+                window.onWebRTCConnected = function() {
+                    updateConnectionStatus('connected');
+                };
+            }
+
+            // 当连接断开时更新状态
+            if (typeof window.onWebRTCDisconnected === 'function') {
+                const originalOnDisconnected = window.onWebRTCDisconnected;
+                window.onWebRTCDisconnected = function() {
+                    updateConnectionStatus('disconnected');
+                    if (originalOnDisconnected) originalOnDisconnected();
+                };
+            } else {
+                window.onWebRTCDisconnected = function() {
+                    updateConnectionStatus('disconnected');
+                };
+            }
+
+            // SRS WebRTC播放功能
+            var sdk = null; // 全局处理器，用于在重新发布时进行清理
+
+            function startPlay() {
+                // 关闭之前的连接
+                if (sdk) {
+                    sdk.close();
+                }
+                
+                sdk = new SrsRtcWhipWhepAsync();
+                $('#video').prop('srcObject', sdk.stream);
+                
+                var host = window.location.hostname;
+                var url = "http://" + host + ":1985/rtc/v1/whep/?app=live&stream=livestream";
+                
+                sdk.play(url).then(function(session) {
+                    console.log('WebRTC播放已启动，会话ID:', session.sessionid);
+                }).catch(function(reason) {
+                    sdk.close();
+                    console.error('WebRTC播放失败:', reason);
+                });
+            }
+        });
+    </script>
+</body>
+</html>

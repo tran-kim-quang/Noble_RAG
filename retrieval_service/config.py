@@ -8,6 +8,15 @@ def _env_bool(name: str, default: str = "false") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _resolve_embedding_backend() -> str:
+    """Smart default: use 'remote' if EMBEDDING_API_URL is set, else use 'local'."""
+    explicit = os.getenv("EMBEDDING_BACKEND", "").strip().lower()
+    if explicit:
+        return explicit
+    api_url = os.getenv("EMBEDDING_API_URL", "").strip()
+    return "remote" if api_url else "local"
+
+
 @dataclass(frozen=True)
 class Settings:
     qdrant_url: str = os.getenv("QDRANT_URL", "http://localhost:6333")
@@ -15,7 +24,7 @@ class Settings:
     collection_name: str = os.getenv("QDRANT_COLLECTION", "retrieval_docs")
     qdrant_timeout_sec: float = float(os.getenv("QDRANT_TIMEOUT_SEC", "10"))
 
-    embedding_backend: str = os.getenv("EMBEDDING_BACKEND", "local").strip().lower()
+    embedding_backend: str = _resolve_embedding_backend()
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-4B")
     embedding_dim: int = int(os.getenv("EMBEDDING_DIM", "2560"))
     embedding_api_url: str = os.getenv("EMBEDDING_API_URL", "").strip()
@@ -52,7 +61,7 @@ class Settings:
     langfuse_flush_at_request_end: bool = _env_bool("LANGFUSE_FLUSH_AT_REQUEST_END", "false")
 
     host: str = os.getenv("HOST", "0.0.0.0")
-    port: int = int(os.getenv("PORT", "8000"))
+    port: int = int(os.getenv("PORT", "8111"))
 
 
 def get_settings() -> Settings:

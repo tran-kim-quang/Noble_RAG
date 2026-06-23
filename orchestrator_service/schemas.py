@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
@@ -10,6 +10,22 @@ from pydantic import field_validator
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_age_bucket(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return "trẻ" if int(value) < 40 else "trung niên"
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        if not cleaned:
+            return None
+        if cleaned in {"trẻ", "tre", "young"}:
+            return "trẻ"
+        if cleaned in {"trung niên", "trung nien", "middle", "middle-aged", "middle_aged"}:
+            return "trung niên"
+    return None
 
 
 class TopicWeight(BaseModel):
@@ -32,11 +48,48 @@ class NeedPainpointState(BaseModel):
     last_updated_at: str | None = None
 
 
+class VisionContext(BaseModel):
+    recognized: bool = False
+    name: str | None = None
+    age: Literal["trẻ", "trung niên"] | None = None
+    gender: Literal["male", "female"] | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    source: Literal["face_db", "local_face_analysis", "vlm", "none", "error"] = "none"
+    face_count: int = Field(default=0, ge=0)
+    bbox: list[int] | None = None
+    reason: str | None = None
+    face_id: str | None = None
+
+    @field_validator("age", mode="before")
+    @classmethod
+    def normalize_age(cls, value: Any) -> str | None:
+        return _normalize_age_bucket(value)
+
+
+class CustomerProfileState(BaseModel):
+    recognized: bool = False
+    name: str | None = None
+    age: Literal["trẻ", "trung niên"] | None = None
+    gender: Literal["male", "female"] | None = None
+    source: Literal["face_db", "local_face_analysis", "vlm", "none", "error"] | None = None
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    last_seen_at: str | None = None
+    greeted_by_name: bool = False
+    greeted_generic: bool = False
+    face_id: str | None = None
+
+    @field_validator("age", mode="before")
+    @classmethod
+    def normalize_age(cls, value: Any) -> str | None:
+        return _normalize_age_bucket(value)
+
+
 class LeadState(BaseModel):
     name: str | None = None
     phone_contact: str | None = None
     need: NeedPainpointState = Field(default_factory=NeedPainpointState)
     painpoint: NeedPainpointState = Field(default_factory=NeedPainpointState)
+    customer_profile: CustomerProfileState = Field(default_factory=CustomerProfileState)
     engagement_state: Literal["cold", "warm", "interested", "ready"] = "cold"
     engagement_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     sales_state: Literal[
@@ -219,6 +272,7 @@ class HistoryTurn(BaseModel):
 class QueryRequest(BaseModel):
     message: str = Field(min_length=1)
     lead_state: LeadState | None = None
+    vision_context: VisionContext | None = None
     recent_history: list[HistoryTurn] = Field(default_factory=list)
     top_k: int | None = Field(default=None, ge=1, le=20)
     session_id: str | None = Field(default=None, min_length=1, max_length=128)
@@ -243,4 +297,75 @@ class QueryResponse(BaseModel):
     routing_signal: RoutingSignal | None = None
     project_grounded_payload: ProjectGroundedPayload | None = None
     decision_trace: DecisionTrace | None = None
+    phase_metrics_ms: dict[str, float] | None = None
     timestamp: str = Field(default_factory=_now_iso)
+
+
+class VisionQueryRequest(QueryRequest):
+    request_id: str | None = None
+    image_base64: str = Field(min_length=1)
+    image_filename: str | None = None
+    image_content_type: str | None = None
+
+    @field_validator("image_base64")
+    @classmethod
+    def validate_image_base64_not_blank(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("image_base64 must not be blank")
+        return cleaned
+
+
+class LiveTalkingSessionStartRequest(BaseModel):
+    request_id: str | None = None
+    image_base64: str = Field(min_length=1)
+    image_filename: str | None = None
+    image_content_type: str | None = None
+    session_id: str | None = Field(default=None, min_length=1, max_length=128)
+    lead_state: LeadState | None = None
+
+    @field_validator("image_base64")
+    @classmethod
+    def validate_start_image_base64_not_blank(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("image_base64 must not be blank")
+        return cleaned
+
+
+class LiveTalkingQueryRequest(QueryRequest):
+    request_id: str | None = None
+    stream: bool = False
+
+
+class LiveTalkingStopRequest(BaseModel):
+    session_id: str | None = Field(default=None, min_length=1, max_length=128)
+    face_session_key: str | None = None
+
+
+class LiveTalkingSessionState(BaseModel):
+    session_id: str
+    face_session_key: str
+    customer_kind: Literal["known", "guest", "anonymous"]
+    ttl_sec: int = Field(ge=1)
+    resumed: bool = False
+    should_greet: bool = False
+    greeting: str | None = None
+
+
+class LiveTalkingSessionStartResponse(BaseModel):
+    session: LiveTalkingSessionState
+    lead_state: LeadState
+    vision_context: VisionContext | None = None
+
+
+class LiveTalkingQueryResponse(QueryResponse):
+    session: LiveTalkingSessionState
+    vision_context: VisionContext | None = None
+
+
+class LiveTalkingStopResponse(BaseModel):
+    stopped: bool
+    session_id: str | None = None
+    face_session_key: str | None = None
+

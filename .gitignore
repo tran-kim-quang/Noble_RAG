@@ -1,6 +1,7 @@
 /.venv/
 /venv/
 /env/
+/.venv310/
 __pycache__/
 *.pyc
 deploy/volumes/ollama/id_ed25519
@@ -17,3 +18,7 @@ deploy/volumes/
 livetalking/.downloads/
 livetalking/**/*.pth
 livetalking/**/*.tar.gz
+
+.vision_models/
+
+logs/
