@@ -297,6 +297,7 @@ class QueryResponse(BaseModel):
     routing_signal: RoutingSignal | None = None
     project_grounded_payload: ProjectGroundedPayload | None = None
     decision_trace: DecisionTrace | None = None
+    phase_metrics_ms: dict[str, float] | None = None
     timestamp: str = Field(default_factory=_now_iso)
 
 

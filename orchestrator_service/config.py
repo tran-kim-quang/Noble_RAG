@@ -81,7 +81,7 @@ def _synthesis_api_format() -> str:
 
 
 def _synthesis_api_url() -> str:
-    return _env_first("ORCHESTRATOR_SYNTHESIS_API_URL", "ORCHESTRATOR_DECIDER_API_URL", default=_decider_api_url())
+    return _env_first("ORCHESTRATOR_SYNTHESIS_API_URL", "ORCHESTRATOR_DECIDER_API_URL", default="http://ollama:11434/api/chat")
 
 
 def _synthesis_api_key() -> str:
@@ -167,6 +167,7 @@ class Settings:
     
     # Streaming enables progressive response return (faster perceived latency)
     synthesis_enable_streaming: bool = _env_bool("ORCHESTRATOR_SYNTHESIS_ENABLE_STREAMING", "false")
+    synthesis_thinking_enabled: bool = _env_bool("ORCHESTRATOR_SYNTHESIS_THINKING_ENABLED", "false")
 
     # Fast response lane for greeting only to keep latency low.
     quick_intent_fast_response_enabled: bool = _env_bool("ORCHESTRATOR_QUICK_INTENT_FAST_RESPONSE_ENABLED", "true")

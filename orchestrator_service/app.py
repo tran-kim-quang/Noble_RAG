@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import re
 import socket
 import tempfile
@@ -265,77 +266,108 @@ def _build_no_grounding_reply(message: str) -> str:
     )
 
 
+def _has_lead_capture_cta(reply: str) -> bool:
+    cleaned = _normalize_text_for_match(reply)
+    if not cleaned:
+        return False
+    cta_patterns = [
+        r"\bso dien thoai\b",
+        r"\bsdt\b",
+        r"\bten\b",
+        r"\bxin phep goi\b",
+        r"\bgoi dien\b",
+        r"\bhen\b",
+        r"\btu van\b",
+    ]
+    return any(re.search(pattern, cleaned) for pattern in cta_patterns)
+
+
+def _build_lead_capture_cta(lead_state: LeadState) -> str:
+    missing_name, missing_phone = _missing_contact_fields(lead_state)
+    if missing_name and missing_phone:
+        return "Anh/chị cho em xin tên và số điện thoại để em gửi so sánh chi tiết và tư vấn đúng nhu cầu."
+    if missing_phone:
+        return "Anh/chị cho em xin số điện thoại để em gọi tư vấn nhanh 15-20 phút theo nhu cầu của mình."
+    if missing_name:
+        return "Anh/chị cho em xin tên để em cá nhân hóa phương án tư vấn phù hợp nhất."
+    return "Nếu anh/chị đồng ý, em xin phép hẹn lịch tư vấn nhanh 15-20 phút để chốt phương án phù hợp."
+
+
+def _apply_business_outcome_gate(
+    *,
+    reply: str,
+    final_route: str,
+    lead_state: LeadState,
+    response_mode: str,
+) -> str:
+    cleaned = (reply or "").strip()
+    if not cleaned:
+        return cleaned
+    # Prioritize lead capture when discussing projects or recommendation.
+    requires_cta = (
+        _normalize_route(final_route) == "project_grounded"
+        or response_mode in {"grounded_recommendation", "contact_capture"}
+    )
+    if not requires_cta:
+        return cleaned
+    if _has_lead_capture_cta(cleaned):
+        return cleaned
+    cta = _build_lead_capture_cta(lead_state)
+    if cleaned.endswith((".", "!", "?")):
+        return f"{cleaned} {cta}"
+    return f"{cleaned}. {cta}"
+
+
+def _apply_safety_gate(
+    *,
+    reply: str,
+    user_has_budget_context: bool,
+) -> str:
+    cleaned = (reply or "").strip()
+    if not cleaned:
+        return cleaned
+    if user_has_budget_context:
+        return cleaned
+    if not _has_personal_budget_phrase(cleaned):
+        return cleaned
+    # Remove unsupported personal budget statements when user has not provided budget.
+    normalized = re.sub(
+        r"[^.?!]*(ngan sach|tài chính|tai chinh|khả năng chi trả|kha nang chi tra)[^.?!]*[.?!]?",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if normalized:
+        return normalized
+    return "Em có thể tư vấn theo các mức ngân sách phổ biến nếu anh/chị chia sẻ khung tài chính mong muốn."
+
+
+def _apply_grounding_gate(
+    *,
+    reply: str,
+    message: str,
+    final_route: str,
+    grounded_result: dict[str, Any] | None,
+    response_mode: str,
+) -> str:
+    cleaned = (reply or "").strip()
+    if _normalize_route(final_route) != "project_grounded":
+        return cleaned
+    if not _has_grounding_evidence(grounded_result):
+        return _build_no_grounding_reply(message)
+    # Keep model output for generic cases to preserve response quality.
+    # Fallback is reserved for no-evidence or synthesis/model failures.
+    _ = response_mode
+    return cleaned
+
+
 def _normalize_text_for_match(value: str) -> str:
     text = unicodedata.normalize("NFD", str(value or ""))
     text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
     text = text.lower()
     text = re.sub(r"[^a-z0-9\s]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
-
-
-def _extract_project_name_hint(message: str) -> str | None:
-    raw = str(message or "").strip()
-    if not raw:
-        return None
-
-    # First-pass on raw text to survive mojibake forms like "dá»± Ã¡n".
-    raw_patterns = [
-        r"(?:dự án|du an|project|dá»±\s*Ã¡n)\s+([^\n\r]{2,120})",
-    ]
-    for pattern in raw_patterns:
-        match = re.search(pattern, raw, re.IGNORECASE)
-        if not match:
-            continue
-        hint_raw = match.group(1).strip(" -")
-        hint_norm = _normalize_text_for_match(hint_raw)
-        hint_norm = re.sub(r"\b(la gi|the nao|ra sao|o dau|gia bao nhieu)$", "", hint_norm).strip()
-        if hint_norm and len(hint_norm) >= 3:
-            return hint_norm[:80]
-
-    normalized = _normalize_text_for_match(raw)
-    if not normalized:
-        return None
-    patterns = [
-        r"(?:du an|project)\s+([a-z0-9][a-z0-9\s\-]{1,80})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, normalized)
-        if not match:
-            continue
-        hint = re.sub(r"\s+", " ", match.group(1)).strip(" -")
-        # trim trailing filler words
-        hint = re.sub(r"\b(la gi|the nao|ra sao|o dau|gia bao nhieu)$", "", hint).strip()
-        if hint and len(hint) >= 3:
-            return hint[:80]
-    return None
-
-
-def _grounded_result_matches_project_hint(grounded_result: dict[str, Any] | None, project_hint: str | None) -> bool:
-    if not project_hint:
-        return True
-    if not isinstance(grounded_result, dict):
-        return False
-    target = _normalize_text_for_match(project_hint)
-    haystack_parts: list[str] = []
-    for project_id in grounded_result.get("used_projects", []) or []:
-        haystack_parts.append(str(project_id))
-    for card in grounded_result.get("project_cards", []) or []:
-        if isinstance(card, dict):
-            haystack_parts.append(str(card.get("project_id") or ""))
-            haystack_parts.append(str(card.get("summary") or ""))
-    for ev in (grounded_result.get("evidence_chunks", []) or [])[:8]:
-        if isinstance(ev, dict):
-            haystack_parts.append(str(ev.get("text") or ""))
-            haystack_parts.append(str(ev.get("source") or ""))
-    haystack = _normalize_text_for_match(" ".join(haystack_parts))
-    return bool(target and target in haystack)
-
-
-def _build_project_name_mismatch_reply(project_hint: str) -> str:
-    return (
-        f"Hiện tại em chưa tìm thấy dữ liệu phù hợp cho dự án \"{project_hint}\" trong kho tri thức. "
-        "Anh/chị vui lòng kiểm tra lại tên dự án hoặc cho em thêm thông tin để em tra cứu chính xác."
-    )
 
 
 def _coerce_extracted_name(raw: Any) -> str | None:
@@ -363,6 +395,7 @@ def _warmup_decider_model(settings: Settings) -> None:
         prompt="Warmup ping. Reply briefly with OK.",
         temperature=0.0,
         response_format=None,
+        call_role="decider",
     )
 
 
@@ -382,6 +415,8 @@ def _warmup_synthesis_model(settings: Settings) -> None:
         response_format=None,
         max_tokens=16,
         enable_stream=False,
+        call_role="synthesis",
+        thinking_enabled=settings.synthesis_thinking_enabled,
     )
 
 
@@ -1883,23 +1918,29 @@ def _call_model_generate(
     timeout_sec: float,
     keep_alive: str,
     prompt: str,
+    messages: list[dict[str, str]] | None = None,
     temperature: float,
     response_format: str | None = "json",
     max_tokens: int | None = None,
     enable_stream: bool = False,
+    call_role: str = "general",
+    stream_handler: Callable[[str], None] | None = None,
+    thinking_enabled: bool | None = None,
 ) -> Any:
-    def _normalize_ollama_cloud_openai_url(raw_url: str) -> str:
+    call_started_at = time.perf_counter()
+    is_synthesis_call = call_role == "synthesis"
+
+    def _elapsed_ms(started_at: float) -> float:
+        return (time.perf_counter() - started_at) * 1000.0
+
+    def _normalize_ollama_cloud_native_url(raw_url: str) -> str:
         parsed = urllib.parse.urlsplit(raw_url)
         base = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
         path = (parsed.path or "").rstrip("/")
         if not path:
-            return base + "/v1/chat/completions"
-        if path.endswith("/v1/chat/completions"):
-            return base + path
-        # Accept common ollama-style path and upgrade to cloud chat-completions.
+            return base + "/api/generate"
         if path.endswith("/api/generate") or path.endswith("/api/chat"):
-            return base + "/v1/chat/completions"
-        # Keep explicit custom path if user provides one.
+            return base + path
         return base + path
 
     api_format = str(api_format or "ollama").strip().lower()
@@ -1907,12 +1948,22 @@ def _call_model_generate(
     api_url = str(api_url or "").strip()
     log.info("model_call config: format=%s url=%s model=%s stream=%s", api_format, api_url, model, bool(enable_stream))
 
-    # Ollama Cloud serves OpenAI-compatible endpoints on ollama.com.
-    # If env is configured as `ollama` format against ollama.com root,
-    # auto-upgrade to OpenAI format to avoid HTML/non-JSON responses.
-    if api_format == "ollama" and "ollama.com" in api_url:
-        api_format = "openai"
-        api_url = _normalize_ollama_cloud_openai_url(api_url)
+    # Ollama Cloud supports native `/api/...` directly on ollama.com.
+    # For orchestrator behavior consistency:
+    # - decider is forced to `/api/generate`
+    # - synthesis is forced to `/api/chat`
+    if api_format == "ollama":
+        if "ollama.com" in api_url:
+            api_url = _normalize_ollama_cloud_native_url(api_url)
+        parsed = urllib.parse.urlsplit(api_url)
+        base = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+        path = (parsed.path or "").rstrip("/")
+        if call_role == "decider":
+            api_url = base + "/api/generate"
+        elif call_role == "synthesis":
+            api_url = base + "/api/chat"
+        elif not path:
+            api_url = base + "/api/generate"
     headers: dict[str, str] = {
         "Content-Type": "application/json",
         "User-Agent": _MODEL_HTTP_USER_AGENT,
@@ -1925,28 +1976,36 @@ def _call_model_generate(
             headers[header_name] = api_key
 
     if api_format == "openai":
+        message_payload = messages if messages else [{"role": "user", "content": prompt}]
         payload: dict[str, Any] = {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": message_payload,
             "stream": bool(enable_stream),
         }
-        # Kimi k2.5 supports thinking/non-thinking modes; disable thinking for faster routing/synthesis turns.
-        if model_name.startswith("kimi-k2.5"):
+        if call_role == "decider":
             payload["thinking"] = {"type": "disabled"}
-            # Add max_tokens constraint to optimize synthesis latency (Kimi responds faster with token limit)
-            if max_tokens:
-                payload["max_tokens"] = max_tokens
         else:
             payload["temperature"] = temperature
+            if max_tokens:
+                payload["max_tokens"] = max_tokens
         if response_format == "json":
             payload["response_format"] = {"type": "json_object"}
     else:
+        parsed_url = urllib.parse.urlsplit(api_url)
+        is_ollama_chat_api = (parsed_url.path or "").rstrip("/").endswith("/api/chat")
         payload = {
             "model": model,
             "prompt": prompt,
             "stream": bool(enable_stream),
             "options": {"temperature": temperature},
         }
+        if is_ollama_chat_api:
+            payload.pop("prompt", None)
+            payload["messages"] = messages if messages else [{"role": "user", "content": prompt}]
+        if call_role == "decider":
+            payload["think"] = False
+        elif call_role == "synthesis" and thinking_enabled is not None:
+            payload["think"] = bool(thinking_enabled)
         if response_format:
             payload["format"] = response_format
             # Some reasoning-capable Ollama models return only `thinking` with empty
@@ -1961,62 +2020,186 @@ def _call_model_generate(
         headers=headers,
         method="POST",
     )
+    if is_synthesis_call:
+        log.info(
+            "synthesis_upstream stage=request_prepared elapsed_ms=%.1f api_format=%s api_url=%s model=%s stream=%s prompt_chars=%s message_count=%s",
+            _elapsed_ms(call_started_at),
+            api_format,
+            api_url,
+            model,
+            bool(enable_stream),
+            len(str(prompt or "")),
+            len(messages or []),
+        )
     if enable_stream:
-        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            if api_format == "openai":
-                parts: list[str] = []
+        open_started_at = time.perf_counter()
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                if is_synthesis_call:
+                    log.info(
+                        "synthesis_upstream stage=response_open elapsed_ms=%.1f status=%s",
+                        _elapsed_ms(call_started_at),
+                        getattr(resp, "status", None),
+                    )
+                if api_format == "openai":
+                    parts: list[str] = []
+                    first_line_logged = False
+                    first_chunk_logged = False
+                    while True:
+                        line_bytes = resp.readline()
+                        if line_bytes and not first_line_logged and is_synthesis_call:
+                            first_line_logged = True
+                            log.info(
+                                "synthesis_upstream stage=first_stream_bytes elapsed_ms=%.1f open_wait_ms=%.1f",
+                                _elapsed_ms(call_started_at),
+                                _elapsed_ms(open_started_at),
+                            )
+                        if not line_bytes:
+                            break
+                        line = line_bytes.decode("utf-8", errors="ignore").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if not data or data == "[DONE]":
+                            continue
+                        try:
+                            event = json.loads(data)
+                        except Exception:
+                            continue
+                        choices = event.get("choices", [])
+                        if not isinstance(choices, list) or not choices:
+                            continue
+                        first = choices[0] if isinstance(choices[0], dict) else {}
+                        delta = first.get("delta") if isinstance(first, dict) else {}
+                        if not isinstance(delta, dict):
+                            continue
+                        content = delta.get("content")
+                        if isinstance(content, str) and content:
+                            parts.append(content)
+                            if is_synthesis_call and not first_chunk_logged:
+                                first_chunk_logged = True
+                                log.info(
+                                    "synthesis_upstream stage=first_text_chunk elapsed_ms=%.1f bytes_len=%s",
+                                    _elapsed_ms(call_started_at),
+                                    len(content),
+                                )
+                            if stream_handler:
+                                stream_handler(content)
+                        elif isinstance(content, list):
+                            for item in content:
+                                if isinstance(item, dict):
+                                    text = item.get("text")
+                                    if isinstance(text, str) and text:
+                                        parts.append(text)
+                                        if is_synthesis_call and not first_chunk_logged:
+                                            first_chunk_logged = True
+                                            log.info(
+                                                "synthesis_upstream stage=first_text_chunk elapsed_ms=%.1f bytes_len=%s",
+                                                _elapsed_ms(call_started_at),
+                                                len(text),
+                                            )
+                                        if stream_handler:
+                                            stream_handler(text)
+                    if is_synthesis_call:
+                        log.info(
+                            "synthesis_upstream stage=stream_completed elapsed_ms=%.1f output_chars=%s",
+                            _elapsed_ms(call_started_at),
+                            sum(len(p) for p in parts),
+                        )
+                    return "".join(parts)
+
+                # Ollama streaming: newline-delimited JSON with `response` chunks
+                # (generate) or `message.content` chunks (chat).
+                parts = []
+                first_line_logged = False
+                first_chunk_logged = False
                 while True:
                     line_bytes = resp.readline()
+                    if line_bytes and not first_line_logged and is_synthesis_call:
+                        first_line_logged = True
+                        log.info(
+                            "synthesis_upstream stage=first_stream_bytes elapsed_ms=%.1f open_wait_ms=%.1f",
+                            _elapsed_ms(call_started_at),
+                            _elapsed_ms(open_started_at),
+                        )
                     if not line_bytes:
                         break
                     line = line_bytes.decode("utf-8", errors="ignore").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if not data or data == "[DONE]":
+                    if not line:
                         continue
                     try:
-                        event = json.loads(data)
+                        event = json.loads(line)
                     except Exception:
                         continue
-                    choices = event.get("choices", [])
-                    if not isinstance(choices, list) or not choices:
+                    chunk = event.get("response")
+                    if isinstance(chunk, str) and chunk:
+                        parts.append(chunk)
+                        if is_synthesis_call and not first_chunk_logged:
+                            first_chunk_logged = True
+                            log.info(
+                                "synthesis_upstream stage=first_text_chunk elapsed_ms=%.1f bytes_len=%s",
+                                _elapsed_ms(call_started_at),
+                                len(chunk),
+                            )
+                        if stream_handler:
+                            stream_handler(chunk)
                         continue
-                    first = choices[0] if isinstance(choices[0], dict) else {}
-                    delta = first.get("delta") if isinstance(first, dict) else {}
-                    if not isinstance(delta, dict):
-                        continue
-                    content = delta.get("content")
-                    if isinstance(content, str) and content:
-                        parts.append(content)
-                    elif isinstance(content, list):
-                        for item in content:
-                            if isinstance(item, dict):
-                                text = item.get("text")
-                                if isinstance(text, str) and text:
-                                    parts.append(text)
+                    message = event.get("message")
+                    if isinstance(message, dict):
+                        content = message.get("content")
+                        if isinstance(content, str) and content:
+                            parts.append(content)
+                            if is_synthesis_call and not first_chunk_logged:
+                                first_chunk_logged = True
+                                log.info(
+                                    "synthesis_upstream stage=first_text_chunk elapsed_ms=%.1f bytes_len=%s",
+                                    _elapsed_ms(call_started_at),
+                                    len(content),
+                                )
+                            if stream_handler:
+                                stream_handler(content)
+                if is_synthesis_call:
+                    log.info(
+                        "synthesis_upstream stage=stream_completed elapsed_ms=%.1f output_chars=%s",
+                        _elapsed_ms(call_started_at),
+                        sum(len(p) for p in parts),
+                    )
                 return "".join(parts)
+        except Exception as exc:
+            if is_synthesis_call:
+                log.warning(
+                    "synthesis_upstream stage=stream_error elapsed_ms=%.1f open_wait_ms=%.1f error_type=%s error=%s",
+                    _elapsed_ms(call_started_at),
+                    _elapsed_ms(open_started_at),
+                    type(exc).__name__,
+                    str(exc)[:240],
+                )
+            raise
 
-            # Ollama streaming: newline-delimited JSON objects with `response` chunks.
-            parts = []
-            while True:
-                line_bytes = resp.readline()
-                if not line_bytes:
-                    break
-                line = line_bytes.decode("utf-8", errors="ignore").strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except Exception:
-                    continue
-                chunk = event.get("response")
-                if isinstance(chunk, str) and chunk:
-                    parts.append(chunk)
-            return "".join(parts)
-
-    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-        raw = resp.read().decode("utf-8")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            if is_synthesis_call:
+                log.info(
+                    "synthesis_upstream stage=response_open elapsed_ms=%.1f status=%s",
+                    _elapsed_ms(call_started_at),
+                    getattr(resp, "status", None),
+                )
+            raw = resp.read().decode("utf-8")
+    except Exception as exc:
+        if is_synthesis_call:
+            log.warning(
+                "synthesis_upstream stage=non_stream_error elapsed_ms=%.1f error_type=%s error=%s",
+                _elapsed_ms(call_started_at),
+                type(exc).__name__,
+                str(exc)[:240],
+            )
+        raise
+    if is_synthesis_call:
+        log.info(
+            "synthesis_upstream stage=non_stream_completed elapsed_ms=%.1f output_chars=%s",
+            _elapsed_ms(call_started_at),
+            len(raw),
+        )
     parsed = json.loads(raw)
     if not isinstance(parsed, dict):
         raise RuntimeError("model response is not a JSON object")
@@ -2041,6 +2224,11 @@ def _call_model_generate(
     response_text = parsed.get("response", "")
     if isinstance(response_text, str) and response_text.strip():
         return response_text
+    message = parsed.get("message")
+    if isinstance(message, dict):
+        message_content = message.get("content")
+        if isinstance(message_content, str) and message_content.strip():
+            return message_content
     thinking_text = parsed.get("thinking", "")
     if isinstance(thinking_text, str):
         return thinking_text
@@ -2215,8 +2403,14 @@ def _sanitize_reply_for_policy(
 def _extract_assistant_reply(response_payload: Any) -> str:
     if isinstance(response_payload, dict):
         return str(response_payload.get("assistant_reply", "")).strip()
-    parsed_obj = _extract_json_object(str(response_payload))
-    return str(parsed_obj.get("assistant_reply", "")).strip()
+    raw_text = str(response_payload or "").strip()
+    if not raw_text:
+        return ""
+    try:
+        parsed_obj = _extract_json_object(raw_text)
+    except Exception:
+        return raw_text
+    return str(parsed_obj.get("assistant_reply", "")).strip() or raw_text
 
 
 def _build_synthesis_cache_key(
@@ -2294,6 +2488,105 @@ def _build_no_decider_direct_reply_prompt(
     )
 
 
+def _history_to_chat_messages(recent_history: list[HistoryTurn], max_turns: int) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for turn in recent_history[-max_turns:]:
+        role = str(turn.role or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = str(turn.message or "").strip()
+        if not content:
+            continue
+        out.append({"role": role, "content": content})
+    return out
+
+
+def _build_no_decider_direct_reply_messages(
+    *,
+    message: str,
+    recent_history: list[HistoryTurn],
+    lead_state: LeadState,
+    reply_plan: ReplyPlan,
+    settings: Settings,
+) -> list[dict[str, str]]:
+    state_payload = {
+        "need_summary": lead_state.need.summary,
+        "painpoint_summary": lead_state.painpoint.summary,
+        "sales_state": lead_state.sales_state,
+        "engagement_state": lead_state.engagement_state,
+        "conversation_goal": lead_state.last_conversation_goal,
+        "next_best_action": lead_state.next_best_action,
+    }
+    system_prompt = (
+        "Ban la tro ly tu van bat dong san.\n"
+        "Boi canh: decider tam thoi khong san sang. Van phai tu van theo noi dung query cua khach.\n"
+        "Muc tieu: tra loi gon, tu nhien, bam sat query, khong noi ve loi he thong.\n"
+        "Bat buoc: tra ve DUY NHAT 1 JSON object theo schema {\"assistant_reply\":\"...\"}.\n"
+        "Khong markdown, khong giai thich them.\n"
+        f"ask_policy={json.dumps(reply_plan.ask_policy, ensure_ascii=False)}\n"
+        f"response_mode={json.dumps(reply_plan.response_mode, ensure_ascii=False)}\n"
+        f"focus={json.dumps(reply_plan.focus, ensure_ascii=False)}\n"
+        f"question_focus={json.dumps(reply_plan.question_focus, ensure_ascii=False)}\n"
+        f"lead_state={json.dumps(state_payload, ensure_ascii=False)}\n"
+    )
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(_history_to_chat_messages(recent_history, settings.synthesis_history_turns))
+    messages.append({"role": "user", "content": message})
+    return messages
+
+
+def _build_synthesis_chat_messages(
+    *,
+    message: str,
+    lead_state: LeadState,
+    recent_history: list[HistoryTurn],
+    final_route: str,
+    query_type: str,
+    decision_reason: str,
+    reply_plan: ReplyPlan,
+    grounded_result: dict[str, Any] | None,
+    settings: Settings,
+) -> list[dict[str, str]]:
+    compact_state = {
+        "need_summary": lead_state.need.summary,
+        "painpoint_summary": lead_state.painpoint.summary,
+        "sales_state": lead_state.sales_state,
+        "engagement_state": lead_state.engagement_state,
+        "conversation_goal": lead_state.last_conversation_goal,
+        "next_best_action": lead_state.next_best_action,
+    }
+    grounded_context = {
+        "used_projects": (grounded_result or {}).get("used_projects", []) if isinstance(grounded_result, dict) else [],
+        "project_cards": (grounded_result or {}).get("project_cards", []) if isinstance(grounded_result, dict) else [],
+        "trait_tags": (grounded_result or {}).get("trait_tags", []) if isinstance(grounded_result, dict) else [],
+        "proximity_facts": (grounded_result or {}).get("proximity_facts", []) if isinstance(grounded_result, dict) else [],
+        "evidence_chunks": (grounded_result or {}).get("evidence_chunks", []) if isinstance(grounded_result, dict) else [],
+        "retrieval_intent": (grounded_result or {}).get("retrieval_intent", {}) if isinstance(grounded_result, dict) else {},
+        "confidence": (grounded_result or {}).get("confidence", 0.0) if isinstance(grounded_result, dict) else 0.0,
+        "low_confidence": bool((grounded_result or {}).get("low_confidence", True)) if isinstance(grounded_result, dict) else True,
+    }
+
+    system_prompt = (
+        "Ban la tro ly tu van bat dong san.\n"
+        "Nhiem vu: tra loi phu hop theo route/chien luoc, ngan gon, tu nhien, khong noi ky thuat he thong.\n"
+        "Bat buoc tra ve DUY NHAT 1 JSON object theo schema {\"assistant_reply\":\"...\"}.\n"
+        "Khong markdown, khong giai thich them.\n"
+        f"final_route={json.dumps(_normalize_route(final_route), ensure_ascii=False)}\n"
+        f"query_type={json.dumps(_normalize_query_type(query_type), ensure_ascii=False)}\n"
+        f"decision_reason={json.dumps(decision_reason, ensure_ascii=False)}\n"
+        f"response_mode={json.dumps(_normalize_response_mode(reply_plan.response_mode), ensure_ascii=False)}\n"
+        f"ask_policy={json.dumps(_normalize_ask_policy(reply_plan.ask_policy), ensure_ascii=False)}\n"
+        f"focus={json.dumps(reply_plan.focus, ensure_ascii=False)}\n"
+        f"question_focus={json.dumps(reply_plan.question_focus, ensure_ascii=False)}\n"
+        f"lead_state={json.dumps(compact_state, ensure_ascii=False)}\n"
+        f"grounded_context={json.dumps(grounded_context, ensure_ascii=False)}\n"
+    )
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(_history_to_chat_messages(recent_history, settings.synthesis_history_turns))
+    messages.append({"role": "user", "content": message})
+    return messages
+
+
 def synthesize_assistant_reply_no_decider(
     *,
     message: str,
@@ -2301,8 +2594,10 @@ def synthesize_assistant_reply_no_decider(
     lead_state: LeadState,
     reply_plan: ReplyPlan,
     settings: Settings,
+    stream_handler: Callable[[str], None] | None = None,
 ) -> str:
-    prompt = _build_no_decider_direct_reply_prompt(
+    synthesis_response_format = None if stream_handler else "json"
+    chat_messages = _build_no_decider_direct_reply_messages(
         message=message,
         recent_history=recent_history,
         lead_state=lead_state,
@@ -2317,11 +2612,15 @@ def synthesize_assistant_reply_no_decider(
         model=settings.synthesis_model,
         timeout_sec=settings.synthesis_timeout_sec,
         keep_alive=settings.synthesis_keep_alive,
-        prompt=prompt,
+        prompt=message,
+        messages=chat_messages,
         temperature=max(0.0, min(1.0, settings.synthesis_temperature)),
-        response_format="json",
+        response_format=synthesis_response_format,
         max_tokens=settings.synthesis_output_max_tokens,
-        enable_stream=False,
+        enable_stream=settings.synthesis_enable_streaming,
+        call_role="synthesis",
+        stream_handler=stream_handler,
+        thinking_enabled=settings.synthesis_thinking_enabled,
     )
     reply = _sanitize_reply_for_policy(
         reply=_extract_assistant_reply(response_payload),
@@ -2346,6 +2645,7 @@ def synthesize_assistant_reply(
     reply_plan: ReplyPlan,
     grounded_result: dict[str, Any] | None,
     settings: Settings,
+    stream_handler: Callable[[str], None] | None = None,
 ) -> str:
     user_has_budget_context = _user_context_has_budget_signal(message=message, recent_history=recent_history)
     primary_prompt = _build_reply_synthesis_prompt(
@@ -2363,6 +2663,17 @@ def synthesize_assistant_reply(
         ask_policy=reply_plan.ask_policy,
         focus=reply_plan.focus,
         question_focus=reply_plan.question_focus,
+        grounded_result=grounded_result,
+        settings=settings,
+    )
+    primary_messages = _build_synthesis_chat_messages(
+        message=message,
+        lead_state=lead_state,
+        recent_history=recent_history,
+        final_route=final_route,
+        query_type=analysis.query_type,
+        decision_reason=decision_reason,
+        reply_plan=reply_plan,
         grounded_result=grounded_result,
         settings=settings,
     )
@@ -2390,93 +2701,63 @@ def synthesize_assistant_reply(
             log.info("synthesis cache hit (stable-key)")
             return _compact_text(cached_response, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
     
-    attempt_prompt = primary_prompt
-    last_failure_reason = "reply_synthesis_not_attempted"
-    for attempt_index in range(2):
-        try:
-            # Record synthesis timing
-            if timing_inst:
-                timing_inst.start("synthesis_call")
-            
-            response_payload = _call_model_generate(
-                api_format=settings.synthesis_api_format,
-                api_url=settings.synthesis_api_url,
-                api_key=settings.synthesis_api_key,
-                api_key_header=settings.synthesis_api_key_header,
-                model=settings.synthesis_model,
-                timeout_sec=settings.synthesis_timeout_sec,
-                keep_alive=settings.synthesis_keep_alive,
-                prompt=attempt_prompt,
-                temperature=max(0.0, min(1.0, settings.synthesis_temperature)),
-                response_format="json",
-                max_tokens=settings.synthesis_output_max_tokens,
-                enable_stream=settings.synthesis_enable_streaming,
-            )
-            
-            if timing_inst:
-                elapsed_ms = timing_inst.end("synthesis_call")
-                log.debug(f"synthesis stage latency: {elapsed_ms:.1f}ms")
-            
-            reply = _sanitize_reply_for_policy(
-                reply=_extract_assistant_reply(response_payload),
-                ask_policy=reply_plan.ask_policy,
-                single_project_mode=single_project_mode,
-                question_focus=reply_plan.question_focus,
-            )
-            if _has_personal_budget_phrase(reply) and not user_has_budget_context:
-                log.info("reply synthesis rejected unsupported personal budget phrase")
-                last_failure_reason = "unsupported_personal_budget_phrase"
-            elif _grounded_reply_too_generic(
-                reply=reply,
-                grounded_result=grounded_result,
-                response_mode=reply_plan.response_mode,
-                final_route=final_route,
-            ):
-                log.info("reply synthesis rejected generic grounded reply")
-                last_failure_reason = "grounded_reply_missing_specific_details"
-            elif _reply_needs_retry(
-                reply=reply,
-                single_project_mode=single_project_mode,
-                ask_policy=reply_plan.ask_policy,
-            ):
-                last_failure_reason = "reply_failed_policy_or_quality_gate"
-            elif reply:
-                # Cache the successful response
-                if synthesis_cache and attempt_index == 0:
-                    synthesis_cache.set(
-                        cache_key,
-                        reply,
-                        metadata={"route": final_route, "query_type": analysis.query_type}
-                    )
-                return _compact_text(reply, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
-            else:
-                last_failure_reason = "empty_reply_after_sanitize"
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="ignore")[:240]
-            log.warning("reply synthesis HTTP %s: %s", exc.code, detail)
-            raise RuntimeError(f"reply synthesis HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            log.warning("reply synthesis unreachable: %s", exc.reason)
-            raise RuntimeError(f"reply synthesis unreachable: {exc.reason}") from exc
-        except socket.timeout as exc:
-            log.warning("reply synthesis timeout after %ss", settings.synthesis_timeout_sec)
-            raise RuntimeError(f"reply synthesis timeout after {settings.synthesis_timeout_sec}s") from exc
-        except Exception as exc:
-            log.warning("reply synthesis failed: %s", exc)
-            raise RuntimeError(f"reply synthesis failed: {exc}") from exc
+    synthesis_response_format = None if stream_handler else "json"
+    try:
+        if timing_inst:
+            timing_inst.start("synthesis_call")
 
-        if attempt_index == 0:
-            attempt_prompt = _build_reply_repair_prompt(
-                original_prompt=primary_prompt,
-                invalid_reply=reply,
-                invalid_reason=last_failure_reason,
-            )
+        response_payload = _call_model_generate(
+            api_format=settings.synthesis_api_format,
+            api_url=settings.synthesis_api_url,
+            api_key=settings.synthesis_api_key,
+            api_key_header=settings.synthesis_api_key_header,
+            model=settings.synthesis_model,
+            timeout_sec=settings.synthesis_timeout_sec,
+            keep_alive=settings.synthesis_keep_alive,
+            prompt=primary_prompt,
+            messages=primary_messages,
+            temperature=max(0.0, min(1.0, settings.synthesis_temperature)),
+            response_format=synthesis_response_format,
+            max_tokens=settings.synthesis_output_max_tokens,
+            enable_stream=settings.synthesis_enable_streaming,
+            call_role="synthesis",
+            stream_handler=stream_handler,
+            thinking_enabled=settings.synthesis_thinking_enabled,
+        )
 
-    grounded_fallback = _build_grounded_specific_reply(grounded_result)
-    if grounded_fallback:
-        log.info("reply synthesis fallback to grounded-specific local rewrite")
-        return _compact_text(grounded_fallback, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
-    raise RuntimeError(f"reply synthesis returned unusable output after retries: {last_failure_reason}")
+        if timing_inst:
+            elapsed_ms = timing_inst.end("synthesis_call")
+            log.debug(f"synthesis stage latency: {elapsed_ms:.1f}ms")
+
+        reply = _sanitize_reply_for_policy(
+            reply=_extract_assistant_reply(response_payload),
+            ask_policy=reply_plan.ask_policy,
+            single_project_mode=single_project_mode,
+            question_focus=reply_plan.question_focus,
+        )
+        if not reply:
+            raise RuntimeError("reply synthesis returned empty reply")
+
+        if synthesis_cache:
+            synthesis_cache.set(
+                cache_key,
+                reply,
+                metadata={"route": final_route, "query_type": analysis.query_type}
+            )
+        return _compact_text(reply, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")[:240]
+        log.warning("reply synthesis HTTP %s: %s", exc.code, detail)
+        raise RuntimeError(f"reply synthesis HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        log.warning("reply synthesis unreachable: %s", exc.reason)
+        raise RuntimeError(f"reply synthesis unreachable: {exc.reason}") from exc
+    except socket.timeout as exc:
+        log.warning("reply synthesis timeout after %ss", settings.synthesis_timeout_sec)
+        raise RuntimeError(f"reply synthesis timeout after {settings.synthesis_timeout_sec}s") from exc
+    except Exception as exc:
+        log.warning("reply synthesis failed: %s", exc)
+        raise RuntimeError(f"reply synthesis failed: {exc}") from exc
 
 
 def _build_decider_prompt(
@@ -2535,24 +2816,63 @@ def _analyze_turn_with_model(
     recent_history: list[HistoryTurn],
     settings: Settings,
 ) -> TurnAnalysis:
-    response_payload = _call_model_generate(
-        api_format=settings.decider_api_format,
-        api_url=settings.decider_api_url,
-        api_key=settings.decider_api_key,
-        api_key_header=settings.decider_api_key_header,
-        model=settings.decider_model,
-        timeout_sec=settings.decider_timeout_sec,
-        keep_alive=settings.decider_keep_alive,
-        prompt=_build_decider_prompt(
-            message=message,
-            lead_state=lead_state,
-            recent_history=recent_history,
-            settings=settings,
-        ),
-        temperature=settings.decider_temperature,
-        response_format="json",
-        max_tokens=settings.decider_output_max_tokens,
+    decider_prompt = _build_decider_prompt(
+        message=message,
+        lead_state=lead_state,
+        recent_history=recent_history,
+        settings=settings,
     )
+    t0 = time.perf_counter()
+    response_payload: Any
+    try:
+        response_payload = _call_model_generate(
+            api_format=settings.decider_api_format,
+            api_url=settings.decider_api_url,
+            api_key=settings.decider_api_key,
+            api_key_header=settings.decider_api_key_header,
+            model=settings.decider_model,
+            timeout_sec=settings.decider_timeout_sec,
+            keep_alive=settings.decider_keep_alive,
+            prompt=decider_prompt,
+            temperature=settings.decider_temperature,
+            response_format="json",
+            max_tokens=settings.decider_output_max_tokens,
+            call_role="decider",
+        )
+    except Exception:
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        log.warning(
+            "decider_latency stage=model_call status=error elapsed_ms=%.1f model=%s api_format=%s api_url=%s "
+            "prompt_chars=%s message_chars=%s history_turns=%s timeout_sec=%s",
+            elapsed_ms,
+            settings.decider_model,
+            settings.decider_api_format,
+            settings.decider_api_url,
+            len(decider_prompt),
+            len(message or ""),
+            len(recent_history or []),
+            settings.decider_timeout_sec,
+        )
+        raise
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    if isinstance(response_payload, dict):
+        response_size = len(json.dumps(response_payload, ensure_ascii=False))
+    else:
+        response_size = len(str(response_payload or ""))
+    log.info(
+        "decider_latency stage=model_call status=ok elapsed_ms=%.1f model=%s api_format=%s api_url=%s "
+        "prompt_chars=%s message_chars=%s history_turns=%s response_chars=%s",
+        elapsed_ms,
+        settings.decider_model,
+        settings.decider_api_format,
+        settings.decider_api_url,
+        len(decider_prompt),
+        len(message or ""),
+        len(recent_history or []),
+        response_size,
+    )
+
     if isinstance(response_payload, dict):
         result_obj = response_payload
     else:
@@ -2903,28 +3223,6 @@ def run_project_grounded(
     evidence_chunks = retrieval_raw.get("evidence_chunks", []) or []
     low_confidence = bool(retrieval_raw.get("low_confidence", False))
     used_projects = [str(card.get("project_id")) for card in project_cards if card.get("project_id")]
-
-    # Project-name consistency gate at retrieval layer:
-    # if user explicitly names a project but retrieved evidence points to another project,
-    # force empty grounded payload so upper layer returns truthful "not found" message.
-    project_hint = _extract_project_name_hint(message)
-    grounded_probe = {
-        "used_projects": used_projects,
-        "project_cards": project_cards,
-        "evidence_chunks": evidence_chunks,
-    }
-    if project_hint and not _grounded_result_matches_project_hint(grounded_probe, project_hint):
-        log.warning(
-            "project-name consistency mismatch in retrieval layer hint=%s used_projects=%s",
-            project_hint,
-            used_projects,
-        )
-        project_cards = []
-        trait_tags = []
-        proximity_facts = []
-        evidence_chunks = []
-        low_confidence = True
-        used_projects = []
 
     return {
         "used_projects": _dedupe_keep_order(used_projects, max_items=5),
@@ -3319,7 +3617,30 @@ def create_app(
         return session, lead_state, recent_history, vision_context
 
     @app.post("/sales/query", response_model=QueryResponse)
-    def query(payload: QueryRequest) -> QueryResponse:
+    def query(payload: QueryRequest, stream_handler: Callable[[str], None] | None = None) -> QueryResponse:
+        request_started_at = time.perf_counter()
+        phase_metrics_ms: dict[str, float] = {}
+        stream_first_delta_ms: float | None = None
+
+        def _mark_phase(phase_name: str, started_at: float) -> None:
+            phase_metrics_ms[phase_name] = round((time.perf_counter() - started_at) * 1000.0, 1)
+
+        def _mark_total() -> None:
+            phase_metrics_ms["total"] = round((time.perf_counter() - request_started_at) * 1000.0, 1)
+
+        def _build_stream_handler_wrapper(
+            upstream_handler: Callable[[str], None] | None,
+            phase_started_at: float,
+        ) -> Callable[[str], None]:
+            def _wrapped(chunk: str) -> None:
+                nonlocal stream_first_delta_ms
+                if stream_first_delta_ms is None and str(chunk or "").strip():
+                    stream_first_delta_ms = round((time.perf_counter() - phase_started_at) * 1000.0, 1)
+                if upstream_handler:
+                    upstream_handler(chunk)
+
+            return _wrapped
+
         message = payload.message.strip()
         lead_state = _merge_customer_profile(payload.lead_state or LeadState(), payload.vision_context)
         top_k = payload.top_k or settings.default_top_k
@@ -3362,7 +3683,9 @@ def create_app(
                             "history_turns": len(payload.recent_history),
                         },
                     ) as analyze_obs:
+                        analyze_started_at = time.perf_counter()
                         analysis = turn_analyzer(message, lead_state, payload.recent_history)
+                        _mark_phase("analyze_turn", analyze_started_at)
                         analyze_obs.update(
                             output={
                                 "start_route": analysis.route,
@@ -3405,7 +3728,9 @@ def create_app(
                             as_type="span",
                             input={"query_type": analysis.query_type},
                         ) as consult_obs:
+                            consult_started_at = time.perf_counter()
                             consult_result = run_consult_discovery(message=message, lead_state=lead_state, analysis=analysis)
+                            _mark_phase("consult_discovery", consult_started_at)
                             routing_signal = consult_result.get("routing_signal")
                             after_consult_state = merge_lead_state(
                                 lead_state=lead_state,
@@ -3440,6 +3765,7 @@ def create_app(
                                     as_type="span",
                                     input={"query": project_message[:500], "top_k": top_k},
                                 ) as grounded_obs:
+                                    chain_retrieval_started_at = time.perf_counter()
                                     grounded_result = run_project_grounded(
                                         message=project_message,
                                         lead_state=after_consult_state,
@@ -3453,6 +3779,7 @@ def create_app(
                                         session_id=session_id,
                                         user_id=user_id,
                                     )
+                                    _mark_phase("project_grounded_chain", chain_retrieval_started_at)
                                     grounded_obs.update(
                                         output={
                                             "project_cards": len(grounded_result.get("project_cards", []) or []),
@@ -3485,6 +3812,7 @@ def create_app(
                                 as_type="span",
                                 input={"query": message[:500], "top_k": top_k},
                             ) as grounded_obs:
+                                direct_retrieval_started_at = time.perf_counter()
                                 grounded_result = run_project_grounded(
                                     message=message,
                                     lead_state=lead_state,
@@ -3498,6 +3826,7 @@ def create_app(
                                     session_id=session_id,
                                     user_id=user_id,
                                 )
+                                _mark_phase("project_grounded_direct", direct_retrieval_started_at)
                                 grounded_obs.update(
                                     output={
                                         "project_cards": len(grounded_result.get("project_cards", []) or []),
@@ -3531,6 +3860,7 @@ def create_app(
                             "final_route": final_route,
                         },
                     ) as state_obs:
+                        state_started_at = time.perf_counter()
                         sales_state_before = _normalize_sales_state(lead_state.sales_state)
                         engagement_state_before = _normalize_engagement_state(lead_state.engagement_state)
                         engagement_state_after = update_engagement_state(
@@ -3599,6 +3929,7 @@ def create_app(
                                 "next_best_action": next_best_action,
                             }
                         )
+                        _mark_phase("sales_state_engine", state_started_at)
 
                     with start_observation(
                         langfuse_enabled,
@@ -3606,6 +3937,7 @@ def create_app(
                         as_type="span",
                         input={"sales_state": final_state.sales_state, "conversation_goal": conversation_goal},
                     ) as plan_obs:
+                        planning_started_at = time.perf_counter()
                         reply_plan = build_reply_plan(
                             message=message,
                             recent_history=payload.recent_history,
@@ -3638,6 +3970,7 @@ def create_app(
                                 "question_focus": reply_plan.question_focus,
                             }
                         )
+                        _mark_phase("reply_planning", planning_started_at)
 
                     used_fastpath_consult_reply = False
                     reply_source = "reply_synthesis"
@@ -3679,6 +4012,11 @@ def create_app(
                                 "fastpath_gate_reason": fastpath_gate_reason,
                             },
                         ) as reply_obs:
+                            synthesis_started_at = time.perf_counter()
+                            synthesis_stream_handler = _build_stream_handler_wrapper(
+                                stream_handler,
+                                synthesis_started_at,
+                            )
                             assistant_reply = ""
                             try:
                                 assistant_reply = synthesize_assistant_reply(
@@ -3691,7 +4029,9 @@ def create_app(
                                     reply_plan=reply_plan,
                                     grounded_result=grounded_result,
                                     settings=settings,
+                                    stream_handler=synthesis_stream_handler,
                                 )
+                                _mark_phase("reply_synthesis", synthesis_started_at)
                             except Exception as exc:
                                 reply_obs.update(output={"error": str(exc)[:240]})
                                 log.exception(
@@ -3711,7 +4051,9 @@ def create_app(
                                             lead_state=final_state,
                                             reply_plan=reply_plan,
                                             settings=settings,
+                                            stream_handler=synthesis_stream_handler,
                                         )
+                                        _mark_phase("reply_synthesis_no_decider", synthesis_started_at)
                                         reply_source = "reply_synthesis_no_decider_direct"
                                         fastpath_gate_reason = "no_decider_model_direct"
                                         used_fastpath_consult_reply = False
@@ -3729,28 +4071,41 @@ def create_app(
                                 if not assistant_reply:
                                     # Graceful degradation: keep the API responsive when model
                                     # synthesis is slow/unavailable by returning fallback consult text.
-                                    if consult_result is None:
-                                        consult_result = run_consult_discovery(
-                                            message=message,
-                                            lead_state=lead_state,
-                                            analysis=analysis,
+                                    grounded_fallback_reply = ""
+                                    if final_route == "project_grounded" and _has_grounding_evidence(grounded_result):
+                                        grounded_fallback_reply = _build_grounded_specific_reply(grounded_result)
+                                        if not grounded_fallback_reply:
+                                            cards = (grounded_result or {}).get("project_cards", []) or []
+                                            grounded_fallback_reply = _build_project_catalog_overview(cards)
+                                    if grounded_fallback_reply:
+                                        assistant_reply = _compact_text(grounded_fallback_reply, max_words=_SYNTHESIS_REPLY_MAX_WORDS)
+                                        reply_source = "reply_synthesis_fallback_grounded"
+                                        fastpath_gate_reason = "synthesis_error_grounded_fallback"
+                                    else:
+                                        if consult_result is None:
+                                            consult_result = run_consult_discovery(
+                                                message=message,
+                                                lead_state=lead_state,
+                                                analysis=analysis,
+                                            )
+                                        fallback_reply = (
+                                            str(consult_result.get("assistant_reply", "")).strip()
+                                            if consult_result
+                                            else ""
+                                        ) or analysis.consult_reply
+                                        assistant_reply = _compact_text(
+                                            fallback_reply
+                                            or (
+                                                "Em xin lỗi, hệ thống trả lời đang bận. "
+                                                "Anh/chị cho em 1 tiêu chí ưu tiên để em tư vấn nhanh hơn ạ."
+                                            ),
+                                            max_words=max(24, settings.quick_intent_response_max_words),
                                         )
-                                    fallback_reply = (
-                                        str(consult_result.get("assistant_reply", "")).strip()
-                                        if consult_result
-                                        else ""
-                                    ) or analysis.consult_reply
-                                    assistant_reply = _compact_text(
-                                        fallback_reply
-                                        or (
-                                            "Em xin lỗi, hệ thống trả lời đang bận. "
-                                            "Anh/chị cho em 1 tiêu chí ưu tiên để em tư vấn nhanh hơn ạ."
-                                        ),
-                                        max_words=max(24, settings.quick_intent_response_max_words),
-                                    )
-                                    reply_source = "reply_synthesis_fallback_consult"
-                                    fastpath_gate_reason = "synthesis_error_fallback"
-                                    used_fastpath_consult_reply = True
+                                        reply_source = "reply_synthesis_fallback_consult"
+                                        fastpath_gate_reason = "synthesis_error_fallback"
+                                        used_fastpath_consult_reply = True
+                                if "reply_synthesis" not in phase_metrics_ms and "reply_synthesis_no_decider" not in phase_metrics_ms:
+                                    _mark_phase("reply_synthesis_error_path", synthesis_started_at)
                             reply_obs.update(
                                 output={
                                     "assistant_reply_chars": len(assistant_reply),
@@ -3769,35 +4124,32 @@ def create_app(
                     if greeting_prefix and _reply_has_greeting_prefix(assistant_reply):
                         final_state = _mark_customer_greeting_applied(final_state)
 
-                    # Hard guardrail: never claim project inventory without grounding evidence.
-                    # If retrieval has no cards/chunks, force a truthful reply.
-                    if final_route == "project_grounded":
-                        has_evidence = _has_grounding_evidence(grounded_result)
-                        if not has_evidence:
-                            if _contains_inventory_claim(assistant_reply):
-                                log.warning(
-                                    "ungrounded inventory claim blocked route=%s reason=%s",
-                                    final_route,
-                                    reason,
-                                )
-                            assistant_reply = _build_no_grounding_reply(message)
-                            reply_source = "grounding_guardrail_no_evidence"
-                            fastpath_gate_reason = "grounding_guardrail_blocked_no_evidence"
-                            reason = "retrieval_empty"
-                        else:
-                            project_hint = _extract_project_name_hint(message)
-                            if not _grounded_result_matches_project_hint(grounded_result, project_hint):
-                                assistant_reply = _build_project_name_mismatch_reply(project_hint or "yêu cầu hiện tại")
-                                reply_source = "grounding_guardrail_project_name_mismatch"
-                                fastpath_gate_reason = "grounding_guardrail_project_name_mismatch"
-                                reason = "project_name_mismatch"
-                                log.warning(
-                                    "project-name consistency blocked hint=%s used_projects=%s",
-                                    project_hint,
-                                    (grounded_result or {}).get("used_projects", []),
-                                )
+                    # Lightweight gate stack optimized for business outcome.
+                    assistant_reply = _apply_grounding_gate(
+                        reply=assistant_reply,
+                        message=message,
+                        final_route=final_route,
+                        grounded_result=grounded_result,
+                        response_mode=reply_plan.response_mode,
+                    )
+                    assistant_reply = _apply_safety_gate(
+                        reply=assistant_reply,
+                        user_has_budget_context=_user_context_has_budget_signal(
+                            message=message,
+                            recent_history=payload.recent_history,
+                        ),
+                    )
+                    assistant_reply = _apply_business_outcome_gate(
+                        reply=assistant_reply,
+                        final_route=final_route,
+                        lead_state=final_state,
+                        response_mode=reply_plan.response_mode,
+                    )
 
                     if final_route == "project_grounded" and grounded_result is not None:
+                        if stream_first_delta_ms is not None:
+                            phase_metrics_ms["synthesis_ttft_ms"] = stream_first_delta_ms
+                        _mark_total()
                         response = QueryResponse(
                             route="project_grounded",
                             assistant_reply=assistant_reply,
@@ -3817,10 +4169,14 @@ def create_app(
                                 "low_confidence": grounded_result["low_confidence"],
                             },
                             decision_trace=trace,
+                            phase_metrics_ms=phase_metrics_ms,
                         )
                     else:
                         if consult_result is None:
                             consult_result = run_consult_discovery(message=message, lead_state=lead_state, analysis=analysis)
+                        if stream_first_delta_ms is not None:
+                            phase_metrics_ms["synthesis_ttft_ms"] = stream_first_delta_ms
+                        _mark_total()
                         response = QueryResponse(
                             route="consult_discovery",
                             assistant_reply=assistant_reply,
@@ -3831,6 +4187,7 @@ def create_app(
                             routing_signal=consult_result.get("routing_signal"),
                             project_grounded_payload=None,
                             decision_trace=trace,
+                            phase_metrics_ms=phase_metrics_ms,
                         )
 
                     request_obs.update(
@@ -3878,7 +4235,7 @@ def create_app(
                             "query_type=%s retrieval_readiness=%s route_source=%s "
                             "engagement_before=%s engagement_after=%s "
                             "sales_state_before=%s sales_state_after=%s conversation_goal=%s next_best_action=%s "
-                            "response_mode=%s ask_policy=%s reply_source=%s fastpath_gate=%s reason=%s"
+                            "response_mode=%s ask_policy=%s reply_source=%s fastpath_gate=%s reason=%s phase_metrics_ms=%s"
                         ),
                         trace.start_route,
                         trace.final_route,
@@ -3897,6 +4254,7 @@ def create_app(
                         reply_source,
                         fastpath_gate_reason,
                         trace.decision_reason,
+                        json.dumps(phase_metrics_ms, ensure_ascii=False),
                     )
                     return response
         finally:
@@ -3904,7 +4262,10 @@ def create_app(
                 flush_observability(langfuse_enabled)
 
     @app.post("/sales/query-with-vision", response_model=QueryResponse)
-    def query_with_vision(payload: VisionQueryRequest) -> QueryResponse:
+    def query_with_vision(
+        payload: VisionQueryRequest,
+        stream_handler: Callable[[str], None] | None = None,
+    ) -> QueryResponse:
         vision_context = _identify_vision_context(
             image_base64=payload.image_base64,
             image_filename=payload.image_filename,
@@ -3921,7 +4282,78 @@ def create_app(
             session_id=payload.session_id,
             force_route=payload.force_route,
         )
-        return query(query_payload)
+        return query(query_payload, stream_handler=stream_handler)
+
+    def _stream_query_like_response(build_response_fn, worker_name: str):
+        def event_stream():
+            yield "event: start\ndata: {}\n\n"
+            result_holder: dict[str, Any] = {}
+            done_event = threading.Event()
+            chunk_queue: queue.Queue[str] = queue.Queue()
+
+            def _on_stream_chunk(text: str) -> None:
+                chunk = str(text or "").strip()
+                if not chunk:
+                    return
+                chunk_queue.put(chunk)
+
+            def _worker() -> None:
+                try:
+                    result_holder["response"] = build_response_fn(_on_stream_chunk)
+                except Exception as exc:
+                    result_holder["error"] = str(exc)[:240]
+                finally:
+                    done_event.set()
+
+            threading.Thread(target=_worker, name=worker_name, daemon=True).start()
+
+            while True:
+                try:
+                    chunk = chunk_queue.get(timeout=0.7)
+                    yield f"event: delta\ndata: {json.dumps({'text': chunk}, ensure_ascii=False)}\n\n"
+                    continue
+                except queue.Empty:
+                    pass
+                if done_event.is_set():
+                    break
+                yield "event: ping\ndata: {}\n\n"
+
+            error_msg = str(result_holder.get("error") or "").strip()
+            if error_msg:
+                yield f"event: error\ndata: {json.dumps({'error': error_msg}, ensure_ascii=False)}\n\n"
+                return
+
+            response_payload = result_holder.get("response")
+            if response_payload is None:
+                yield f"event: error\ndata: {json.dumps({'error': 'query stream returned no payload'}, ensure_ascii=False)}\n\n"
+                return
+
+            packed = response_payload.model_dump(mode="json")
+            yield f"event: done\ndata: {json.dumps(packed, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.post("/sales/query-stream")
+    def query_stream(payload: QueryRequest):
+        return _stream_query_like_response(
+            build_response_fn=lambda stream_handler: query(payload, stream_handler=stream_handler),
+            worker_name="sales-query-stream-worker",
+        )
+
+    @app.post("/sales/query-with-vision-stream")
+    def query_with_vision_stream(payload: VisionQueryRequest):
+        return _stream_query_like_response(
+            build_response_fn=lambda stream_handler: query_with_vision(payload, stream_handler=stream_handler),
+            worker_name="sales-query-with-vision-stream-worker",
+        )
 
     @app.post("/integrations/livetalking/start", response_model=LiveTalkingSessionStartResponse)
     def livetalking_start(payload: LiveTalkingSessionStartRequest) -> LiveTalkingSessionStartResponse:
@@ -4112,4 +4544,3 @@ def create_app(
 
 
 app = create_app()
-

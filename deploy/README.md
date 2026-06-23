@@ -43,7 +43,7 @@ vi deploy/.env.orchestrator
 # if using local Ollama on host machine
 # set in deploy/.env.retrieval:
 #   EMBEDDING_BACKEND=remote
-#   EMBEDDING_API_URL=http://host.docker.internal:11434/api/embeddings
+#   EMBEDDING_API_URL=http://host.docker.internal:11434/api/embed
 #   EMBEDDING_API_FORMAT=ollama
 #   EMBEDDING_MODEL=qwen3-embedding:8b
 #   EMBEDDING_DIM=4096
