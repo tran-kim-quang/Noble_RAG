@@ -1,4 +1,5 @@
-﻿###############################################################################
+import re
+###############################################################################
 #  服务器路由 — 统一异常处理的 API 路由
 ###############################################################################
 
@@ -309,6 +310,41 @@ async def is_speaking(request):
     return json_ok(data=avatar_session.is_speaking())
 
 
+
+async def play_script(request):
+    """Receive a script text and enqueue lines sequentially for the avatar to speak."""
+    try:
+        params: dict = await request.json()
+        sessionid: str = params.get('sessionid', '')
+        avatar_session = get_session(request, sessionid)
+        if avatar_session is None:
+            return json_error("session not found")
+
+        raw_script: str = params.get('script', '')
+        split_by: str = params.get('split_by', 'sentence')
+        if not raw_script:
+            return json_error("script is empty")
+
+        if split_by == 'line':
+            lines = [line.strip() for line in raw_script.splitlines() if line.strip()]
+        elif split_by == 'sentence':
+            # Split by sentence-ending punctuation (supports Vietnamese/Chinese/English)
+            chunks = re.split(r'(?<=[.!?。！？])\s+', raw_script)
+            lines = [c.strip() for c in chunks if c.strip()]
+        else:
+            lines = [raw_script.strip()]
+
+        total = len(lines)
+        logger.info('play_script session=%s lines=%d split_by=%s', sessionid, total, split_by)
+
+        for text in lines:
+            avatar_session.put_msg_txt_chunked(text, {})
+
+        return json_ok(data={"lines": total, "split_by": split_by})
+    except Exception as e:
+        logger.exception('play_script exception:')
+        return json_error(str(e))
+
 # ─── 路由注册 ──────────────────────────────────────────────────────────────
 
 def setup_routes(app):
@@ -320,5 +356,7 @@ def setup_routes(app):
     app.router.add_post("/noble/livetalking/start", noble_livetalking_start)
     app.router.add_post("/noble/livetalking/stop", noble_livetalking_stop)
     app.router.add_post("/interrupt_talk", interrupt_talk)
-    app.router.add_post("/is_speaking", is_speaking)
+        app.router.add_post("/is_speaking", is_speaking)
+    app.router.add_post("/play_script", play_script)
     app.router.add_static('/', path='web')
+
